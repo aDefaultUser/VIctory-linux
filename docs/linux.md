@@ -50,8 +50,7 @@ What was seen on screen, besides the first room:
 - **Logo movie.** Near 30 frames per second in sampled intervals with frame
   capture turned off, under both system Wine and Proton (earlier builds).
 - **Loading screen.** Texture preparation for the character bake still
-  causes stutter, less under Proton with the script's shorter bake budget
-  (next section).
+  causes stutter (next section).
 - **Bright frames in the intro.** Some of them are an authored title card. A
   short bright fade of the window has not been shown to be a bug.
 
@@ -60,25 +59,32 @@ What was seen on screen, besides the first room:
 While it loads, the title bakes its characters' skin and decorations, and
 just before each bake draw the layer uploads textures the bake may pick.
 `VICTORY_BAKE_TEXTURES_MS` is how many milliseconds of upload work that pass
-may take there. The script's default is 60 with `VICTORY_WINE=proton` and
-1500 under system Wine, which is also the layer's own default without the
-script. A value in the environment replaces the script's default, and a
-`VICTORY_BAKE_TEXTURES_MS=...` argument after the executable name wins over
-both. `0` turns the pass off.
+may take there. The script's default is 1500 under both system Wine and
+`VICTORY_WINE=proton`, the same as the layer's own default without the
+script. A value in the environment replaces the script's default (an empty
+value keeps 1500), and a `VICTORY_BAKE_TEXTURES_MS=...` argument after the
+executable name wins over both. `0` turns the pass off. A shorter budget such
+as `VICTORY_BAKE_TEXTURES_MS=60` still works when given explicitly.
 
-In one matched Proton Experimental A/B with frame capture off, 60 against
+The script defaulted to 60 under Proton for a while. A later private staging
+run of the opening (2026-11-25, graphics warm-up list empty) compared 60 and
+1500 on the same renderer (`d6a6651` against `2d0c444`, which differ only by
+a moved shader test fixture and warm-up notes). With 60, 40,000 to 45,000
+texture slots were still waiting during the following cutscene and the world
+looked flat, with detail missing. With 1500 more of them were uploaded during
+the decoration bake, and the courtyard walls and ground rendered clearly in
+the corresponding shot. Faces were missing in both runs; that is being
+investigated on its own.
+
+The earlier speed comparison still holds for what it tested: in one matched
+Proton Experimental A/B with a warmed cache and frame capture off, 60 against
 1500 raised the slowest five-second sample of the loading screen from 4.2 to
 14.9 frames per second and the median from 20 to 23, and the first room
-looked the same (the player's hair and clothes, the walls and the wired
-glass) with camera input working. The setting limits the upload pass. In the
-separate Proton script smoke test, one loading interval still dipped to
-1.6 frames per second.
-
-System Wine keeps 1500 because 60 is unproven there. One run with 60 reached
-the first room with camera control, but its loading screen still dropped to
-2.5 frames per second, and dark patches on clothing were more visible than in
-a run with 1500. There is no matched frame-rate comparison under system Wine,
-and the patches have not been traced to the setting.
+looked the same. The default favours complete textures over that speed, so
+the loading-screen stutter remains. In the separate Proton script smoke test,
+one loading interval still dipped to 1.6 frames per second. Under system Wine
+one run with 60 reached the first room but still dropped to 2.5 frames per
+second while loading; there is no matched comparison there.
 
 ## What it needs
 
@@ -164,8 +170,9 @@ dxil-spirv `114e664e` with a backport of upstream commit `e084e35c` from
   described above. Later parts of the game remain unverified.
 - **GPU resets (earlier builds).** Some earlier runs reset the GPU, for a cause
   not known. The two `7ec6682` runs showed no fault in 520 and 420 seconds.
-- **Loading-screen stutter.** Stalls can still occur with the shorter bake
-  budget. See [Texture uploads before the character bake](#texture-uploads-before-the-character-bake).
+- **Loading-screen stutter.** The default 1500 ms bake budget stalls the
+  loading screen. 60 ms stalls less but left world textures missing in a later
+  cutscene. See [Texture uploads before the character bake](#texture-uploads-before-the-character-bake).
 - **Black frames (earlier builds).** Not seen in later samples. Earlier runs
   showed every second or third frame of the 3D world black. In those runs the
   scene's brightness before tone mapping swung by a factor of about 100 from

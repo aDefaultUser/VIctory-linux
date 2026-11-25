@@ -11,7 +11,7 @@
 #   VKD3D_DLLS        folder with another d3d12.dll and d3d12core.dll pair (optional)
 #   D3DCOMPILER       a native d3dcompiler_47.dll (winetricks keeps one in its cache)
 #   RADV_DEBUG        default "zerovram"; set it empty to go without
-#   VICTORY_BAKE_TEXTURES_MS  default 60 with VICTORY_WINE=proton, 1500 otherwise
+#   VICTORY_BAKE_TEXTURES_MS  default 1500; empty also means 1500
 #   VICTORY_WINE      "wine" (default: the system's) or "proton": Proton's own Wine
 #                     (PROTON_WINE_LIBS/../../bin/wine) in a prefix of its own
 #   VICTORY_WARM      "1": `victory warm` in the same sandbox before the launch;
@@ -39,7 +39,6 @@ case ${VICTORY_WINE:-wine} in
     wine=wine
     wine_setup=(--unshare-ipc --setenv WINEPREFIX /state/prefix)
     display=()
-    bake_ms=1500
     ;;
   proton)
     # Proton's Wine finds its libraries beside it. It needs the host's IPC
@@ -54,15 +53,13 @@ case ${VICTORY_WINE:-wine} in
     if [[ -n ${XAUTHORITY:-} ]]; then
       display+=(--ro-bind "$XAUTHORITY" /run/session/Xauthority --setenv XAUTHORITY /run/session/Xauthority)
     fi
-    # The shorter bake budget was measured only under Proton (docs/linux.md).
-    bake_ms=60
     ;;
   *) echo "VICTORY_WINE is wine or proton" >&2; exit 1 ;;
 esac
 
 # Command-line settings come last, so they win over the environment.
 settings=(--setenv RADV_DEBUG "${RADV_DEBUG-zerovram}"
-  --setenv VICTORY_BAKE_TEXTURES_MS "${VICTORY_BAKE_TEXTURES_MS:-$bake_ms}")
+  --setenv VICTORY_BAKE_TEXTURES_MS "${VICTORY_BAKE_TEXTURES_MS:-1500}")
 for setting in "$@"; do
   settings+=(--setenv "${setting%%=*}" "${setting#*=}")
 done
