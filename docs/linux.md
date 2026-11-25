@@ -12,9 +12,8 @@ still being investigated (see "Known problems").
 
 ## What it needs
 
-- **The executable built for Windows.** `cargo build --release -p victory
-  --target x86_64-pc-windows-msvc`, cross-compiled with clang-cl and lld-link
-  against an MSVC CRT and Windows SDK (xwin fetches both).
+- **The executable built for Windows**, cross-built as described in the next
+  section.
 - **vkd3d-proton and DXVK's dxgi** as native DLLs beside the executable. The
   script takes them from a Proton install.
 - **A native `d3dcompiler_47.dll`.** The layer compiles HLSL of its own at run
@@ -28,16 +27,53 @@ still being investigated (see "Known problems").
   allocation. Where exactly the zeroing is lost (vkd3d-proton's
   zero-initialisation path, RADV on this card, or the kernel) is not known.
 
+## Building the Windows executable
+
+A plain `cargo build --target x86_64-pc-windows-msvc` on Linux works only when
+a C compiler, librarian and linker for that target and an MSVC CRT and Windows
+SDK are already set up. [cargo-xwin](https://github.com/rust-cross/cargo-xwin)
+does that setup:
+
+```sh
+# clang (clang-cl), lld (lld-link) and llvm (llvm-lib) from the distribution,
+# for example on Arch: sudo pacman -S clang lld llvm
+cargo install --locked cargo-xwin
+cargo xwin build --release -p victory --target x86_64-pc-windows-msvc
+```
+
+The first build downloads the CRT and SDK with
+[xwin](https://github.com/Jake-Shadle/xwin) into cargo-xwin's cache
+(`XWIN_CACHE_DIR` moves it), which means accepting
+[Microsoft's license](https://go.microsoft.com/fwlink/?LinkId=2086102). The
+Windows target comes with the toolchain that `rust-toolchain.toml` pins. The
+executable lands in `target/x86_64-pc-windows-msvc/release/victory.exe`.
+
+The builds on the machine above were made by hand from the same pieces: a
+CRT and SDK fetched with xwin, `CC_x86_64_pc_windows_msvc=clang-cl`,
+`AR_x86_64_pc_windows_msvc=llvm-lib`, and `CFLAGS_x86_64_pc_windows_msvc`
+giving clang-cl `/vctoolsdir` and `/winsdkdir` for the CRT and SDK folders.
+The cargo-xwin route has not been run on that machine yet.
+
 ## Wine or Proton's Wine
 
-System Wine 11.22 ran for more than ten minutes at a time. Proton
-Experimental's own Wine (11.0, with fsync, through Xwayland) drew the same
-picture, and the title crashed after three and a half minutes with a write to
-address 0 in its own code, in the one run made. It needs the sandbox to share
-the host's IPC namespace (X11 shared-memory images) and a prefix of its own.
-`VICTORY_WINE=proton` has the script use it that way (`prefix-proton`, the
-X11 socket of `DISPLAY`); only its warm-up has been run through the script so
-far.
+Proton Experimental's own Wine (11.0, with fsync, through Xwayland) needs the
+sandbox to share the host's IPC namespace (X11 shared-memory images) and a
+prefix of its own. `VICTORY_WINE=proton` has the script use it that way
+(`prefix-proton`, the X11 socket of `DISPLAY`).
+
+Checked on 2026-11-25 on the machine above:
+
+- System Wine 11.22 entered the opening story (the prologue).
+- Proton Experimental, started outside the script with its own
+  `proton runinprefix`, entered the prologue too.
+- `VICTORY_WINE=proton VICTORY_WARM=1` through the script, with `DISPLAY` set
+  to a private Xwayland server, ran the warm-up and then the title; the intro
+  movie played at 30 frames per second in the three intervals measured.
+
+These runs still showed missing or wrong rendering, and some of them reset
+the GPU. An earlier run with Proton's Wine crashed after three and a half
+minutes with a write to address 0 in the title's own code; that crash has not
+been looked into since.
 
 ## Three compute pipelines vkd3d-proton cannot make
 
@@ -52,13 +88,19 @@ not depend on it.
 
 ## Known problems
 
-- **Black frames.** The scene's brightness before tone mapping swings by a
-  factor of about 100 from frame to frame (large, small, zero), and the frame
-  where it reaches zero is black. The title measures the picture's brightness
-  on the card, reads the result back and sets the next frames' exposure from
-  it. The numbers suggest it pairs a measurement with the wrong frame's
-  exposure. Not found yet. `VICTORY_LATE_WAIT=0 VICTORY_RELAY=0` (everything
-  waited for) was too slow here to tell: 6.5 s a frame.
+- **Missing or wrong rendering.** The latest runs (2026-11-25) still draw
+  parts of scenes and characters wrong or not at all. Not fixed.
+- **GPU resets.** Some of the latest runs reset the GPU. The cause is not
+  known.
+- **Black frames (earlier runs).** Earlier runs showed every second or third
+  frame of the 3D world black. In those runs the scene's brightness before
+  tone mapping swung by a factor of about 100 from frame to frame (large,
+  small, zero), and the black frames were the ones where it reached zero. The
+  title measures the picture's brightness on the card, reads it back and sets
+  later frames' exposure from it, so a measurement paired with the wrong frame
+  is one possible cause. It has not been confirmed.
+  `VICTORY_LATE_WAIT=0 VICTORY_RELAY=0` (everything waited for) was too slow
+  here to tell: 6.5 s a frame.
 - **A fresh shader cache takes minutes.** The first launch translates about
   3,200 shaders and vkd3d-proton compiles each pipeline; hundreds of draws a
   frame are dropped meanwhile. Every change to the translator (a new build,

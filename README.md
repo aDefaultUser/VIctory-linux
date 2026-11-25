@@ -11,8 +11,8 @@ with or endorsed by the game's developer or publisher.
 
 ## Status
 
-Not playable yet. Tested on one Linux machine with a Radeon RX 9070 XT,
-Wine 11.22 and Proton Experimental:
+Not playable yet. Tested on one Linux machine (2026-11-25) with a Radeon RX
+9070 XT, Wine 11.22 and Proton Experimental:
 
 - The title boots.
 - The intro movie plays at 30 fps (measured with frame capture turned off).
@@ -25,21 +25,34 @@ Exact versions and known problems are kept in [docs/linux.md](docs/linux.md).
 
 You need:
 
-- Rust (the version in `rust-toolchain.toml`) with the
-  `x86_64-pc-windows-msvc` target, `clang-cl`, `lld-link`, and an MSVC CRT and
-  Windows SDK (`xwin` can fetch both)
+- Rust (rustup installs the version and Windows target that
+  `rust-toolchain.toml` names)
+- [cargo-xwin](https://github.com/rust-cross/cargo-xwin) with clang, lld and
+  llvm from your distribution, for the cross build
 - Wine, or Proton's own Wine with `VICTORY_WINE=proton`
 - Proton Experimental, for its vkd3d-proton and DXVK DLLs
 - bubblewrap
 - a native `d3dcompiler_47.dll` (winetricks keeps one in its cache)
 
-Build the Windows executable and start the title in a sandbox without network:
+Build the Windows executable. cargo-xwin downloads the MSVC CRT and Windows
+SDK on first use, which means accepting
+[Microsoft's license](https://go.microsoft.com/fwlink/?LinkId=2086102).
+[docs/linux.md](docs/linux.md#building-the-windows-executable) has the
+details and the manual route.
 
 ```sh
-cargo build --release -p victory --target x86_64-pc-windows-msvc
-PROTON_WINE_LIBS="<Proton Experimental>/files/lib/wine" \
+cargo install --locked cargo-xwin
+cargo xwin build --release -p victory --target x86_64-pc-windows-msvc
+```
+
+Start the title in a sandbox without network. The Proton path below is
+Steam's default; the game folder and executable name are examples, so use
+your own:
+
+```sh
+PROTON_WINE_LIBS="$HOME/.local/share/Steam/steamapps/common/Proton - Experimental/files/lib/wine" \
   scripts/run-linux.sh target/x86_64-pc-windows-msvc/release/victory.exe \
-  <game folder> <title exe name>
+  "$HOME/Games/Title" "Title.exe"
 ```
 
 The script's header lists its settings. Two are worth knowing first:
@@ -59,11 +72,13 @@ The script's header lists its settings. Two are worth knowing first:
 You need Windows 10 or 11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
 model 6.6 and mesh shaders, and Rust.
 
+The game path below is an example; use your own.
+
 ```powershell
 copy victory.example.toml victory.toml   # point it at your files, outside the repository
 cargo run -p victory -- config           # check the paths
 cargo build --release -p victory
-target\release\victory.exe run <game folder>\<title exe> --execute
+target\release\victory.exe run "D:\Games\Title\Title.exe" --execute
 ```
 
 Saves, settings and `crashes.log` go to `%LOCALAPPDATA%\victory\data`.

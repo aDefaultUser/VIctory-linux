@@ -12,7 +12,8 @@ screenshots or logs that quote title data. Derived data lives in the cache and
 data folders outside the repository, and code that writes it calls
 `victory_core::ensure_outside_repo`. Tests use synthetic data made by our own
 code. [docs/asset-policy.md](docs/asset-policy.md) is the full rule. If
-something slips into a commit, history has to be rewritten.
+something slips into a commit, tell the maintainers; they decide how to remove
+it from history.
 
 ## Workspace conventions
 
@@ -42,8 +43,21 @@ run them by name with `--ignored --nocapture`. Tests that need files outside the
 repository read their paths from environment variables (for example
 `VICTORY_XMA_STREAMS`, `VICTORY_BCPACK_TABLES`) and are also `#[ignore]`d.
 
-Do not start the title, GPU stress runs or driver changes unless you were asked
-to. They need the user's own game files and can reset the display driver.
+## Runs on real hardware
+
+- A run of the title uses the tester's own game files and private state: the
+  Wine prefix, shader and pipeline caches, saves, captures and logs live under
+  `VICTORY_STATE` or the data and cache folders, outside the repository, and
+  stay with the tester.
+- Claims about rendering or speed come from runs of the title on real
+  hardware, not from unit tests or warm-ups. Note the date, machine, GPU
+  driver, Wine or Proton build and the `VICTORY_*` settings, and measure frame
+  rates with frame capture turned off.
+- Compatibility notes say what was tested and how: which Wine or Proton build,
+  through `scripts/run-linux.sh` or another launcher, and how far the title
+  got. Mark anything untested as untested, and keep dated results in
+  `docs/linux.md`.
+- Title runs and GPU stress tests can reset the display driver.
 
 ## Validation
 
