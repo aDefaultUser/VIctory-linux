@@ -850,6 +850,37 @@ pub(super) const WAVE_OR_V7_TO_S7: [u32; 20] = [
     0xBEFE_0404, // s_mov_b64 exec, s[4:5]
 ];
 
+/// A wave64 program's body (the thread index in v0, root constants in s0 and s1, a raw UAV in
+/// s[8:11]). The lanes below s0 are a mask kept in s[24:25] across a loop of s1 iterations (at
+/// least one). In each, the lanes below 40 count a copy of it (`s_bcnt1`), add the iteration's
+/// number and store that to dword 0; then the mask moves out to s[12:13] and back a dword at a
+/// time, as the compiler spills an SGPR pair. The copy is written where not every lane runs,
+/// of the loop's join of the mask and its restored dwords, and that join only ever holds the
+/// compare's bits from before the loop. Dword 0 ends as `min(s0, 64) + max(s1, 1) - 1`.
+#[cfg(test)]
+pub(super) const MASK_KEPT_ACROSS_A_LOOP: [u32; 20] = [
+    0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+    0xBE98_046A, // s_mov_b64 s[24:25], vcc
+    0xBE86_0380, // s_mov_b32 s6, 0
+    0x7D88_00A8, // loop: v_cmp_gt_u32 vcc, 40, v0
+    0xBE8E_246A, // s_and_saveexec_b64 s[14:15], vcc
+    0xBF88_0006, // s_cbranch_execz to the restore of EXEC
+    0xBE90_0418, // s_mov_b64 s[16:17], s[24:25]
+    0xBE87_1010, // s_bcnt1_i32_b64 s7, s[16:17]
+    0x8107_0607, // s_add_i32 s7, s7, s6
+    0x7E02_0207, // v_mov_b32 v1, s7
+    0x38 << 26 | 0x1C << 18,
+    0x80 << 24 | 2 << 16 | 1 << 8, // buffer_store_dword v1, off, s[8:11], 0
+    0xBEFE_040E,                   // s_mov_b64 exec, s[14:15]
+    0xBE8C_0318,                   // s_mov_b32 s12, s24
+    0xBE8D_0319,                   // s_mov_b32 s13, s25
+    0xBE98_030C,                   // s_mov_b32 s24, s12
+    0xBE99_030D,                   // s_mov_b32 s25, s13
+    0x8106_8106,                   // s_add_i32 s6, s6, 1
+    0xBF0A_0106,                   // s_cmp_lt_u32 s6, s1
+    0xBF85_FFEF,                   // s_cbranch_scc1 loop
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

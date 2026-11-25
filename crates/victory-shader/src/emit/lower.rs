@@ -281,6 +281,8 @@ struct Lower<'a> {
     balloting: HashSet<Value>,
     /// Block writing each value.
     def_block: HashMap<Value, usize>,
+    /// Each dword a plain scalar move writes, with the dword it copies ([`scalar_copies`]).
+    copies: HashMap<Value, Value>,
     /// IR block being lowered.
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
@@ -1241,6 +1243,59 @@ fn half_input_partners(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, u8> {
     partners
 }
 
+/// Each dword a plain scalar move (`s_mov_b32`, `s_mov_b64` from registers) writes, with the
+/// dword it copies: the move's reads in order, spill slots included.
+fn scalar_copies(p: &Program) -> HashMap<Value, Value> {
+    let mut out = HashMap::new();
+    for i in p.blocks.iter().flat_map(|b| &b.insts) {
+        let dwords = match i.name() {
+            "s_mov_b32" => 1,
+            "s_mov_b64" => 2,
+            _ => continue,
+        };
+        let Fields::Sop { src, .. } = &i.fields else {
+            continue;
+        };
+        if !matches!(src[..], [Operand::Scalar { .. }])
+            || i.reads.len() != dwords
+            || i.writes.len() != dwords
+        {
+            continue;
+        }
+        for (&(_, w), &(_, r)) in i.writes.iter().zip(&i.reads) {
+            out.insert(w, r);
+        }
+    }
+    out
+}
+
+/// The value `v` holds wherever it runs: the one value from outside that the copies and joins
+/// `v` is made of all go back to, or `v` itself when there are several (or too many to follow).
+fn same_bits(
+    v: Value,
+    copies: &HashMap<Value, Value>,
+    phi_at: &HashMap<Value, (usize, usize)>,
+    p: &Program,
+) -> Value {
+    let (mut seen, mut stack, mut outside) = (HashSet::new(), vec![v], None);
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) {
+            continue;
+        }
+        if seen.len() > 256 {
+            return v;
+        }
+        if let Some(&from) = copies.get(&x) {
+            stack.push(from);
+        } else if let Some(&(b, i)) = phi_at.get(&x) {
+            stack.extend(p.blocks[b].phis[i].args.iter().copied());
+        } else if outside.replace(x).is_some_and(|o| o != x) {
+            return v;
+        }
+    }
+    outside.unwrap_or(v)
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -1583,6 +1638,7 @@ impl<'a> Lower<'a> {
                         .chain(block.phis.iter().map(move |phi| (phi.value, b)))
                 })
                 .collect(),
+            copies: scalar_copies(p),
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
@@ -3138,6 +3194,14 @@ impl<'a> Lower<'a> {
         let made = self.def_block.get(&lo).copied();
         let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
         if !self.x.st.active.contains(&lo) && !whole {
+            // A copy of a mask, or a join of copies of one (a mask spilled a dword at a time
+            // and restored across a loop), holds that mask's bits wherever it is read. That
+            // mask's ballot is taken, or refused with its own block to take wave-wide.
+            let same = same_bits(v, &self.copies, &self.phi_at, self.x.p);
+            let same_lo = self.x.st.highs.get(&same).copied().unwrap_or(same);
+            if same != v && self.x.st.masks.contains_key(&same_lo) {
+                return self.mask_dword(same);
+            }
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
             }
@@ -11891,6 +11955,85 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    /// A 64-lane console wave of one 64-thread group runs
+    /// [`super::super::wave::MASK_KEPT_ACROSS_A_LOOP`]: a copy of a mask, of the loop's join of
+    /// it and its dwords moved out and back, read in a per-lane branch on other lanes. On host
+    /// waves of 64 and of 32 that join is the compare's mask from before the loop, whose
+    /// ballot is exact: no "lane mask holding lanes elsewhere". (The card runs it in
+    /// `wave64_tests`.)
+    #[test]
+    fn a_mask_moved_out_and_back_across_a_loop_is_read_as_the_mask_it_copies() {
+        let mut words = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
+            125 << 25, // s_load_dwordx4 s[8:11], s[4:5], 0
+        ];
+        words.extend_from_slice(&super::super::wave::MASK_KEPT_ACROSS_A_LOOP);
+        words.push(S_ENDPGM);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 16,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
+                threads: [64, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, true, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        for host_wave in [64, 32] {
+            let was = super::TEST_HOST_WAVE.replace(Some(host_wave));
+            let lowered = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            });
+            super::TEST_HOST_WAVE.set(was);
+            let lowered = lowered.unwrap_or_else(|e| panic!("host waves of {host_wave}: {e}"));
+            assert!(
+                lowered.wave_ops,
+                "host waves of {host_wave}: the count is a ballot"
+            );
+        }
     }
 
     #[test]

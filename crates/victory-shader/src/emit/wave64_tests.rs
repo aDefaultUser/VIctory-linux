@@ -530,3 +530,36 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// [`super::wave::MASK_KEPT_ACROSS_A_LOOP`]: a copy of a mask, of a loop's join of it and its
+/// dwords moved out and back, counted in a per-lane branch on other lanes (those below 40).
+/// The count is the mask's, all 64 lanes of it, in every iteration: on whichever host wave
+/// size the card takes, dword 0 ends as `min(s0, 64) + max(s1, 1) - 1`.
+#[test]
+fn a_mask_moved_out_and_back_across_a_loop_counts_the_lanes_it_copies() {
+    let native = native(&super::wave::MASK_KEPT_ACROSS_A_LOOP);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = Vec::new();
+    for host_wave in [32, 64] {
+        let shader = lowered_on(&native, &p, &HashSet::new(), host_wave)
+            .unwrap_or_else(|e| panic!("host waves of {host_wave}: {e}"));
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        for (below, iterations) in [(64u32, 1u32), (63, 3), (40, 2), (33, 0), (32, 1), (17, 4), (1, 1), (0, 3)] {
+            let Some(got) = on_the_card(&shader, [below, iterations]) else {
+                break;
+            };
+            let expected = below.min(64) + iterations.max(1) - 1;
+            assert_eq!(got, expected, "host waves of {host_wave}: {below} lanes in the mask, {iterations} iterations");
+            if !ran.contains(&host_wave) {
+                ran.push(host_wave);
+            }
+        }
+    }
+    if !ran.is_empty() {
+        eprintln!("ran on the hardware device with host waves of {ran:?}: the mask's count in every case");
+    }
+}
