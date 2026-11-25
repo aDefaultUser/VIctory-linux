@@ -180,6 +180,13 @@ pub fn run(o: Options) -> Result<()> {
         let notes_path = shaders
             .with_file_name("pipelines")
             .join(format!("warm-pipelines-{driver}.txt"));
+        // The library beside the notes is refused the same way at
+        // `use_shader_cache`; the title's launch goes on either way.
+        if let Err(e) = notes_allowed(&notes_path) {
+            eprintln!("warm-up      compute pipelines not made: {e:#}");
+            let _ = std::io::stdout().flush();
+            return Ok(());
+        }
         let pipeline_threads = (threads / 2).max(1);
         let stall = Duration::from_secs(o.pipeline_seconds.max(1));
         let started = Instant::now();
@@ -409,6 +416,20 @@ struct PipelineCounts {
     skipped: usize,
     stalled: usize,
     not_started: usize,
+}
+
+/// Whether warm-up notes may be kept at `notes`, checked before it is
+/// opened. The asset policy resolves links among its folders and a note
+/// file's link to something that exists. A note file that links to nothing
+/// is refused too: opening it would create the link's target, which the
+/// policy cannot resolve. (A folder that links to nothing cannot be opened
+/// through.)
+fn notes_allowed(notes: &Path) -> Result<()> {
+    victory_core::ensure_outside_repo(notes)?;
+    let dangling = std::fs::symlink_metadata(notes).is_ok_and(|m| m.file_type().is_symlink())
+        && std::fs::metadata(notes).is_err();
+    anyhow::ensure!(!dangling, "{} is a link to nothing", notes.display());
+    Ok(())
 }
 
 /// Makes the compute pipelines of `todo` on `threads` workers, as
@@ -753,6 +774,41 @@ mod tests {
         let notes = Notes::parse(&text);
         assert_eq!(notes.0.get(A), Some(&Note::Begun));
         assert_eq!(notes.0.get(B), Some(&Note::Made));
+    }
+
+    /// Notes are not kept through a link into a source tree (here: a
+    /// folder holding the repository's marker), whether the link is the
+    /// notes' folder or the note file, and whether or not its target exists.
+    #[cfg(unix)]
+    #[test]
+    fn notes_are_not_kept_through_a_link_into_a_source_tree() {
+        use std::os::unix::fs::symlink;
+        let cache = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::write(tree.path().join(victory_core::policy::ROOT_MARKER), "").unwrap();
+        let pipelines = cache.path().join("pipelines");
+        let notes = pipelines.join("warm-pipelines-x.txt");
+        notes_allowed(&notes).unwrap();
+
+        symlink(tree.path(), &pipelines).unwrap();
+        assert!(notes_allowed(&notes).is_err(), "folder links into the tree");
+        std::fs::remove_file(&pipelines).unwrap();
+
+        std::fs::create_dir(&pipelines).unwrap();
+        notes_allowed(&notes).unwrap();
+        let there = tree.path().join("notes.txt");
+        std::fs::write(&there, "").unwrap();
+        symlink(&there, &notes).unwrap();
+        assert!(
+            notes_allowed(&notes).is_err(),
+            "note file links into the tree"
+        );
+        std::fs::remove_file(&notes).unwrap();
+
+        let nowhere = tree.path().join("not-yet.txt");
+        symlink(&nowhere, &notes).unwrap();
+        assert!(notes_allowed(&notes).is_err(), "note file links to nothing");
+        assert!(!nowhere.exists());
     }
 
     fn jobs(n: usize) -> Vec<(String, Vec<u8>)> {
