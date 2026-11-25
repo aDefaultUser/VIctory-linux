@@ -3223,6 +3223,25 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    /// A host slot made from a view of a texture says so in the stride
+    /// table, one made from a constant buffer view says 0, and a buffer
+    /// view its bytes per element.
+    #[test]
+    fn slot_words_say_what_a_view_shows() {
+        use victory_shader::emit::SLOT_IMAGE;
+        // Resource dimensions: 1 a buffer, 3 a 2D texture.
+        let (mut texture, mut buffer) = ([0u32; 14], [0u32; 14]);
+        texture[0] = 3;
+        buffer[0] = 1;
+        assert_eq!(slot_word(&View::Placed(false, texture, [0; 16])), SLOT_IMAGE);
+        assert_eq!(slot_word(&View::Constant(0x1000, 256)), 0);
+        // A structured buffer view (dimension buffer, 16-byte elements).
+        let mut structured = [0u32; 16];
+        structured[1] = 1;
+        structured[7] = 16;
+        assert_eq!(slot_word(&View::Placed(false, buffer, structured)), 16);
+    }
+
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
     #[test]

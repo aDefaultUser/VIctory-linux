@@ -424,6 +424,15 @@ impl Module {
         self.push(block, to, Op::Cast(op, v))
     }
     pub fn cmp(&mut self, block: usize, pred: u8, a: V, b: V) -> V {
+        // Integer predicates start at EQ; below it they are floating ones,
+        // which the writer emits as is (an `ult` on integers that way was
+        // dropped by the driver's compiler).
+        debug_assert_eq!(
+            pred >= pred::EQ,
+            matches!(self.types[self.type_of(a).0 as usize], TypeDef::Int(_)),
+            "comparison predicate {pred} on {:?}",
+            self.types[self.type_of(a).0 as usize]
+        );
         let t = self.int(1);
         self.push(block, t, Op::Cmp(pred, a, b))
     }

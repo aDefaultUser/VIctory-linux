@@ -5549,7 +5549,7 @@ impl<'a> Lower<'a> {
             let zero = self.s.m.i32(0);
             let none = self.s.m.i32(super::shader::SLOT_NONE);
             let not_constant = self.s.m.cmp(self.cur, pred::NE, stride, zero);
-            let below_none = self.s.m.cmp(self.cur, pred::ULT, stride, none);
+            let below_none = self.s.m.cmp(self.cur, pred::IULT, stride, none);
             let is_buffer = self.s.m.bin(self.cur, Bin::And, not_constant, below_none);
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
@@ -10221,7 +10221,7 @@ impl<'a> Lower<'a> {
             outside.push((new, x));
         }
         let none = self.s.m.i32(super::shader::SLOT_NONE);
-        let fits = self.s.m.cmp(head, pred::ULT, stride, none);
+        let fits = self.s.m.cmp(head, pred::IULT, stride, none);
         let at = self.begin_guarded(Some(fits));
         // The word read above serves the guarded access too.
         self.strides.insert((self.cur, load, first), stride);
