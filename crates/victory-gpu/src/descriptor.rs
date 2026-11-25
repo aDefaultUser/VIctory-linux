@@ -1323,13 +1323,16 @@ mod tests {
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 
-    /// The stride table tells shaders that pick a slot by index what it
-    /// holds as the slot changes: a texture (not to be read as a buffer or
-    /// a constant buffer), a constant buffer, then nothing.
+    /// The stride table tells shaders that pick a slot by index what its
+    /// host slot shows as the slot changes: a texture (not to be read as a
+    /// buffer or a constant buffer), a constant buffer not made (constant
+    /// buffers are made for draws, from a host copy), a texture, nothing.
+    /// Slots never written, and those past the title's (made per draw),
+    /// have nothing to read.
     #[cfg(windows)]
     #[test]
-    fn the_stride_table_follows_what_a_slot_holds() {
-        use victory_shader::emit::SLOT_IMAGE;
+    fn the_stride_table_follows_what_a_slot_shows() {
+        use victory_shader::emit::{SLOT_IMAGE, SLOT_NONE};
         let desc = HeapDesc {
             kind: VIEWS_KIND,
             count: 8,
@@ -1342,17 +1345,23 @@ mod tests {
         if let Some(host) = heap(h).host() {
             let null = std::ptr::null();
             let slot2 = heap(h).start + 2 * 32;
+            assert_eq!(host.stride_word(2), SLOT_NONE, "never written");
+            assert_eq!(host.stride_word(8), SLOT_NONE, "past the title's slots");
             create_srv(null, null, std::ptr::null(), slot2);
             assert_eq!(host.stride_word(2), SLOT_IMAGE);
+            // A constant buffer with no host copy: not made, for a draw
+            // either.
             create_cbv(null, &[0x1000, 1, 256, 0], slot2);
-            assert_eq!(host.stride_word(2), 0);
+            assert_eq!(host.stride_word(2), SLOT_NONE);
+            host.mirror(2, slot2, true);
+            assert_eq!(host.stride_word(2), SLOT_NONE);
             create_srv(null, null, std::ptr::null(), slot2);
             assert_eq!(host.stride_word(2), SLOT_IMAGE);
             // The title clears the slot: no view there.
             // SAFETY: a slot of the heap's memory.
             unsafe { std::ptr::write_bytes(slot2 as *mut u8, 0, 32) };
             host.mirror(2, slot2, false);
-            assert_eq!(host.stride_word(2), 0);
+            assert_eq!(host.stride_word(2), SLOT_NONE);
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
     }

@@ -114,7 +114,7 @@ pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_IMAGE, SLOT_MEMORY,
-    SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_NONE, SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit, view_heap_limit,
 };
 
@@ -1888,7 +1888,10 @@ mod heap_pick_tests {
             let texel = [[1.0f32, 2.0, 3.0, 4.0]];
             let constants = [0xC0_FFEE; 64];
             let buffer = [0xB0_FFEE; 4];
-            // Heap: a texture, a constant buffer, a raw buffer, the UAV.
+            // Heap: a texture, a constant buffer, a raw buffer, the UAV, a
+            // texture in a slot with nothing to read (past the title's
+            // slots, where draws make their tables: its word was 0, read
+            // as a constant buffer's, before such slots had one).
             let views = [
                 host::View::Texture(1, 1, &texel),
                 host::View::Cbv(&constants),
@@ -1897,9 +1900,10 @@ mod heap_pick_tests {
                     stride: host::Stride::Raw,
                 },
                 host::View::RawUav(32),
+                host::View::Texture(1, 1, &texel),
             ];
-            let strides = vec![SLOT_IMAGE, 0, 1, 1];
-            for (slot, want) in [(0, 0), (1, 0xC0_FFEE), (2, 0xB0_FFEE)] {
+            let strides = vec![SLOT_IMAGE, 0, 1, 1, SLOT_NONE];
+            for (slot, want) in [(0, 0), (1, 0xC0_FFEE), (2, 0xB0_FFEE), (4, 0)] {
                 let mut ud = vec![0u32; cs.user_data_dwords().max(1) as usize];
                 for u in cs
                     .user_data
@@ -2055,9 +2059,10 @@ mod heap_pick_tests {
     /// view the program picks from the heap read a buffer view as before,
     /// the element scaled by the stride in the host's table and nothing
     /// past the buffer's end, and do not run on a slot the table says
-    /// holds a texture: its descriptor read as a buffer's names no memory
-    /// of the buffer's (the scalar form faulted at 0 on an RX 9070 XT
-    /// under Proton). They read zeros there.
+    /// shows a texture or nothing (a slot past the title's, which a draw
+    /// may have made a texture's): a texture's descriptor read as a
+    /// buffer's names no memory of the buffer's (the scalar form faulted
+    /// at 0 on an RX 9070 XT under Proton). They read zeros there.
     #[test]
     fn a_heap_slot_picked_for_a_vector_load_is_read_only_if_it_holds_no_texture() {
         let words: [u32; 16] = [
@@ -2086,8 +2091,8 @@ mod heap_pick_tests {
             let texel = [[1.0f32, 2.0, 3.0, 4.0]];
             let data: Vec<u32> = (0..48).map(|i| 0xB000 + i).collect();
             // Heap: a texture, a buffer of 8-byte elements (made raw, as
-            // the host makes buffer views), the texture again (its word 0,
-            // so that the UAV sits at slot 3), the UAV the lanes write.
+            // the host makes buffer views), a texture in a slot with
+            // nothing to read, the UAV the lanes write.
             let views = [
                 host::View::Texture(1, 1, &texel),
                 host::View::Buffer {
@@ -2097,11 +2102,12 @@ mod heap_pick_tests {
                 host::View::Texture(1, 1, &texel),
                 host::View::RawUav(64),
             ];
-            let strides = [SLOT_IMAGE, 8, SLOT_IMAGE, 1];
-            let Some(runs) = run_picking(l, &views, &strides, &[0, 1]) else {
+            let strides = [SLOT_IMAGE, 8, SLOT_NONE, 1];
+            let Some(runs) = run_picking(l, &views, &strides, &[0, 1, 2]) else {
                 return;
             };
             assert_eq!(runs[0][0], vec![0; 64], "a texture's slot");
+            assert_eq!(runs[2][0], vec![0; 64], "a slot with nothing to read");
             // Element `lane` at byte 8 * lane: past the 48 dwords from
             // lane 24 on.
             let by_element = (0..32).map(|lane| if lane < 24 { 0xB000 + 2 * lane } else { 0 });
@@ -2114,7 +2120,8 @@ mod heap_pick_tests {
     /// A store and a returning atomic (`buffer_store_dword`,
     /// `buffer_atomic_add ... glc`) through a view the program picks from
     /// the heap write a buffer view as before, and write nothing on a slot
-    /// the table says holds a texture; the atomic returns 0 there.
+    /// the table says shows a texture or nothing; the atomic returns 0
+    /// there.
     #[test]
     fn a_heap_slot_picked_for_a_vector_write_is_written_only_if_it_holds_no_texture() {
         let words: [u32; 16] = [
@@ -2140,14 +2147,16 @@ mod heap_pick_tests {
         let _ = l;
         #[cfg(windows)]
         {
-            // Heap: a texture UAV, a raw UAV, the UAV the lanes write.
+            // Heap: a texture UAV, a raw UAV, the UAV the lanes write, a
+            // texture UAV in a slot with nothing to read.
             let views = [
                 host::View::TextureUav(32, 1),
                 host::View::RawUav(32),
                 host::View::RawUav(32),
+                host::View::TextureUav(32, 1),
             ];
-            let strides = [SLOT_IMAGE, 1, 1];
-            let Some(runs) = run_picking(l, &views, &strides, &[0, 1]) else {
+            let strides = [SLOT_IMAGE, 1, 1, SLOT_NONE];
+            let Some(runs) = run_picking(l, &views, &strides, &[0, 1, 3]) else {
                 return;
             };
             assert_eq!(runs[0][0], vec![0; 4 * 32], "the texture written");
@@ -2156,6 +2165,12 @@ mod heap_pick_tests {
                 vec![0; 32],
                 "the atomic's result on a texture's slot"
             );
+            assert_eq!(
+                runs[2][3],
+                vec![0; 4 * 32],
+                "the texture of a slot with nothing to read written"
+            );
+            assert_eq!(runs[2][2], vec![0; 32], "the atomic's result there");
             let stored: Vec<u32> = (0..32).map(|lane| lane + 2).collect();
             let old: Vec<u32> = (0..32).map(|lane| lane + 1).collect();
             assert_eq!(runs[1][1], stored, "a buffer's slot");

@@ -16,9 +16,10 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
 /// index it computes (SM 6.6 dynamic resources): a raw buffer of
-/// [`SLOT_STRIDES_COUNT`] dwords the host keeps, dword `i` the bytes per
-/// element of the buffer view at heap slot `i` ([`SLOT_IMAGE`]: a view of
-/// a texture; 0: anything else, a constant buffer or nothing).
+/// [`SLOT_STRIDES_COUNT`] dwords the host keeps, dword `i` what host slot
+/// `i` shows: the bytes per element of a buffer view, 0 for a constant
+/// buffer, [`SLOT_IMAGE`] for a view of a texture, [`SLOT_NONE`] for
+/// nothing to read (a null slot, a slot past the title's).
 /// The console's descriptor holds that stride and its hardware multiplies
 /// the element index by it; the program's code does not say it, and the
 /// used-resource list only names what tables hold. A shader that has this
@@ -33,6 +34,10 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 /// texture's descriptor as a constant buffer's. A stride no buffer view
 /// has.
 pub const SLOT_IMAGE: u32 = u32::MAX;
+/// In the [`SLOT_STRIDES`] table: nothing to read at the slot (null, or no
+/// slot of the title's). Words from it up name no buffer: a shader reads
+/// zeros and writes nothing there.
+pub const SLOT_NONE: u32 = u32::MAX - 1;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
