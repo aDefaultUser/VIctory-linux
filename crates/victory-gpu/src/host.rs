@@ -629,7 +629,18 @@ fn create() -> windows::core::Result<Host> {
             .is_ok()
         {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
-            victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+            // `VICTORY_HOST_WAVE=32`: a host that also runs waves of 64 (AMD)
+            // is given the translations a host of 32 gets (NVIDIA's, the
+            // ones most runs were made with).
+            let asked = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.trim().parse::<u32>().ok());
+            let max = match asked {
+                Some(lanes) if (o1.WaveLaneCountMin..=o1.WaveLaneCountMax).contains(&lanes) => {
+                    tracing::info!(lanes, "translating for this wave size (VICTORY_HOST_WAVE)");
+                    lanes
+                }
+                _ => o1.WaveLaneCountMax,
+            };
+            victory_shader::emit::set_host_max_wave(max);
         }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
