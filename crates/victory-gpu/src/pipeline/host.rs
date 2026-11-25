@@ -608,6 +608,9 @@ impl HostPipeline {
                 ..Default::default()
             };
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            if !super::warm_gate(&name) {
+                return None;
+            }
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.

@@ -92,11 +92,17 @@ Vulkan start-up waits for it), though the warm-up opens no window.
   will do). With no sources it says so and the launch goes on.
 - **Bounds.** `VICTORY_WARM_SECONDS` (default 600) stops new work; the
   sandbox is ended a minute later if a driver call never returns. A pipeline
-  not back within `--pipeline-seconds` (default 30) is left behind. Each
-  pipeline is noted before and after it is asked for
-  (`cache/pipelines/warm-pipelines-<driver>.txt`, by a hash of the loaded
-  `d3d12core.dll`), and the next warm-up with that driver skips the ones that
-  never came back or were refused. A warm-up that fails does not stop the
+  not back within `--pipeline-seconds` (default 30) is left to its worker,
+  which takes no more work; after four are left behind no more pipelines are
+  started. Each pipeline is noted before and after it is asked for, by its
+  name in the pipeline library (a hash of the translated code and root
+  signature), in `cache/pipelines/warm-pipelines-<driver>.txt` (a hash of the
+  loaded `d3d12core.dll` and of `VKD3D_CONFIG`, `VKD3D_DISABLE_EXTENSIONS`,
+  `VKD3D_FEATURE_LEVEL`, `VKD3D_SHADER_MODEL`, `RADV_DEBUG`, `RADV_PERFTEST`
+  and `ACO_DEBUG` when set). The next warm-up with that driver and those
+  settings skips the ones that never came back or were refused, until a
+  change to the translator, its switches or the host changes what the driver
+  is handed. A warm-up that fails does not stop the
   launch. The Wine server is waited for at the end, so that a prefix the
   warm-up made is written out before the sandbox ends.
 

@@ -60,14 +60,16 @@ pub fn warm_host() -> bool {
 }
 
 /// The warm-up's compute pipelines: see `victory_gpu::pipeline::warm_compute`.
-pub fn warm_compute(container: &[u8]) -> Option<bool> {
+/// `gate` is handed the pipeline's name in the pipeline library just
+/// before the host is asked for it, and decides whether it is.
+pub fn warm_compute(container: &[u8], gate: Box<dyn FnMut(&str) -> bool>) -> Option<bool> {
     #[cfg(windows)]
     {
-        victory_gpu::pipeline::warm_compute(container)
+        victory_gpu::pipeline::warm_compute(container, gate)
     }
     #[cfg(not(windows))]
     {
-        let _ = container;
+        let _ = (container, gate);
         None
     }
 }

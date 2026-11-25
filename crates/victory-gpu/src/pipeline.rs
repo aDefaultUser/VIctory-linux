@@ -734,12 +734,32 @@ pub fn use_host_device() -> bool {
     crate::host::host().is_some()
 }
 
+/// The warm-up's say on a pipeline, given its name in the library.
+#[cfg(windows)]
+pub type WarmGate = Box<dyn FnMut(&str) -> bool>;
+
+#[cfg(windows)]
+thread_local! {
+    static WARM_GATE: std::cell::RefCell<Option<WarmGate>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Whether the host is asked for the pipeline named `name` (its name in
+/// the library, which holds the translated code and the root signature):
+/// always, but in [`warm_compute`] on this thread, where its gate decides.
+#[cfg(windows)]
+fn warm_gate(name: &str) -> bool {
+    WARM_GATE.with(|g| g.borrow_mut().as_mut().is_none_or(|gate| gate(name)))
+}
+
 /// For the warm-up: the host pipeline of a compute container, made the way
 /// a run's first dispatch with it makes it, so that the pipeline library
-/// and the driver's own caches hold it. `None` if the container holds no
-/// compute program or does not translate; else whether the host made it.
+/// and the driver's own caches hold it. `gate` is handed the pipeline's
+/// name in the library just before the host is asked, and the host is not
+/// asked if it says no. `None` if the container holds no compute program
+/// or does not translate; else whether the host made it (`false` too when
+/// the root signature was refused or the gate said no).
 #[cfg(windows)]
-pub fn warm_compute(container: &[u8]) -> Option<bool> {
+pub fn warm_compute(container: &[u8], gate: WarmGate) -> Option<bool> {
     use victory_shader::{Container, FourCC, HwStage};
     let dxil = Container::parse(container).ok()?.part(FourCC::DXIL)?.data;
     let programs = victory_shader::native_programs(dxil).ok()?;
@@ -754,7 +774,10 @@ pub fn warm_compute(container: &[u8]) -> Option<bool> {
         translated: OnceLock::new(),
     });
     shader.translated()?;
-    Some(host::HostPipeline::new(&[shader], None).is_some())
+    WARM_GATE.with(|g| *g.borrow_mut() = Some(gate));
+    let made = host::HostPipeline::new(&[shader], None).is_some();
+    WARM_GATE.with(|g| *g.borrow_mut() = None);
+    Some(made)
 }
 
 /// What tells one host driver build from another for the warm-up's notes
