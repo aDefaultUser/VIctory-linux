@@ -174,9 +174,21 @@ impl GraphicsState {
         }
     }
 
-    /// Everything the state holds, as text: part of a pipeline's name in
-    /// the library and of the key a title pipeline is started early by.
+    /// Everything the state holds, as the title gave it, as text: the key
+    /// a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
+        self.describe_with(&self.blend)
+    }
+
+    /// The state as the host is given it, as text: part of a pipeline's
+    /// name in the library, which must change when the description the
+    /// library holds does. Where `host_blend` changes nothing it is the
+    /// same as `describe`, keeping the names stored before.
+    fn host_describe(&self) -> String {
+        self.describe_with(&host_blend(&self.blend, &self.targets))
+    }
+
+    fn describe_with(&self, blend: &D3D12_BLEND_DESC) -> String {
         let inputs: Vec<String> = self
             .inputs
             .iter()
@@ -195,7 +207,7 @@ impl GraphicsState {
         };
         format!(
             "{:?} {} {:?} {:?}{bounds} {inputs:?} {} {} {:?} {} {:?}",
-            self.blend,
+            blend,
             self.sample_mask,
             self.rasterizer,
             self.depth,
@@ -262,6 +274,76 @@ pub(crate) struct Input {
     pub(crate) offset: u32,
     pub(crate) format: u32,
     pub(crate) per_instance: bool,
+}
+
+/// Whether a render target format holds integers, which D3D12 does not
+/// blend.
+fn integer_target(format: DXGI_FORMAT) -> bool {
+    matches!(
+        format,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
+}
+
+/// The title's blend state as the host takes it: blending off on integer
+/// targets. The console ignores blending there; D3D12 refuses the whole
+/// pipeline (vkd3d-proton: "Enabling blending on RT n with format
+/// DXGI_FORMAT_R8_UINT"). Every other target keeps the blending it had, so
+/// a shared description over a mix of targets becomes an independent one,
+/// with blending off where no target is (vkd3d-proton refuses an
+/// independent state that blends there under dual-source blending, and
+/// reads those entries by output signature index). A state D3D12 takes as
+/// it is comes back unchanged.
+fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D12_BLEND_DESC {
+    let formats = &targets.RTFormats[..targets.NumRenderTargets.min(8) as usize];
+    let independent = blend.IndependentBlendEnable.as_bool();
+    let blended = |i: usize| {
+        blend.RenderTarget[if independent { i } else { 0 }]
+            .BlendEnable
+            .as_bool()
+    };
+    let refused = |i: usize| blended(i) && integer_target(formats[i]);
+    if !(0..formats.len()).any(refused) {
+        return *blend;
+    }
+    let mut out = *blend;
+    if !independent && formats.iter().any(|&f| !integer_target(f)) {
+        // Every target takes the shared state, to differ on the integer ones.
+        out.RenderTarget = [blend.RenderTarget[0]; 8];
+        out.IndependentBlendEnable = true.into();
+        for (i, t) in out.RenderTarget.iter_mut().enumerate() {
+            if formats.get(i).is_none_or(|&f| f == DXGI_FORMAT_UNKNOWN) {
+                t.BlendEnable = false.into();
+            }
+        }
+    }
+    let independent = out.IndependentBlendEnable.as_bool();
+    for (i, &format) in formats.iter().enumerate() {
+        if integer_target(format) {
+            out.RenderTarget[if independent { i } else { 0 }].BlendEnable = false.into();
+        }
+    }
+    out
 }
 
 /// The console's own primitive topology types.
@@ -574,7 +656,7 @@ impl HostPipeline {
         } else {
             false
         };
-        let state = g.describe();
+        let state = g.host_describe();
         if mesh.is_some() {
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
@@ -634,7 +716,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: host_blend(&g.blend, &g.targets),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -876,12 +958,13 @@ fn mesh_pipeline(
         samples: Sub<DXGI_SAMPLE_DESC>,
         topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
     }
+    let blend = host_blend(&g.blend, &g.targets);
     let build = |depth: Sub<_>| {
         let mut stream = Stream {
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
@@ -900,7 +983,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
@@ -1058,6 +1141,207 @@ mod tests {
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
         );
+    }
+
+    /// Three targets, the last an integer one as in the title's refused
+    /// mesh pipeline, and a blend state that blends all three (additive,
+    /// with alpha to coverage and a write mask to see they are kept).
+    fn mixed() -> (D3D12_BLEND_DESC, D3D12_RT_FORMAT_ARRAY) {
+        let mut blend = GraphicsState::default().blend;
+        blend.AlphaToCoverageEnable = true.into();
+        for t in &mut blend.RenderTarget {
+            t.BlendEnable = true.into();
+            t.DestBlend = D3D12_BLEND_ONE;
+            t.RenderTargetWriteMask = 0x7;
+        }
+        let mut targets = D3D12_RT_FORMAT_ARRAY {
+            NumRenderTargets: 3,
+            ..Default::default()
+        };
+        targets.RTFormats[..3].copy_from_slice(&[
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_R8_UINT,
+        ]);
+        (blend, targets)
+    }
+
+    #[test]
+    fn blending_stays_as_it_is_where_the_host_takes_it() {
+        let (mut blend, mut targets) = mixed();
+        // Shared blending over float targets only.
+        targets.NumRenderTargets = 2;
+        assert_eq!(host_blend(&blend, &targets), blend);
+        // An integer target past the ones in use is not looked at.
+        targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
+        assert_eq!(host_blend(&blend, &targets), blend);
+        // Independent blending already off on the integer target.
+        targets.NumRenderTargets = 3;
+        blend.IndependentBlendEnable = true.into();
+        blend.RenderTarget[2].BlendEnable = false.into();
+        blend.RenderTarget[2].SrcBlend = D3D12_BLEND_ZERO;
+        assert_eq!(host_blend(&blend, &targets), blend);
+    }
+
+    #[test]
+    fn shared_blending_over_mixed_targets_turns_off_on_the_integer_one() {
+        let (mut blend, targets) = mixed();
+        // Past the first target, a shared state's entries are not used.
+        for t in &mut blend.RenderTarget[1..] {
+            *t = D3D12_RENDER_TARGET_BLEND_DESC::default();
+        }
+        let host = host_blend(&blend, &targets);
+        assert!(host.IndependentBlendEnable.as_bool());
+        assert!(host.AlphaToCoverageEnable.as_bool());
+        assert_eq!(host.RenderTarget[0], blend.RenderTarget[0]);
+        assert_eq!(host.RenderTarget[1], blend.RenderTarget[0]);
+        let integer = D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: false.into(),
+            ..blend.RenderTarget[0]
+        };
+        assert_eq!(host.RenderTarget[2], integer);
+    }
+
+    #[test]
+    fn shared_blending_over_integer_targets_only_stays_shared() {
+        let (blend, mut targets) = mixed();
+        targets.NumRenderTargets = 2;
+        targets.RTFormats[..2].copy_from_slice(&[DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R32_SINT]);
+        let host = host_blend(&blend, &targets);
+        let mut expected = blend;
+        expected.RenderTarget[0].BlendEnable = false.into();
+        assert_eq!(host, expected);
+    }
+
+    #[test]
+    fn independent_blending_turns_off_on_integer_targets_only() {
+        let (mut blend, targets) = mixed();
+        blend.IndependentBlendEnable = true.into();
+        blend.RenderTarget[1].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        let host = host_blend(&blend, &targets);
+        let mut expected = blend;
+        expected.RenderTarget[2].BlendEnable = false.into();
+        assert_eq!(host, expected);
+    }
+
+    /// Dual-source blending over the first target, a gap, then an integer
+    /// target the pixel shader does not write.
+    fn dual_source() -> (D3D12_BLEND_DESC, D3D12_RT_FORMAT_ARRAY) {
+        let (mut blend, mut targets) = mixed();
+        blend.RenderTarget[0].DestBlend = D3D12_BLEND_SRC1_COLOR;
+        targets.RTFormats[1] = DXGI_FORMAT_UNKNOWN;
+        (blend, targets)
+    }
+
+    #[test]
+    fn shared_blending_made_independent_is_off_where_no_target_is() {
+        let (blend, targets) = dual_source();
+        let host = host_blend(&blend, &targets);
+        assert!(host.IndependentBlendEnable.as_bool());
+        assert_eq!(host.RenderTarget[0], blend.RenderTarget[0]);
+        for (i, t) in host.RenderTarget.iter().enumerate().skip(1) {
+            assert!(!t.BlendEnable.as_bool(), "target {i} blends");
+            let unblended = D3D12_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: false.into(),
+                ..blend.RenderTarget[0]
+            };
+            assert_eq!(*t, unblended, "target {i}");
+        }
+    }
+
+    /// A library name follows the blend state the host is given: the same
+    /// as before where `host_blend` changes nothing, a new one where it
+    /// does (else the entry stored with the title's state never loads).
+    #[test]
+    fn library_names_change_only_with_the_host_blend_state() {
+        let mut g = GraphicsState::default();
+        let (blend, targets) = mixed();
+        (g.blend, g.targets) = (blend, targets);
+        g.targets.NumRenderTargets = 2;
+        assert_eq!(host_blend(&g.blend, &g.targets), g.blend);
+        assert_eq!(g.host_describe(), g.describe());
+        g.targets.NumRenderTargets = 3;
+        assert_ne!(host_blend(&g.blend, &g.targets), g.blend);
+        assert_ne!(g.host_describe(), g.describe());
+        let mut host = GraphicsState::default();
+        (host.blend, host.targets) = (host_blend(&g.blend, &g.targets), g.targets);
+        assert_eq!(g.host_describe(), host.describe());
+    }
+
+    /// The host takes `host_blend`'s state over mixed targets, shared and
+    /// independent alike, and with dual-source blending over a gap. Whether
+    /// it takes the title's own state differs between runtimes (vkd3d-proton
+    /// takes blending on an integer target the shader does not write), so
+    /// that is only reported. Wine's vkd3d refuses any dual-source state with
+    /// more than one target, so the dual-source case is checked only where
+    /// the title's own state loads.
+    #[test]
+    fn the_host_takes_blending_over_mixed_targets() {
+        let Some(host) = host() else {
+            return;
+        };
+        const VS: &str = "float4 main(uint i : SV_VertexID) : SV_Position {
+            return float4((i << 1) & 2, i & 2, 0.5, 1);
+        }";
+        // The root signature is in the pixel shaders: empty, needing no
+        // heap indexing (shader model 6.6).
+        const MIXED: &str =
+            "struct O { float4 a : SV_Target0; float4 b : SV_Target1; uint c : SV_Target2; };
+            [RootSignature(\"RootFlags(0)\")] O main() { O o; o.a = 1; o.b = 1; o.c = 1; return o; }";
+        const DUAL: &str = "struct O { float4 a : SV_Target0; float4 b : SV_Target1; };
+            [RootSignature(\"RootFlags(0)\")] O main() { O o; o.a = 1; o.b = 1; return o; }";
+        let compile = |src: &str, profile| {
+            crate::host::compile(src, windows::core::s!("main"), profile).unwrap()
+        };
+        let vs = compile(VS, windows::core::s!("vs_5_1"));
+        let mixed_ps = compile(MIXED, windows::core::s!("ps_5_1"));
+        let dual_ps = compile(DUAL, windows::core::s!("ps_5_1"));
+        // SAFETY: the shader's own root signature.
+        let root: ID3D12RootSignature =
+            unsafe { host.device.CreateRootSignature(0, &mixed_ps[..]) }.unwrap();
+        let g = GraphicsState::default();
+        let make = |ps: &[u8], blend: D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY| {
+            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                // SAFETY: borrowed pointer, never released by the descriptor.
+                pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+                VS: code(&vs),
+                PS: code(ps),
+                BlendState: blend,
+                SampleMask: g.sample_mask,
+                RasterizerState: g.rasterizer,
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: targets.NumRenderTargets,
+                RTVFormats: targets.RTFormats,
+                SampleDesc: g.samples,
+                ..Default::default()
+            };
+            // SAFETY: the description points at live data.
+            unsafe {
+                host.device
+                    .CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc)
+            }
+        };
+        let (mut blend, targets) = mixed();
+        let mut cases = Vec::new();
+        for independent in [false, true] {
+            blend.IndependentBlendEnable = independent.into();
+            let case = format!("independent {independent}");
+            cases.push((case, &mixed_ps, blend, targets));
+        }
+        let (blend, targets) = dual_source();
+        cases.push(("dual source".into(), &dual_ps, blend, targets));
+        for (case, ps, blend, targets) in cases {
+            let title = make(ps, blend, &targets).map(drop);
+            eprintln!("{case}: the title's own state: {title:?}");
+            if case == "dual source" && title.is_err() {
+                eprintln!(
+                    "dual source: skipped, the host refuses dual-source blending with several targets before any normalization"
+                );
+                continue;
+            }
+            make(ps, host_blend(&blend, &targets), &targets)
+                .unwrap_or_else(|e| panic!("{case}: host_blend's state refused: {e}"));
+        }
     }
 
     const VS: &str = "float4 main(uint i : SV_VertexID) : SV_Position {
