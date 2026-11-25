@@ -362,21 +362,20 @@ impl Note {
 
 impl Notes {
     fn parse(text: &str) -> Notes {
-        let mut notes = HashMap::new();
-        for line in text.lines() {
-            let mut words = line.split_whitespace();
-            let (Some(word), Some(name)) = (words.next(), words.next()) else {
-                continue;
-            };
-            let note = match word {
-                "begun" => Note::Begun,
-                "made" => Note::Made,
-                "refused" => Note::Refused,
-                _ => continue,
-            };
-            notes.insert(name.to_owned(), note);
-        }
-        Notes(notes)
+        let notes = text.lines().filter_map(Notes::line);
+        Notes(notes.map(|(name, note)| (name.to_owned(), note)).collect())
+    }
+
+    /// The pipeline name and note of one line, if it is a note.
+    fn line(line: &str) -> Option<(&str, Note)> {
+        let mut words = line.split_whitespace();
+        let note = match words.next()? {
+            "begun" => Note::Begun,
+            "made" => Note::Made,
+            "refused" => Note::Refused,
+            _ => return None,
+        };
+        Some((words.next()?, note))
     }
 
     /// Whether the pipeline named `name` is asked for: unless an earlier
@@ -418,18 +417,72 @@ struct PipelineCounts {
     not_started: usize,
 }
 
-/// Whether warm-up notes may be kept at `notes`, checked before it is
-/// opened. The asset policy resolves links among its folders and a note
+/// Whether warm-up notes may be kept at `notes`, checked before they are
+/// read. The asset policy resolves links among its folders and a note
 /// file's link to something that exists. A note file that links to nothing
-/// is refused too: opening it would create the link's target, which the
-/// policy cannot resolve. (A folder that links to nothing cannot be opened
-/// through.)
+/// is refused too, as the policy cannot resolve it. (A folder that links to
+/// nothing cannot be opened through.) Links the policy cannot see, such as
+/// a Unix link under Wine, are never written through: see [`open_notes`].
 fn notes_allowed(notes: &Path) -> Result<()> {
     victory_core::ensure_outside_repo(notes)?;
     let dangling = std::fs::symlink_metadata(notes).is_ok_and(|m| m.file_type().is_symlink())
         && std::fs::metadata(notes).is_err();
     anyhow::ensure!(!dangling, "{} is a link to nothing", notes.display());
     Ok(())
+}
+
+/// The earlier notes at `notes`, and the file this warm-up's notes go to.
+///
+/// The file at `notes` is only ever read: its notes are written to a file
+/// this process makes anew beside it, which then takes its place, so what
+/// was at `notes` (perhaps a link the policy cannot see, such as a Unix
+/// link under Wine) is replaced, never written through. The earlier notes
+/// are in the new file before any pipeline is asked for, and each note is
+/// one write to it after, so a process that ends at any point keeps them.
+/// Notes that cannot be read are left as they are and none are kept. Of two
+/// warm-ups of one driver at once, the notes of the one replaced first are
+/// lost: their pipelines are asked for again.
+fn open_notes(notes: &Path) -> (Notes, std::io::Result<std::fs::File>) {
+    let text = match std::fs::read(notes) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return (Notes::default(), Err(e)),
+    };
+    let kept: String = text
+        .lines()
+        .filter(|line| Notes::line(line).is_some())
+        .flat_map(|line| [line, "\n"])
+        .collect();
+    (Notes::parse(&kept), replace_notes(notes, &kept))
+}
+
+/// Writes `kept` to a new file beside `notes`, then renames it to `notes`,
+/// returning it open at its end.
+fn replace_notes(notes: &Path, kept: &str) -> std::io::Result<std::fs::File> {
+    let (Some(dir), Some(name)) = (notes.parent(), notes.file_name()) else {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    };
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(
+        "{}.{}.tmp",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    match file
+        .write_all(kept.as_bytes())
+        .and_then(|()| std::fs::rename(&tmp, notes))
+    {
+        Ok(()) => Ok(file),
+        Err(e) => {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 /// Makes the compute pipelines of `todo` on `threads` workers, as
@@ -443,19 +496,11 @@ fn make_pipelines(
     stall: Duration,
     deadline: Option<Instant>,
 ) -> PipelineCounts {
-    let earlier = Arc::new(Notes::parse(
-        &std::fs::read_to_string(notes).unwrap_or_default(),
-    ));
-    if let Some(dir) = notes.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(notes);
+    let (earlier, file) = open_notes(notes);
     if let Err(e) = &file {
         eprintln!("warm-up      notes not kept in {}: {e}", notes.display());
     }
+    let earlier = Arc::new(earlier);
     let file = Arc::new(Mutex::new(file.ok()));
     let make = move |hash: &str, bytes: &[u8]| {
         // The gate runs on this thread, before the host is asked: the
@@ -809,6 +854,76 @@ mod tests {
         symlink(&nowhere, &notes).unwrap();
         assert!(notes_allowed(&notes).is_err(), "note file links to nothing");
         assert!(!nowhere.exists());
+    }
+
+    /// A note file that is another name of a file elsewhere (a hard link,
+    /// or a Unix link that the policy does not see under Wine) is replaced
+    /// by a file of the warm-up's own: the file elsewhere is never written,
+    /// and the earlier notes in it are kept.
+    #[test]
+    fn notes_replace_another_name_instead_of_writing_through_it() {
+        type Alias = fn(&Path, &Path) -> std::io::Result<()>;
+        let aliases: &[Alias] = &[
+            |original, link| std::fs::hard_link(original, link),
+            #[cfg(unix)]
+            |original, link| std::os::unix::fs::symlink(original, link),
+        ];
+        for alias in aliases {
+            let cache = tempfile::tempdir().unwrap();
+            let tree = tempfile::tempdir().unwrap();
+            let held = tree.path().join("held.txt");
+            let earlier =
+                format!("begun {A} 0000000000000001\nnot a note\nmade {B} 0000000000000002\n");
+            std::fs::write(&held, &earlier).unwrap();
+            let pipelines = cache.path().join("pipelines");
+            std::fs::create_dir(&pipelines).unwrap();
+            let notes = pipelines.join("warm-pipelines-x.txt");
+            alias(&held, &notes).unwrap();
+
+            let (read, file) = open_notes(&notes);
+            let file = Mutex::new(Some(file.unwrap()));
+            note(&file, Note::Begun, C, "0000000000000003");
+            drop(file);
+
+            assert_eq!(std::fs::read_to_string(&held).unwrap(), earlier);
+            assert!(std::fs::symlink_metadata(&notes).unwrap().is_file());
+            assert!(!read.retry(A) && read.retry(B) && read.retry(C));
+            assert_eq!(
+                std::fs::read_to_string(&notes).unwrap(),
+                format!(
+                    "begun {A} 0000000000000001\nmade {B} 0000000000000002\nbegun {C} 0000000000000003\n"
+                )
+            );
+            let names: Vec<_> = std::fs::read_dir(&pipelines).unwrap().collect();
+            assert_eq!(names.len(), 1, "no temporary file left");
+        }
+    }
+
+    /// Notes that are there but cannot be read are left as they are.
+    #[test]
+    fn notes_that_cannot_be_read_are_not_replaced() {
+        let cache = tempfile::tempdir().unwrap();
+        let notes = cache.path().join("warm-pipelines-x.txt");
+        std::fs::create_dir(&notes).unwrap();
+        let (read, file) = open_notes(&notes);
+        assert!(file.is_err());
+        assert_eq!(read, Notes::default());
+        assert!(notes.is_dir());
+        assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn notes_start_where_there_were_none() {
+        let cache = tempfile::tempdir().unwrap();
+        let notes = cache.path().join("pipelines").join("warm-pipelines-x.txt");
+        let (read, file) = open_notes(&notes);
+        let file = Mutex::new(Some(file.unwrap()));
+        note(&file, Note::Made, A, "0000000000000001");
+        assert_eq!(read, Notes::default());
+        assert_eq!(
+            std::fs::read_to_string(&notes).unwrap(),
+            format!("made {A} 0000000000000001\n")
+        );
     }
 
     fn jobs(n: usize) -> Vec<(String, Vec<u8>)> {
