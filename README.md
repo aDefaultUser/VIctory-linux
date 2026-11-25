@@ -61,17 +61,16 @@ PROTON_WINE_LIBS="$HOME/.local/share/Steam/steamapps/common/Proton - Experimenta
   "$HOME/Games/Title" "Title.exe"
 ```
 
-The script's header lists its settings, and `VICTORY_X=value` arguments after
-the executable name are passed to the title.
-[docs/linux.md](docs/linux.md#latest-tested-runs) shows the settings of the
-tested runs. Two are worth knowing first:
+The opening-scene tests used a patched vkd3d-proton build and the flags in
+[the tested configuration](docs/linux.md#latest-tested-runs). Pass
+`VICTORY_X=value` arguments after the executable name to apply them.
 
 - `VICTORY_WARM=1` fills the shader caches before the launch, and
   `VICTORY_WARM=only` does that and stops. Leave it out to start the title
   straight away. It translates the shader sources that earlier warm runs
   captured on your machine, and builds compute pipelines with `--pipelines`
-  (the default). The title creates graphics pipelines and streams textures
-  as it reaches them.
+  (the default). The layer creates graphics pipelines on demand and uploads
+  texture bytes as the title streams them.
 - `VKD3D_DLLS` points at another vkd3d-proton build. Three of the title's
   compute shaders stall the compiler in stock vkd3d-proton. A build with the
   matching dxil-spirv backport makes all three. That build is not bundled

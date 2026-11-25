@@ -26,8 +26,8 @@ settings.
 - `VICTORY_HEAP_SYNC_TABLES` unset, so only table slots whose host slot does
   not show their record are mirrored (the default)
 
-These runs cover the opening. Later scenes and performance with default
-settings remain unverified.
+These runs cover the opening. Later scenes, native Windows behavior and
+performance with default settings remain unverified.
 
 The command below applies those settings through the script. A separate
 140-second smoke test with the Proton script warmed the cache and entered the
