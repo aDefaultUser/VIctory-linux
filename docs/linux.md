@@ -1,14 +1,14 @@
 # Running under Wine on Linux
 
-Tested on one machine (2026-11-25): CachyOS, kernel 7.3.5, Radeon RX 9070
+Tested on one machine (2026-11-25): CachyOS, kernel 7.3.5, Radeon RX 9070 XT
 (RADV, Mesa 26.3.1), Wine 11.22, vkd3d-proton 2576c0b4 as shipped with Proton
 Experimental `experimental-11.0-20261112`. `scripts/run-linux.sh` starts a
 title with the settings below.
 
-State on that machine: boot, menus and loading screens work; the opening
-cutscene and the first room are drawn and lit, at 0.3 to 2 frames per second.
-Every second or third frame of the 3D world is still black (see "Known
-problems").
+State on that machine: the title boots, and the intro movie plays at 30 frames
+per second in a run with frame capture turned off. Some characters and scenes
+of the opening story render. Missing or wrong rendering and GPU resets are
+still being investigated (see "Known problems").
 
 ## What it needs
 
