@@ -155,18 +155,11 @@ impl Mapped {
         Some(mapped)
     }
 
-    /// A new file of `len` bytes at `path` (replacing what is there),
-    /// mapped for writing.
-    fn create(path: &std::path::Path, len: usize) -> Option<Mapped> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
-            .ok()?;
+    /// `file` (open to read and write), made `len` bytes long and mapped
+    /// for writing.
+    fn create(file: &std::fs::File, len: usize) -> Option<Mapped> {
         file.set_len(len as u64).ok()?;
-        Mapped::map(&file, len, true)
+        Mapped::map(file, len, true)
     }
 
     fn bytes(&self) -> &[u8] {
@@ -597,16 +590,20 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    // One save at a time, so that a later save's files are renamed after
+    // an earlier one's and replace them.
+    static ONE_SAVE: Mutex<()> = Mutex::new(());
+    let _one = ONE_SAVE.lock().unwrap_or_else(|e| e.into_inner());
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
-    // The bytes of the library written to `tmp`; 0 when no pipeline was
-    // added: the library on disk is then what it was, and only the early
-    // list is written (a title pipeline first drawn with wrote all 1,352 MB
-    // of the library again: run 60's second save).
-    let bytes = {
+    // The library written to a new file, and the pipelines added before
+    // it was written; none when no pipeline was added: the library on disk
+    // is then what it was, and only the early list is written (a title
+    // pipeline first drawn with wrote all 1,352 MB of the library again:
+    // run 60's second save).
+    let serialised = {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
@@ -615,25 +612,36 @@ pub(crate) fn save(now: bool) {
             return;
         }
         if added == 0 {
-            0
+            None
         } else {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
             let _call = call("serialise", "the whole library");
-            if let Err(e) = serialise(&library.library, &tmp, size) {
-                tracing::warn!(error = %e, "host pipeline library not serialised");
-                let _ = std::fs::remove_file(&tmp);
-                return;
+            match serialise(&library.library, dir, size) {
+                Ok(file) => {
+                    library.added.store(0, Ordering::Relaxed);
+                    SAVED.store(size as u64, Ordering::Relaxed);
+                    Some((file, size, added))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "host pipeline library not serialised");
+                    USED_CHANGED.store(true, Ordering::Relaxed);
+                    return;
+                }
             }
-            library.added.store(0, Ordering::Relaxed);
-            SAVED.store(size as u64, Ordering::Relaxed);
-            size
         }
     };
+    let bytes = serialised.as_ref().map_or(0, |w| w.1);
     // Read from the file first if this process never asked (the warm-up):
     // the list on disk is written back, not emptied.
     let used: Vec<String> = used().iter().flatten().cloned().collect();
-    let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+    let library_written = match serialised {
+        Some((mut file, _, added)) => replace_library(dir, &mut file).inspect_err(|_| {
+            // The next save writes it again.
+            library.added.fetch_add(added, Ordering::Relaxed);
+        }),
+        None => Ok(()),
+    };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
@@ -659,45 +667,105 @@ pub(crate) fn save(now: bool) {
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Err(e) => {
+            tracing::warn!(error = %e, "host pipeline library not saved");
+            USED_CHANGED.store(true, Ordering::Relaxed);
+        }
     }
 }
 
-/// Writes the library's `size` serialised bytes to the file `tmp`: through
-/// a mapping of that file, so that the bytes are the file's pages and not
-/// 1.3 GB more of the process's own memory for the seconds a save takes;
-/// through a buffer where the file cannot be mapped (and with
-/// `VICTORY_LIBRARY_MAP=0`).
-fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usize) -> std::io::Result<()> {
+/// A file made by this writer under a name nothing had, beside the file it
+/// is to replace; removed when dropped unless renamed. Only its handle is
+/// written, so a link or file a fixed name already held is never written
+/// through or truncated.
+struct NewFile {
+    file: std::fs::File,
+    path: PathBuf,
+    renamed: bool,
+}
+
+impl NewFile {
+    fn beside(path: &std::path::Path) -> std::io::Result<NewFile> {
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        };
+        let mut last = std::io::ErrorKind::AlreadyExists.into();
+        for n in 0..64 {
+            let path = dir.join(format!("{}.{}.{n}.tmp", name.to_string_lossy(), std::process::id()));
+            // Read as well: a mapping for writing needs both.
+            match std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
+                Ok(file) => return Ok(NewFile { file, path, renamed: false }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = e,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last)
+    }
+
+    /// Renames the file to `to`, replacing what is there; the handle stays
+    /// open until then.
+    fn rename(&mut self, to: &std::path::Path) -> std::io::Result<()> {
+        std::fs::rename(&self.path, to)?;
+        self.renamed = true;
+        Ok(())
+    }
+}
+
+impl Drop for NewFile {
+    fn drop(&mut self) {
+        if !self.renamed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Writes the library's `size` serialised bytes to a new file in `dir`.
+fn serialise(library: &ID3D12PipelineLibrary1, dir: &std::path::Path, size: usize) -> std::io::Result<NewFile> {
     let failed = |e: windows::core::Error| std::io::Error::other(e.to_string());
-    if mapped()
-        && let Some(mut file) = Mapped::create(tmp, size)
-    {
-        // SAFETY: a buffer of the size the library asks for.
-        return unsafe { library.Serialize(file.bytes_mut()) }.map_err(failed);
+    // SAFETY: a buffer of the size the library asks for.
+    write_new(&dir.join(LIBRARY_FILE), size, mapped(), |bytes| unsafe { library.Serialize(bytes) }.map_err(failed))
+}
+
+/// A new file beside `path` holding the `size` bytes `fill` writes: with
+/// `map`, through a mapping of that file, so that the bytes are the file's
+/// pages and not 1.3 GB more of the process's own memory for the seconds a
+/// save takes; through a buffer without it (`VICTORY_LIBRARY_MAP=0`) or
+/// where the file cannot be mapped.
+fn write_new(
+    path: &std::path::Path,
+    size: usize,
+    map: bool,
+    fill: impl FnOnce(&mut [u8]) -> std::io::Result<()>,
+) -> std::io::Result<NewFile> {
+    use std::io::Write;
+    let mut file = NewFile::beside(path)?;
+    if map && let Some(mut view) = Mapped::create(&file.file, size) {
+        fill(view.bytes_mut())?;
+        return Ok(file);
     }
     let mut bytes = vec![0u8; size];
-    // SAFETY: a buffer of the size the library asks for.
-    unsafe { library.Serialize(&mut bytes) }.map_err(failed)?;
-    std::fs::write(tmp, &bytes)
+    fill(&mut bytes)?;
+    file.file.write_all(&bytes)?;
+    Ok(file)
 }
 
-/// Renames the written library `tmp` over the library's file in `dir`. This
+/// Renames the written library `file` over the library's file in `dir`. This
 /// run may have that file mapped: Windows 11 replaces a mapped file, and
 /// the mapping goes on reading the old one for as long as a handle on it
 /// is open ([`holds`]; with none, only the pages in memory at that moment
 /// stay: the rest read as zeros). Where a system refuses, the new library
 /// is left beside it as [`NEXT_FILE`] for the next start.
-fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+fn replace_library(dir: &std::path::Path, file: &mut NewFile) -> std::io::Result<()> {
+    file.rename(&dir.join(LIBRARY_FILE)).or_else(|_| file.rename(&dir.join(NEXT_FILE)))
 }
 
-/// Writes `bytes` to a temporary file beside `path`, then renames it over
+/// Writes `bytes` to a new file beside `path`, then renames it over
 /// `path`: a reader never sees a part.
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    use std::io::Write;
+    let mut file = NewFile::beside(path)?;
+    file.file.write_all(bytes)?;
+    file.rename(path)
 }
 
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
@@ -775,21 +843,72 @@ mod tests {
         assert!(matches!(blob, Blob::Mapped(_)) || !mapped());
         assert_eq!(blob.bytes(), &old[..]);
         // A save while the old file is mapped.
-        let tmp = path.with_extension("tmp");
         let new: Vec<u8> = (0..300_000u32).map(|i| (i * 7) as u8).collect();
-        {
-            let mut file = Mapped::create(&tmp, new.len()).expect("a new file, mapped");
-            file.bytes_mut().copy_from_slice(&new);
-        }
-        assert_eq!(std::fs::read(&tmp).unwrap(), new);
-        replace_library(dir.path(), &tmp).unwrap();
-        assert!(!tmp.exists());
+        let mut file = write_new(&path, new.len(), true, |b| {
+            b.copy_from_slice(&new);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&file.path).unwrap(), new);
+        replace_library(dir.path(), &mut file).unwrap();
+        assert!(!file.path.exists());
         // The mapping still reads the old library.
         assert_eq!(blob.bytes(), &old[..]);
         drop(blob);
         // The next start reads the new one, wherever the save left it.
         assert_eq!(Blob::of(dir.path()).bytes(), &new[..]);
         assert!(!dir.path().join(NEXT_FILE).exists());
+    }
+
+    /// A save writes only files it made: a link to another file at the
+    /// fixed names saves used before, or at the first name a save tries,
+    /// is neither written through nor removed, mapped or through a buffer.
+    /// A failed write leaves nothing behind.
+    #[test]
+    fn a_save_never_writes_through_a_name_already_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let elsewhere = other.path().join("elsewhere");
+        std::fs::write(&elsewhere, b"not ours").unwrap();
+        let first = |name: &str| dir.path().join(format!("{name}.{}.0.tmp", std::process::id()));
+        let taken = [
+            dir.path().join("host-pipelines.tmp"),
+            dir.path().join("early-pipelines.tmp"),
+            first(LIBRARY_FILE),
+            first(EARLY_FILE),
+        ];
+        for link in &taken {
+            std::fs::hard_link(&elsewhere, link).unwrap();
+        }
+        let listing = || {
+            let mut names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+            names.sort();
+            names
+        };
+        let before = listing();
+        for (map, fill) in [(true, 0x11u8), (false, 0x22)] {
+            let mut file = write_new(&dir.path().join(LIBRARY_FILE), 70_000, map, |b| {
+                b.fill(fill);
+                Ok(())
+            })
+            .unwrap();
+            assert!(!taken.contains(&file.path));
+            replace_library(dir.path(), &mut file).unwrap();
+            assert_eq!(std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap(), vec![fill; 70_000]);
+            write_atomically(&dir.path().join(EARLY_FILE), &[fill; 9]).unwrap();
+            assert_eq!(std::fs::read(dir.path().join(EARLY_FILE)).unwrap(), [fill; 9]);
+            // A save that fails removes the file it made, and only that.
+            let fail = |_: &mut [u8]| Err(std::io::ErrorKind::Other.into());
+            assert!(write_new(&dir.path().join(LIBRARY_FILE), 4096, map, fail).is_err());
+        }
+        assert_eq!(std::fs::read(&elsewhere).unwrap(), b"not ours");
+        for link in &taken {
+            assert_eq!(std::fs::read(link).unwrap(), b"not ours");
+        }
+        let mut after = before;
+        after.extend([LIBRARY_FILE, EARLY_FILE].map(std::ffi::OsString::from));
+        after.sort();
+        assert_eq!(listing(), after, "only the library and the early list are new");
     }
 
     /// The bytes at `at` of the pattern the test below writes.
@@ -847,12 +966,12 @@ mod tests {
         }
         let mapped = Mapped::open_holding(&path, true).expect("the file, mapped");
         // A save: the new library, renamed over the mapped one.
-        let tmp = path.with_extension("tmp");
-        {
-            let mut file = Mapped::create(&tmp, LEN).expect("a new file, mapped");
-            file.bytes_mut().fill(0xEE);
-        }
-        replace_library(dir.path(), &tmp).unwrap();
+        let mut file = write_new(&path, LEN, true, |b| {
+            b.fill(0xEE);
+            Ok(())
+        })
+        .unwrap();
+        replace_library(dir.path(), &mut file).unwrap();
         // Every page of the old mapping, read for the first time now.
         let mut expected = vec![0u8; 4096];
         for (page, bytes) in mapped.bytes().chunks(4096).enumerate() {
