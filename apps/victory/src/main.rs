@@ -8,6 +8,7 @@ mod inspect;
 mod run;
 mod shader;
 mod translate;
+mod warm;
 
 use std::path::PathBuf;
 
@@ -87,10 +88,42 @@ enum Command {
         /// Warm the run's shader cache: a file of shader hashes (the 16
         /// hex digits a run's log names a shader by, anywhere in a line);
         /// the containers with those hashes are translated into the
-        /// cache and nothing else is done. Set `VICTORY_HOST_WAVE` and
-        /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
+        /// cache and nothing else is done (as `victory warm --only`). The
+        /// host device is made as a run makes it; without one, set
+        /// `VICTORY_HOST_WAVE` and `VICTORY_VIEW_LIMIT` to what the run's
+        /// log says of the host.
         #[arg(long)]
         warm: Option<PathBuf>,
+    },
+    /// Fill the caches a run reads, before the run: translate shader
+    /// containers into the shader cache under the key a run looks them up
+    /// by (the host device is made as a run makes it), and with
+    /// --pipelines make compute pipelines into the pipeline library and the
+    /// driver's caches. Takes the containers a run with
+    /// `VICTORY_SHADER_SOURCES=1` kept, or the files and folders given.
+    Warm {
+        /// `.cdxil` files (read whole) and other files searched for
+        /// containers, or folders of them. Default: the cache's
+        /// `shader-sources` folder.
+        sources: Vec<PathBuf>,
+        /// Only the containers with the 16-hex-digit hashes this file names
+        /// (anywhere in a line: a run's log will do).
+        #[arg(long)]
+        only: Option<PathBuf>,
+        /// Translation threads (default 4); pipelines get half as many.
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Take no new work after this many seconds (what is done stays
+        /// done; the next warm-up goes on from there).
+        #[arg(long)]
+        seconds: Option<u64>,
+        /// Also make the compute containers' host pipelines.
+        #[arg(long)]
+        pipelines: bool,
+        /// Leave behind a pipeline the driver has not returned after this
+        /// many seconds (noted: not asked for again with this driver).
+        #[arg(long, default_value_t = 30)]
+        pipeline_seconds: u64,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -170,9 +203,51 @@ fn main() -> Result<()> {
                 victory_shader::emit::set_host_max_wave(n);
             }
             if let Some(file) = warm {
-                return translate::warm(paths, &file, jobs);
+                // `--warm all`: every container found, whatever its hash.
+                let all = file.as_os_str() == "all";
+                return warm::run(warm::Options {
+                    sources: default_paths(paths)?,
+                    only: (!all).then_some(file),
+                    jobs,
+                    seconds: std::env::var("VICTORY_WARM_SECONDS")
+                        .ok()
+                        .and_then(|v| v.trim().parse().ok()),
+                    pipelines: false,
+                    pipeline_seconds: 30,
+                });
             }
             translate::run(paths, validate, pipelines, list, jobs)
+        }
+        Command::Warm {
+            sources,
+            only,
+            jobs,
+            seconds,
+            pipelines,
+            pipeline_seconds,
+        } => {
+            // Without a host device, the translator's host facts come from
+            // these (a device overrides them, as in a run).
+            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                victory_shader::emit::set_view_heap_limit(n);
+            }
+            if let Some(n) = std::env::var("VICTORY_HOST_WAVE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                victory_shader::emit::set_host_max_wave(n);
+            }
+            warm::run(warm::Options {
+                sources,
+                only,
+                jobs,
+                seconds,
+                pipelines,
+                pipeline_seconds,
+            })
         }
         Command::Run {
             exe,

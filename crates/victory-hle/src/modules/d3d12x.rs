@@ -49,12 +49,64 @@ pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
     }
 }
 
+/// The warm-up's host: see `victory_gpu::pipeline::use_host_device`.
+pub fn warm_host() -> bool {
+    #[cfg(windows)]
+    {
+        victory_gpu::pipeline::use_host_device()
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+/// The warm-up's compute pipelines: see `victory_gpu::pipeline::warm_compute`.
+/// `gate` is handed the pipeline's name in the pipeline library just
+/// before the host is asked for it, and decides whether it is.
+pub fn warm_compute(container: &[u8], gate: Box<dyn FnMut(&str) -> bool>) -> Option<bool> {
+    #[cfg(windows)]
+    {
+        victory_gpu::pipeline::warm_compute(container, gate)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (container, gate);
+        None
+    }
+}
+
+/// See `victory_gpu::pipeline::host_driver_id`.
+pub fn host_driver_id() -> Option<String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::pipeline::host_driver_id()
+    }
+    #[cfg(not(windows))]
+    None
+}
+
+/// Writes the pipeline library now if pipelines were added.
+pub fn save_pipeline_cache() {
+    #[cfg(windows)]
+    victory_gpu::pipeline::save_pipeline_cache();
+}
+
+/// The folder the title's shader containers are kept in, beside the
+/// shader cache folder `shaders` (`VICTORY_SHADER_SOURCES=1`).
+pub fn shader_sources_dir(shaders: &std::path::Path) -> std::path::PathBuf {
+    shaders.with_file_name("shader-sources")
+}
+
 /// Keeps the host's translations of the title's shaders in `dir` (a
 /// folder of the cache) across runs, and its compiled pipelines beside it
-/// (`pipelines`).
+/// (`pipelines`). With `VICTORY_SHADER_SOURCES=1` (the Linux launcher's
+/// warm-up sets it) the containers translated are kept too
+/// (`shader-sources`), for `victory warm` before a later launch.
 pub fn use_shader_cache(dir: std::path::PathBuf) {
     #[cfg(windows)]
     {
+        if std::env::var_os("VICTORY_SHADER_SOURCES").is_some_and(|v| v == "1") {
+            victory_gpu::shader_sources::keep_sources(shader_sources_dir(&dir));
+        }
         victory_gpu::pipeline::use_pipeline_cache(dir.with_file_name("pipelines"));
         victory_gpu::shader_cache::use_shader_cache(dir);
     }

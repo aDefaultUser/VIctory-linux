@@ -35,6 +35,9 @@ Experimental's own Wine (11.0, with fsync, through Xwayland) drew the same
 picture, and the title crashed after three and a half minutes with a write to
 address 0 in its own code, in the one run made. It needs the sandbox to share
 the host's IPC namespace (X11 shared-memory images) and a prefix of its own.
+`VICTORY_WINE=proton` has the script use it that way (`prefix-proton`, the
+X11 socket of `DISPLAY`); only its warm-up has been run through the script so
+far.
 
 ## Three compute pipelines vkd3d-proton cannot make
 
@@ -58,7 +61,69 @@ not depend on it.
   waited for) was too slow here to tell: 6.5 s a frame.
 - **A fresh shader cache takes minutes.** The first launch translates about
   3,200 shaders and vkd3d-proton compiles each pipeline; hundreds of draws a
-  frame are dropped meanwhile.
+  frame are dropped meanwhile. Every change to the translator (a new build,
+  a switch it reads) keys the cache anew, so the next launch starts cold
+  again. The warm-up below does that work before the launch.
+
+## Warm-up before the launch
+
+`VICTORY_WARM=1` runs `victory warm` in the same sandbox, with the same DLLs,
+caches and `VICTORY_*` settings, before the title starts; `VICTORY_WARM=only`
+runs it alone and starts no title. Off by default. It works the same with
+`VICTORY_WINE=proton`; Proton's Wine gets the X11 display there too (without
+one, its `explorer.exe` restarts over and over in a prefix made earlier and
+Vulkan start-up waits for it), though the warm-up opens no window.
+
+- **Translations (DXIL).** Each shader container is translated into the shader
+  cache. The cache key holds the host facts the device hands the translator
+  (widest wave, view heap size), so the warm-up makes the host device as a
+  run does; its log shows the same `host wave lanes` and `host view heaps`
+  lines as a run's.
+- **Compute pipelines** (`--pipelines`, in the default `VICTORY_WARM_ARGS`).
+  Made as a run's first dispatch makes them: into the pipeline library and
+  vkd3d-proton's and Mesa's caches. Graphics pipelines need the title's
+  graphics state and are not made here; a run starts the ones it drew with
+  before at their creation (`early-pipelines.txt`), as it did already.
+- **Where the containers come from.** A run started with `VICTORY_WARM` keeps
+  every container it translates in the cache's `shader-sources` folder
+  (`VICTORY_SHADER_SOURCES=1`). The title's own files hold few of them as
+  plain containers. `victory warm <folder>` also takes `VICTORY_SHADER_SAVE`
+  folders; `--only <file>` limits it to the hashes a file names (a run's log
+  will do). With no sources it says so and the launch goes on.
+- **Bounds.** `VICTORY_WARM_SECONDS` (default 600) stops new work; the
+  sandbox is ended a minute later if a driver call never returns. A pipeline
+  not back within `--pipeline-seconds` (default 30) is left to its worker,
+  which takes no more work; after four are left behind no more pipelines are
+  started. Each pipeline is noted before and after it is asked for, by its
+  name in the pipeline library (a hash of the translated code and root
+  signature), in `cache/pipelines/warm-pipelines-<driver>.txt` (a hash of the
+  loaded `d3d12core.dll` and of `VKD3D_CONFIG`, `VKD3D_DISABLE_EXTENSIONS`,
+  `VKD3D_FEATURE_LEVEL`, `VKD3D_SHADER_MODEL`, `RADV_DEBUG`, `RADV_PERFTEST`
+  and `ACO_DEBUG` when set). The next warm-up with that driver and those
+  settings skips the ones that never came back or were refused, until a
+  change to the translator, its switches or the host changes what the driver
+  is handed. A warm-up that fails does not stop the
+  launch. The Wine server is waited for at the end, so that a prefix the
+  warm-up made is written out before the sandbox ends.
+
+Measured on the machine above (warm-up only, no title started, 4 translation
+threads, 2 pipeline threads):
+
+| case | result |
+|---|---|
+| cold shader cache, 3,235 containers | 2,839 + 395 translated in 140 s + 20 s (a 20 s limit, then a second warm-up that went on from there) |
+| shader cache of an earlier run, same translator | 3,233 of 3,235 found in the cache (the key matched the run's), 3 s |
+| compute pipelines, empty driver caches, stock vkd3d-proton 2576c0b4 | 1,133 made in 111 s; the three dxil-spirv #376 programs did not come back within 20 s and were left behind |
+| the same again | 1,133 loaded from the library in 1 to 2 s; the three skipped |
+| `VKD3D_DLLS` with the dxil-spirv e084e35c backport | 1,136 made in 6.5 s (driver caches of the runs before), the three included |
+| Proton Experimental's Wine, new and reused prefix | as with system Wine: same host facts, same driver, 3 to 13 s |
+
+What it does not change: textures, descriptors and streaming. Texture bytes
+come from the title at run time and are uploaded as it asks for them, so a
+warm cache does not fix missing or late textures in the world or on
+characters. Switching `VKD3D_DLLS` between a warm-up and a run makes the run
+reject the warm-up's pipeline library (each vkd3d-proton build refuses
+another's), which the script avoids by using the same DLLs for both.
 
 ## Finding out what a frame does
 
