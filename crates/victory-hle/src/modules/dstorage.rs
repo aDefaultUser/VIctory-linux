@@ -594,13 +594,11 @@ impl Lanes {
         }
     }
 
-    /// Moves a queue's enqueued commands to the workers. At the title's
-    /// submit (`by_title`) a page destination's pages are taken as its list
-    /// says now (`taken_at_submit`); at a submit of our own its list is read
-    /// when the request runs: the title fills or rewrites a list between its
-    /// enqueue and its submit, so one taken earlier may hold the numbers of
-    /// its last use, pages that exist but are no longer the destination.
-    fn submit(&mut self, id: u64, by_title: bool) {
+    /// Moves a queue's enqueued commands to the workers, a page
+    /// destination's with its pages as its list says now
+    /// (`taken_at_submit`). Only the title's submit moves page destinations
+    /// while their lists are taken at the submit (`Lane::holds_page_lists`).
+    fn submit(&mut self, id: u64) {
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
             return;
         };
@@ -624,11 +622,7 @@ impl Lanes {
             self.next_seq += 1;
             match command {
                 Command::Read(request) => {
-                    let pages = if by_title {
-                        taken_at_submit(&request)
-                    } else {
-                        None
-                    };
+                    let pages = taken_at_submit(&request);
                     lane.reads.push_back((seq, request, pages));
                 }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
@@ -637,28 +631,63 @@ impl Lanes {
         lane.flush();
     }
 
-    /// A queue full of enqueued commands submits them itself, as waiting
-    /// could not make room; its page lists are read when the requests run
-    /// (see `submit`). Whether it did.
-    fn submit_when_full(&mut self, id: u64) -> bool {
+    /// Makes room in queue `id` for one more command, if it can now.
+    ///
+    /// One slot stays free, as the console's count of empty slots says, so
+    /// a queue is full at one command short of its capacity. A full queue
+    /// waits for its submitted commands to finish. One holding nothing
+    /// submitted, whose room only the title's submit could make, submits
+    /// itself, unless page destinations wait in it for their lists to be
+    /// taken at the title's submit (`holds_page_lists`): a submit of our own
+    /// would hand the workers lists the title fills only after this enqueue
+    /// returns, while they may still name pages of their last use. Such a
+    /// queue takes the command beyond its capacity instead, until the
+    /// title's submit; the overcommitted commands are only ever unsubmitted
+    /// ones, so they hold no worker, staging or status beyond their own.
+    fn make_room(&mut self, id: u64) -> Room {
         let Some(lane) = self.lanes.get(&id) else {
-            return false;
+            return Room::Made;
         };
-        if lane.entries() != lane.unsubmitted.len() {
-            return false;
+        if lane.entries() + 1 < lane.capacity.max(2) {
+            return Room::Made;
         }
-        static EARLY: AtomicU64 = AtomicU64::new(0);
-        let early = EARLY.fetch_add(1, Ordering::Relaxed) + 1;
-        if early <= 8 || early.is_power_of_two() {
+        if lane.entries() != lane.unsubmitted.len() {
+            return Room::Wait;
+        }
+        let held = lane.holds_page_lists();
+        static FULL: AtomicU64 = AtomicU64::new(0);
+        let times = FULL.fetch_add(1, Ordering::Relaxed) + 1;
+        if times <= 8 || times.is_power_of_two() {
             tracing::warn!(
                 commands = lane.unsubmitted.len(),
-                times = early,
-                "dstorage: a queue full of enqueued commands submits before the title does; its page lists are read when the requests run"
+                capacity = lane.capacity,
+                times,
+                "dstorage: a queue full of enqueued commands before the title's submit {}",
+                if held {
+                    "holds them past its capacity (page lists are taken at the title's submit)"
+                } else {
+                    "submits them itself"
+                }
             );
         }
-        self.submit(id, false);
-        true
+        if held {
+            return Room::Made;
+        }
+        self.submit(id);
+        Room::Submitted
     }
+}
+
+/// What `Lanes::make_room` did.
+#[derive(Debug, PartialEq)]
+enum Room {
+    /// The command may be enqueued.
+    Made,
+    /// Full until a submitted command finishes.
+    Wait,
+    /// Its commands were submitted (statuses may be written already): ask
+    /// again.
+    Submitted,
 }
 
 impl Lane {
@@ -676,9 +705,18 @@ impl Lane {
         }
     }
 
-    /// Requests and status entries held, submitted or not.
+    /// Requests and status entries held, submitted or not; more than the
+    /// capacity only once it held page destinations past it (see
+    /// `Lanes::make_room`), until enough of them finish after the submit.
     fn entries(&self) -> usize {
         self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
+    }
+
+    /// Page destinations wait among the enqueued commands for their lists to
+    /// be taken at the title's submit (see `at_submit`): nothing but the
+    /// title's submit moves them to the workers.
+    fn holds_page_lists(&self) -> bool {
+        at_submit() && self.unsubmitted.iter().any(Command::to_pages)
     }
 
     /// Writes the status entries whose earlier reads have all finished.
@@ -789,10 +827,11 @@ impl Command {
 /// fills the table in), then submits, and may change the table again before
 /// the request runs. So the list is taken at the submit (the default,
 /// `VICTORY_PAGE_LIST=submit`), its pages held until the request is done,
-/// and a queue holding such requests does not submit on its own at half
-/// capacity (one full of enqueued commands still does, with their lists
-/// read when they run: `Lanes::submit_when_full`). `VICTORY_PAGE_LIST=late` reads the list when the request runs
-/// and submits at half capacity, as before, to compare. Analysis by
+/// and a queue holding such requests never submits on its own: not at half
+/// capacity, and not when full, where it takes commands past its capacity
+/// until the title's submit (`Lanes::make_room`). `VICTORY_PAGE_LIST=late`
+/// reads the list when the request runs and submits at half capacity, or
+/// when full, as before, to compare. Analysis by
 /// JappertjeV (PastiiJay/klbf-lab-beta#3), as PastiiJay/klbf-lab has it.
 fn at_submit() -> bool {
     static AT_SUBMIT: OnceLock<bool> = OnceLock::new();
@@ -894,12 +933,11 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
     queue(this, Command::Status(Status { array, index }));
 }
 
-/// Adds a command to the queue; blocks while the queue is full, and
-/// submits on its own once half of it is enqueued, as the console does,
-/// unless page destinations wait in it (their lists are right only at the
-/// title's submit, see `at_submit`): then it submits on its own only when
-/// it is full of enqueued commands, as waiting could not make room, and
-/// their lists are read when they run.
+/// Adds a command to the queue; blocks while the queue is full of
+/// submitted work, and submits on its own once half of it is enqueued, as
+/// the console does, or when it is full of enqueued commands. A queue that
+/// holds page destinations for the title's submit never submits on its own:
+/// full, it takes the command past its capacity (`Lanes::make_room`).
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
     let id = unsafe { &*this }.state.id;
@@ -908,16 +946,17 @@ fn queue(this: QueueRef, command: Command) {
     };
     let mut lanes = scheduler.lock();
     loop {
-        let Some(lane) = lanes.lanes.get(&id).filter(|l| !l.closed) else {
+        if !lanes.lanes.get(&id).is_some_and(|l| !l.closed) {
             return; // closed: dropped (a status releases its array)
-        };
-        // One slot stays free, as the console's count of empty slots says.
-        if lane.entries() + 1 < lane.capacity.max(2) {
-            break;
         }
-        if lanes.submit_when_full(id) {
-            scheduler.work.notify_all();
-            continue;
+        match lanes.make_room(id) {
+            Room::Made => break,
+            Room::Submitted => {
+                // Statuses with no reads before them were written at once.
+                scheduler.work.notify_all();
+                continue;
+            }
+            Room::Wait => {}
         }
         lanes = scheduler
             .finished
@@ -928,9 +967,8 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    let hold = at_submit() && lane.unsubmitted.iter().any(Command::to_pages);
-    if !hold && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
-        lanes.submit(id, false);
+    if !lane.holds_page_lists() && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+        lanes.submit(id);
         scheduler.work.notify_all();
     }
 }
@@ -944,7 +982,7 @@ extern "system" fn submit(this: QueueRef) {
     let mut lanes = scheduler.lock();
     let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len());
     tracing::debug!(commands = pending, "dstorage: submit");
-    lanes.submit(id, true);
+    lanes.submit(id);
     scheduler.work.notify_all();
 }
 
@@ -1644,13 +1682,14 @@ mod tests {
         lane.unsubmitted.push(Command::Read(r));
     }
 
-    /// A queue full of enqueued page destinations submits them itself
-    /// before the title's submit, while the title's list still holds the
-    /// numbers of its last use: pages that exist, but not the destination.
-    /// Those are not taken; the lists are read when the requests run. The
-    /// title's own submit takes its list as it is then.
+    /// A queue full of enqueued page destinations before the title's
+    /// submit takes more past its capacity rather than submit them while
+    /// their lists may still name the pages of their last use; the title's
+    /// submit takes every list as it is then. A full queue with submitted
+    /// commands waits for them, and one full of other enqueued commands
+    /// submits itself.
     #[test]
-    fn a_full_queue_does_not_take_page_lists_before_the_titles_submit() {
+    fn a_full_queue_holds_page_destinations_for_the_titles_submit() {
         use crate::modules::xmem;
         let mut pages = [0usize; 2];
         let mut n = 2;
@@ -1682,37 +1721,45 @@ mod tests {
         fn lane(l: &mut Lanes) -> &mut Lane {
             l.lanes.get_mut(&0).unwrap()
         }
+        assert_eq!(l.make_room(0), Room::Made);
         for _ in 0..3 {
             lane(&mut l).unsubmitted.push(to_pages(list.as_mut_ptr()));
         }
-        // Three of four: one slot stays free, so the queue is full.
-        assert!(l.submit_when_full(0));
+        // Three of four: one slot stays free, so the queue is full, and
+        // stays so past its capacity, with nothing submitted.
+        for held in 3..6 {
+            assert_eq!(l.make_room(0), Room::Made);
+            assert_eq!(lane(&mut l).entries(), held);
+            lane(&mut l).unsubmitted.push(to_pages(list.as_mut_ptr()));
+        }
+        assert!(lane(&mut l).reads.is_empty(), "nothing submitted");
+
+        // The title fills its list, then submits: every list is taken now.
+        list[0] = fresh;
+        l.submit(0);
         let reads = &lane(&mut l).reads;
         assert_eq!(
             reads.iter().map(|r| r.0).collect::<Vec<_>>(),
-            [0, 1, 2],
+            [0, 1, 2, 3, 4, 5],
             "in order"
         );
-        assert!(
-            reads.iter().all(|r| r.2.is_none()),
-            "no list taken before the title's submit"
-        );
-        // Reads waiting: the next enqueue waits for room, nothing is submitted.
-        lane(&mut l).unsubmitted.push(to_pages(list.as_mut_ptr()));
-        assert!(!l.submit_when_full(0));
-        assert_eq!(lane(&mut l).unsubmitted.len(), 1);
-
-        // The title fills its list, then submits.
-        list[0] = fresh;
-        l.submit(0, true);
-        let reads = &lane(&mut l).reads;
-        assert_eq!(reads.len(), 4);
-        assert!(reads.iter().take(3).all(|r| r.2.is_none()));
-        if at_submit() {
-            let taken = reads[3].2.as_ref().expect("taken at the title's submit");
+        for read in reads {
+            let taken = read.2.as_ref().expect("taken at the title's submit");
             assert_eq!(taken.pages(), [fresh]);
         }
+        // Submitted reads fill it: the next enqueue waits for them.
+        lane(&mut l).unsubmitted.push(to_pages(list.as_mut_ptr()));
+        assert_eq!(l.make_room(0), Room::Wait);
+        assert_eq!(lane(&mut l).unsubmitted.len(), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+
+        // Full of enqueued reads to addresses: it submits them itself.
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 4));
+        (0..3).for_each(|_| read(&mut l, 0, 0, 16));
+        assert_eq!(l.make_room(0), Room::Submitted);
+        assert_eq!(lane(&mut l).reads.len(), 3);
+        assert_eq!(l.make_room(0), Room::Wait);
     }
 
     #[test]
@@ -1726,7 +1773,7 @@ mod tests {
                 read(&mut l, id, 0, 4096);
             }
         }
-        (0..3).for_each(|id| l.submit(id, true));
+        (0..3).for_each(|id| l.submit(id));
         let mut started = [0u32; 3];
         for _ in 0..330 {
             let job = l.start().unwrap();
@@ -1746,7 +1793,7 @@ mod tests {
         read(&mut l, 0, ZLIB, 60);
         read(&mut l, 0, ZLIB, 60);
         read(&mut l, 0, 0, 1000); // raw: straight to its destination
-        l.submit(0, true);
+        l.submit(0);
         let first = l.start().unwrap();
         assert!(l.start().is_none(), "60 + 60 > 100");
         l.finish(&first, Ok(()));
@@ -1755,7 +1802,7 @@ mod tests {
         assert_eq!((second.staging, raw.staging), (60, 0));
         // Alone, a request larger than the buffer still runs.
         read(&mut l, 0, ZLIB, 500);
-        l.submit(0, true);
+        l.submit(0);
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
@@ -1779,7 +1826,7 @@ mod tests {
         for entry in unsafe { &(*array).state.entries }.iter() {
             entry.store(E_PENDING, Ordering::Release);
         }
-        l.submit(0, true);
+        l.submit(0);
         let jobs: Vec<Job> = (0..3).map(|_| l.start().unwrap()).collect();
         // The last read and the first finish; the second then fails.
         l.finish(&jobs[2], Ok(()));
@@ -2211,7 +2258,7 @@ mod tests {
             .unwrap()
             .unsubmitted
             .push(Command::Read(r));
-        l.submit(0, true);
+        l.submit(0);
         // After the submit: the list names other pages, and `a` is freed
         // (still shown at `at_a`, as freed pages stay mapped).
         set(&list, &b);
@@ -2277,7 +2324,7 @@ mod tests {
             .unwrap()
             .unsubmitted
             .push(Command::Read(r));
-        l.submit(0, true);
+        l.submit(0);
         // SAFETY: the list's own allocation; a read of it from now on faults.
         assert_ne!(unsafe { VirtualFree(list.cast(), 0, MEM_RELEASE) }, 0);
         let job = l.start().unwrap();
@@ -2318,7 +2365,7 @@ mod tests {
         let lane = l.lanes.get_mut(&0).unwrap();
         lane.unsubmitted.push(Command::Read(unknown));
         lane.unsubmitted.push(Command::Read(address));
-        l.submit(0, true);
+        l.submit(0);
         let jobs = [l.start().unwrap(), l.start().unwrap()];
         assert!(jobs.iter().all(|job| job.pages.is_none()));
         set(&list, &pages);
@@ -2336,47 +2383,81 @@ mod tests {
         );
     }
 
-    /// A queue filled with enqueued page destinations before the title's
-    /// submit submits them itself rather than wait for room that never
-    /// comes; its status still completes in order.
+    /// The title enqueues more page destinations than its queue holds, all
+    /// with lists still naming the pages of their last use (pages that
+    /// exist), and only after its enqueues return fills the lists and
+    /// submits, on the same thread. The queue takes them past its capacity
+    /// rather than submit or wait: the old pages stay untouched, the new
+    /// ones are written, and the status completes after them.
     #[test]
-    fn a_queue_full_of_page_destinations_does_not_wait_forever() {
-        let pages = allocate(3);
+    fn a_full_queue_takes_page_destinations_until_the_titles_submit() {
+        const N: usize = 5;
+        let (stale, fresh) = (allocate(N), allocate(N));
         let plain = pattern(32);
         let queue = small_queue(4);
         let array = status_array(1);
-        let lists = page_list_of(&pages);
+        let lists = page_list_of(&stale);
+        let (done, enqueued) = std::sync::mpsc::channel();
         let title = {
-            let (queue, array, plain_at, lists_at) = (
+            let (queue, array, plain_at, lists_at, fresh) = (
                 queue as usize,
                 array as usize,
                 plain.as_ptr() as usize,
                 lists.as_ptr() as usize,
+                fresh.clone(),
             );
             std::thread::spawn(move || {
                 let queue = queue as *mut c_void;
                 // SAFETY: the test's lists and source outlive the thread.
-                let plain = unsafe { std::slice::from_raw_parts(plain_at as *const u8, 32) };
-                for k in 0..3 {
-                    let list = (lists_at as *const AtomicUsize).wrapping_add(k);
+                let (plain, lists) = unsafe {
+                    (
+                        std::slice::from_raw_parts(plain_at as *const u8, 32),
+                        std::slice::from_raw_parts(lists_at as *const AtomicUsize, N),
+                    )
+                };
+                // From the fourth command on, the queue is full of these.
+                for list in lists {
                     enqueue(queue, &page_request(list, plain, 0));
                 }
-                // The fourth command finds the queue full of enqueued ones.
                 enqueue_status(queue, array as *mut c_void, 0);
+                done.send(unsubmitted(queue)).unwrap();
+                // Nothing ran: the title maps its pages, which fills the
+                // lists, and submits.
+                std::thread::sleep(Duration::from_millis(30));
+                set(lists, &fresh);
                 void(queue, 0x30);
             })
         };
+        let held = enqueued
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the enqueues return before the title's submit");
+        assert_eq!(held, N + 1, "all held for the title's submit");
         assert_eq!(wait(array, 0), S_OK);
         title.join().unwrap();
-        for &page in &pages {
-            let at = show(&[page]);
-            // SAFETY: the page is mapped read-write.
-            assert_eq!(unsafe { std::slice::from_raw_parts(at, 32) }, plain);
-            unshow(at, 1);
+        for (old, new) in stale.iter().zip(&fresh) {
+            let (at_old, at_new) = (show(&[*old]), show(&[*new]));
+            // SAFETY: both pages are mapped read-write.
+            let (seen_old, seen_new) = unsafe {
+                (
+                    std::slice::from_raw_parts(at_old, PAGE),
+                    std::slice::from_raw_parts(at_new, PAGE),
+                )
+            };
+            assert!(
+                seen_old.iter().all(|&b| b == 0),
+                "the old page is untouched"
+            );
+            assert_eq!(seen_new[..32], plain);
+            assert!(seen_new[32..].iter().all(|&b| b == 0));
+            unshow(at_old, 1);
+            unshow(at_new, 1);
         }
-        assert_eq!(
-            crate::modules::xmem::XMemFreePhysicalPages(3, pages.as_ptr()),
-            1
-        );
+        void(queue, 0x40);
+        for pages in [&stale, &fresh] {
+            assert_eq!(
+                crate::modules::xmem::XMemFreePhysicalPages(N, pages.as_ptr()),
+                1
+            );
+        }
     }
 }
