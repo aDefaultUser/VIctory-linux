@@ -228,6 +228,10 @@ translator does not support) and made 1,136 compute pipelines. In the Proton
 script smoke test, a repeat loaded those shader translations from cache in
 3.0 s and the compute pipelines in 0.9 s.
 
+A cold-cache comparison of 512 loose shader files under Proton took 34.1 s
+with `--jobs 1` and 8.4 s with `--jobs 4`. Both runs produced byte-identical
+cached translations.
+
 Earlier warm-up measurements configured four translation workers and two
 pipeline workers. That version processed loose shader files one at a time.
 
