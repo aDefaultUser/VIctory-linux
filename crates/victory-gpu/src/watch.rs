@@ -1068,12 +1068,18 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
-        assert!(before.is_empty());
+        // The journal keeps pages written in memory an earlier test had at
+        // these addresses: only what was written since the first asking
+        // here counts.
+        let (first, before) = writes(start, end, false).expect("watched");
+        assert!(before.iter().all(|&(_, w)| w < first), "{before:?}");
+        let since = |pages: Vec<(usize, u64)>| -> Vec<(usize, u64)> {
+            pages.into_iter().filter(|&(_, w)| w > first).collect()
+        };
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
         let (now, after) = writes(start, end, false).expect("watched");
-        assert_eq!(after, [(p / PAGE + 1, now)]);
+        assert_eq!(since(after), [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
