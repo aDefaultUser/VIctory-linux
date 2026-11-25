@@ -325,6 +325,12 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// This thread's write-watch askings of the kernel in [`writes`].
+    static KERNEL_ASKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the
@@ -353,11 +359,19 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let started = std::time::Instant::now();
     // View memory the guards already hold cannot be write-watched: the
     // kernel asking would only fail. Copies of it are flushed many times a
-    // frame, each time paying that failed call before the guards answer.
-    let known_view = guarded && known_view(first * PAGE);
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = known_view
-        || unsafe {
+    // frame, each time paying that failed call before the guards answer;
+    // and each refresh of a texture there asked first without the guards,
+    // a failed call more. Under Wine a failed call waits for the lock that
+    // every change of mapping holds: 300-400 microseconds beside two
+    // threads mapping views, 0.5 alone. While the world loaded under Proton
+    // a frame had 4,950 failed calls, and texture refreshes spent 0.3-2.3 s
+    // a frame (all threads) asking.
+    let known_view = known_view(first * PAGE);
+    let failed = known_view || {
+        #[cfg(test)]
+        KERNEL_ASKS.with(|n| n.set(n.get() + 1));
+        // SAFETY: the answer buffer holds `count` entries.
+        let status = unsafe {
             GetWriteWatch(
                 WRITE_WATCH_FLAG_RESET,
                 (first * PAGE) as *const _,
@@ -366,7 +380,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 &mut count,
                 &mut granularity,
             )
-        } != 0;
+        };
+        status != 0
+    };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         if known_view {
@@ -1430,6 +1446,37 @@ mod tests {
         unsafe { ((other + BLOCK + 8) as *mut u8).write(1) };
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+        drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// A texture's refresh asks first without the guards. In view memory
+    /// the guards hold that is "not write-watched" with no kernel asking
+    /// (under Wine a failed one waits behind every change of mapping), and
+    /// the guards still report what is written through any view of it.
+    #[test]
+    fn view_memory_the_guards_hold_is_not_asked_of_the_kernel() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, guarded, other) = two_views(SIZE);
+        let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
+        let asks = || KERNEL_ASKS.with(|n| n.get());
+        // The first check learns that it is a view and guards it.
+        let (first, taken) = writes(guarded, guarded + SIZE, true).expect("a view");
+        assert_eq!(taken, [(pages(0), first), (pages(1), first)]);
+        let before = asks();
+        assert!(writes(guarded, guarded + SIZE, false).is_none());
+        let (_, unwritten) = writes(guarded, guarded + SIZE, true).expect("a view");
+        assert!(unwritten.iter().all(|&(_, w)| w <= first));
+        assert_eq!(asks(), before, "the kernel was asked about a guarded view");
+        // SAFETY: the second view, read-write once the handler has opened it.
+        unsafe { ((other + BLOCK + 8) as *mut u8).write(1) };
+        assert!(writes(guarded, guarded + SIZE, false).is_none());
+        let (now, written) = writes(guarded, guarded + SIZE, true).expect("a view");
+        assert_eq!(written, [(pages(0), first), (pages(1), now)]);
+        assert_eq!(asks(), before);
+        // Mapped anew, it is not known to be a view: the kernel is asked.
+        title_memory_remapped(guarded, SIZE);
+        assert!(writes(guarded, guarded + SIZE, false).is_none());
+        assert_eq!(asks(), before + 1);
         drop_views(section, &[guarded, other], SIZE);
     }
 
