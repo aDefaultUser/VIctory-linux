@@ -222,11 +222,13 @@ Vulkan start-up waits for it), though the warm-up opens no window.
   launch. The Wine server is waited for at the end, so that a prefix the
   warm-up made is written out before the sandbox ends.
 
-Latest, with `7ec6682` and the patched vkd3d-proton: a warm-up from a cold
-cache translated 3,263 of 3,264 containers (the one left uses a wave mask the
-translator does not support) and made 1,136 compute pipelines. In the Proton
-script smoke test, a repeat loaded those shader translations from cache in
-3.0 s and the compute pipelines in 0.9 s.
+The patched vkd3d-proton build and the shader fixes in `7e789a1` translated
+all 3,264 saved containers in 50.2 s on a cold Proton cache with four
+translation workers. Two workers compiled 1,137 compute pipelines in
+76.1 s. System Wine reused those shader translations in 0.8 s and the
+compute pipelines in 0.9 s. The test card supports both 32- and 64-lane
+waves. An offline run forced to the 32-lane host setting still refused
+one different shader.
 
 A cold-cache comparison of 512 loose shader files under Proton took 34.1 s
 with `--jobs 1` and 8.4 s with `--jobs 4`. Both runs produced byte-identical
