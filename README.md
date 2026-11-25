@@ -105,6 +105,12 @@ Memory sync between the title's memory and the copies on the card:
   both by default; `guards` the first alone, `0` counts only, `slots`,
   `all`).
 - Failed page-destination reads are retried (`VICTORY_DSTORAGE_RETRIES=0` = as before).
+- A page destination's list of pages is taken at the title's submit, with its
+  pages held until the read is done, and a queue holding such reads no longer
+  submits itself at half capacity (only when full); a list not known then is
+  read when the read runs (`VICTORY_PAGE_LIST=late` = as before). Analysis by
+  JappertjeV ([PastiiJay/klbf-lab-beta#3](https://github.com/PastiiJay/klbf-lab-beta/issues/3)),
+  as PastiiJay/klbf-lab does it.
 
 Card memory (the test card is full from the first frame of the world: 85 to
 99 % of its budget for a whole run, about 26,000 texture copies let go and
