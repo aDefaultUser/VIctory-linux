@@ -1175,12 +1175,10 @@ fn into_destination(
     let offset = (request.page_offset & 0xffff) as usize;
     let n_pages = (offset + len).div_ceil(PAGE);
     // Without pages taken at the submit (`VICTORY_PAGE_LIST=late`, or a page
-    // not known then), the list as it is now.
+    // not known then), the list as it is now. With them the list is not read
+    // again: the title may have reused or freed it since.
     let (live, mut late) = match taken {
-        Some(taken) => {
-            changed_since_submit(taken, request.destination.cast(), n_pages);
-            (Vec::new(), None)
-        }
+        Some(_) => (Vec::new(), None),
         None => {
             let live = filled(request.destination.cast(), n_pages);
             let late = super::xmem::resolve_pages(&live, offset, len);
@@ -1272,26 +1270,6 @@ fn into_destination(
             "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
         );
         Err(E_INVALIDARG)
-    }
-}
-
-/// Counts page lists the title changed between its submit and the run: the
-/// pages taken at the submit are written all the same (the evidence for
-/// taking them then; the issue saw lists that hold zeros at the enqueue and
-/// change after the submit).
-fn changed_since_submit(taken: &PageRuns, array: *const usize, n: usize) {
-    if page_list(array, n) == taken.pages() {
-        return;
-    }
-    static CHANGED: AtomicU64 = AtomicU64::new(0);
-    let changed = CHANGED.fetch_add(1, Ordering::Relaxed) + 1;
-    if changed <= 8 || changed.is_power_of_two() {
-        tracing::info!(
-            requests = changed,
-            pages = n,
-            first = format_args!("{:#x}", taken.pages().first().copied().unwrap_or(0)),
-            "dstorage: a page list changed after the submit; the pages taken then are written"
-        );
     }
 }
 
@@ -2171,6 +2149,57 @@ mod tests {
         unshow(at_a, 2);
         unshow(at_b, 2);
         assert_eq!(xmem::XMemFreePhysicalPages(2, b.as_ptr()), 1);
+    }
+
+    /// A request whose pages were taken at the submit does not read the
+    /// title's list again: the list's memory released after the submit, the
+    /// pages taken then are still written.
+    #[test]
+    fn pages_taken_at_submit_need_no_list_when_the_request_runs() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let pages = allocate(1);
+        let at = show(&pages);
+        let plain = pattern(64);
+        // SAFETY: a fresh read-write page holding the list, released below.
+        let list = unsafe {
+            let list = VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+            .cast::<AtomicUsize>();
+            assert!(!list.is_null());
+            list.write(AtomicUsize::new(pages[0]));
+            list
+        };
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64));
+        let r = page_request(list, &plain, 8);
+        l.lanes
+            .get_mut(&0)
+            .unwrap()
+            .unsubmitted
+            .push(Command::Read(r));
+        l.submit(0);
+        // SAFETY: the list's own allocation; a read of it from now on faults.
+        assert_ne!(unsafe { VirtualFree(list.cast(), 0, MEM_RELEASE) }, 0);
+        let job = l.start().unwrap();
+        assert_eq!(
+            job.pages.as_ref().expect("taken at the submit").pages(),
+            pages
+        );
+        assert_eq!(execute(&job.request, job.pages.as_ref()), Ok(()));
+        // SAFETY: the page is mapped read-write.
+        assert_eq!(unsafe { std::slice::from_raw_parts(at.add(8), 64) }, plain);
+        l.finish(&job, Ok(()));
+        unshow(at, 1);
+        assert_eq!(
+            crate::modules::xmem::XMemFreePhysicalPages(1, pages.as_ptr()),
+            1
+        );
     }
 
     /// A list still empty at the submit is not taken: the request reads it
