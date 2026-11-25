@@ -11,6 +11,7 @@
 #   VKD3D_DLLS        folder with another d3d12.dll and d3d12core.dll pair (optional)
 #   D3DCOMPILER       a native d3dcompiler_47.dll (winetricks keeps one in its cache)
 #   RADV_DEBUG        default "zerovram"; set it empty to go without
+#   VICTORY_BAKE_TEXTURES_MS  default 60 here (1500 without the script)
 #   VICTORY_WINE      "wine" (default: the system's) or "proton": Proton's own Wine
 #                     (PROTON_WINE_LIBS/../../bin/wine) in a prefix of its own
 #   VICTORY_WARM      "1": `victory warm` in the same sandbox before the launch;
@@ -33,7 +34,8 @@ warm_seconds=${VICTORY_WARM_SECONDS:-600}
 read -r -a warm_args <<<"${VICTORY_WARM_ARGS---pipelines}"
 mkdir -p "$state/vkd3d-cache" "$state/mesa-cache"
 
-settings=(--setenv RADV_DEBUG "${RADV_DEBUG-zerovram}")
+settings=(--setenv RADV_DEBUG "${RADV_DEBUG-zerovram}"
+  --setenv VICTORY_BAKE_TEXTURES_MS "${VICTORY_BAKE_TEXTURES_MS:-60}")
 for setting in "$@"; do
   settings+=(--setenv "${setting%%=*}" "${setting#*=}")
 done

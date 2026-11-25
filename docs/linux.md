@@ -49,9 +49,28 @@ What was seen on screen, besides the first room:
 - **Logo movie.** Near 30 frames per second in sampled intervals with frame
   capture turned off, under both system Wine and Proton (earlier builds).
 - **Loading screen.** Texture preparation for the character bake still
-  causes stutter.
+  causes stutter, less with the script's shorter bake budget (next section).
 - **Bright frames in the intro.** Some of them are an authored title card. A
   short bright fade of the window has not been shown to be a bug.
+
+## Texture uploads before the character bake
+
+While it loads, the title bakes its characters' skin and decorations, and
+just before each bake draw the layer uploads textures the bake may pick.
+`VICTORY_BAKE_TEXTURES_MS` is how many milliseconds of upload work that pass
+may take there. The script sets it to 60 under both system Wine and Proton;
+without the script the layer's own default is 1500. A value in the
+environment or on the script's command line wins, so
+`VICTORY_BAKE_TEXTURES_MS=1500` restores the old behaviour and `0` turns the
+pass off.
+
+In one matched Proton Experimental A/B with frame capture off, 60 against
+1500 raised the slowest five-second sample of the loading screen from 4.2 to
+14.9 frames per second and the median from 20 to 23, and the first room
+looked the same (the player's hair and clothes, the walls and the wired
+glass) with camera input working. System Wine was not measured. The value
+bounds upload work, not the time between presented frames, and the loading
+screen still stutters.
 
 ## What it needs
 
@@ -137,7 +156,8 @@ dxil-spirv `114e664e` with a backport of upstream commit `e084e35c` from
   described above. Later parts of the game remain unverified.
 - **GPU resets (earlier builds).** Some earlier runs reset the GPU, for a cause
   not known. The two `7ec6682` runs showed no fault in 520 and 420 seconds.
-- **Loading-screen stutter.** See "Latest tested runs".
+- **Loading-screen stutter.** Reduced, not gone; see "Texture uploads before
+  the character bake".
 - **Black frames (earlier builds).** Not seen in later samples. Earlier runs
   showed every second or third frame of the 3D world black. In those runs the
   scene's brightness before tone mapping swung by a factor of about 100 from
