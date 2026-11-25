@@ -1880,9 +1880,23 @@ impl HostHeap {
         // were most of the 26,000 to 43,000 records a frame this pass
         // mirrored in run 200 and in the play session after it, each then
         // made and brought up to date once more by the pass over buffer
-        // views (some 50 ms a frame). `VICTORY_HEAP_SYNC_TABLES=1`: they
-        // are mirrored too, as in run 200.
-        if !sync_tables() && self.tabled_lately(index, crate::frame::current()) {
+        // views (some 50 ms a frame).
+        // Only while its host slot shows the record, though. Left alone
+        // whatever it showed, a slot the title wrote over after its draws,
+        // or that no draw read since, kept the view of an older record,
+        // and a shader that picks the slot by index read that view as the
+        // new one's kind: a constant buffer read from a slot that still
+        // held a texture took the texture's upper half for a buffer at
+        // address 0 (GPU faults of the scalar cache at 0 under Proton, RX
+        // 9070 XT; as in VIctory#844, where Slaktarn700's 6f732b6 mirrors
+        // every slot written). The fingerprint below does not tell: a draw
+        // makes the slot without it. 20,000 to 40,000 slots a frame were
+        // left alone in the world (853d7af).
+        // `VICTORY_HEAP_SYNC_TABLES=1`: tables' slots are mirrored as any
+        // other; `=0`: left to their draws whatever their host slot shows.
+        let mode = sync_tables();
+        let tabled = mode != Some(true) && self.tabled_lately(index, crate::frame::current());
+        if tabled && mode == Some(false) {
             COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
@@ -1892,7 +1906,7 @@ impl HostHeap {
         // frame this pass took over some 250,000 to 300,000 records, run
         // 200.)
         let print = record_print(record) | 1;
-        {
+        let seen = {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             if copied.is_empty() {
                 copied.resize(self.count as usize, 0);
@@ -1901,13 +1915,45 @@ impl HostHeap {
                 return false;
             };
             // A slot never looked at that holds nothing: as it was.
-            if *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0)) {
-                return false;
-            }
+            let seen = *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0));
             *last = print;
+            seen
+        };
+        if seen && !tabled {
+            return false;
+        }
+        // A table's slot: left alone if its host slot shows the record, or
+        // waits for a draw or a pass to make what this already saw there.
+        if tabled && self.shows_record(index, record).unwrap_or(seen) {
+            COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
         }
         self.mirror(index, handle, false);
         true
+    }
+
+    /// Whether host slot `index` shows what the title record `record` (its
+    /// bytes) says: the view [`HostHeap::mirror`] made from it, or nothing
+    /// for a record that names no live view of ours. `None`: the slot holds
+    /// nothing made and the record names a view, which `mirror` leaves so
+    /// for a draw or a pass to make (buffers, textures that wait).
+    fn shows_record(&self, index: u32, record: &[u8]) -> Option<bool> {
+        let word = |k: usize| {
+            record
+                .get(4 * k..4 * k + 4)
+                .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap_or_default()))
+        };
+        let [tag, i, generation] = [word(0), word(1), word(2)];
+        let key = if tag == VIEW_TAG && view_at(i, generation).is_some() {
+            u64::from(generation) << 32 | u64::from(i)
+        } else {
+            0
+        };
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        match made.get(index as usize).copied() {
+            Some(0) if key != 0 => None,
+            made => Some(made == Some(key)),
+        }
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -2227,12 +2273,19 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
 
-/// Whether the pass over records copied in as bytes also mirrors slots
-/// that draws read through tables lately (`VICTORY_HEAP_SYNC_TABLES=1`;
-/// off by default: [`HostHeap::mirror_copied`]).
-fn sync_tables() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_TABLES").is_some_and(|v| v == "1"))
+/// Whether the pass over records copied in as bytes mirrors slots that
+/// draws read through tables lately ([`HostHeap::mirror_copied`]):
+/// `VICTORY_HEAP_SYNC_TABLES=1` all of them, `=0` none; unset, those whose
+/// host slot does not show their record.
+fn sync_tables() -> Option<bool> {
+    static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *ON.get_or_init(
+        || match std::env::var("VICTORY_HEAP_SYNC_TABLES").as_deref() {
+            Ok("1") => Some(true),
+            Ok("0") => Some(false),
+            _ => None,
+        },
+    )
 }
 
 /// Since the last frame line: slots on changed heap pages that

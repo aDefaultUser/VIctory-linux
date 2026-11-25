@@ -1255,6 +1255,74 @@ mod tests {
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 
+    /// A slot a draw read through a table is left to its draws while its
+    /// host slot shows the record there; a constant buffer the title then
+    /// copies over it as bytes does not leave the draw's view in the host
+    /// slot for shaders that pick the slot by index (they read a texture's
+    /// upper half as a buffer at address 0: VIctory#844).
+    #[cfg(windows)]
+    #[test]
+    fn a_record_copied_over_a_tables_slot_replaces_the_draws_view() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: a fresh allocation.
+        let memory = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                crate::watch::PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!memory.is_null());
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 64,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let placement = Placement {
+            address: memory as u64,
+            size: 64 * 32,
+        };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            let null = std::ptr::null();
+            // Records made outside the heap, copied in as bytes.
+            let mut elsewhere = [0u64; 8];
+            let (texture, constant) = (
+                elsewhere.as_mut_ptr() as u64,
+                elsewhere.as_mut_ptr() as u64 + 32,
+            );
+            create_srv(null, null, std::ptr::null(), texture);
+            create_cbv(null, &[0x1000, 1, 256, 0], constant);
+            let slot5 = memory as u64 + 5 * 32;
+            let copy_in = |from: u64| {
+                // SAFETY: both hold 32 descriptor bytes.
+                unsafe { std::ptr::copy_nonoverlapping(from as *const u8, slot5 as *mut u8, 32) }
+            };
+            copy_in(texture);
+            // A draw reads slot 5 through a table and makes it.
+            host.mirror(5, slot5, true);
+            host.texture_slot_tabled(5, true);
+            assert!(host.made(5));
+            sync_heaps();
+            assert!(host.made(5), "the draw's view of an unchanged record stays");
+            copy_in(constant);
+            sync_heaps();
+            assert!(
+                !host.made(5),
+                "the host slot still shows the view of the record before"
+            );
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        // SAFETY: this allocation belongs to the test.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
     /// The stride table tells shaders that pick a slot by index what it
     /// holds as the slot changes: a texture (not to be read as a buffer or
     /// a constant buffer), a constant buffer, then nothing.
