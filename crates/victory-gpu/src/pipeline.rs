@@ -150,6 +150,7 @@ impl Shader {
                 if let Ok(t) = &done {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    crate::shader_sources::keep_source(&self.hash, self.stage, &self.container);
                 }
                 match &done {
                     Ok(t) => tracing::info!(
@@ -720,6 +721,64 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
+}
+
+/// For the warm-up (`victory warm`): makes the host device as a run makes
+/// it, which hands the translator the host's widest wave and view heap
+/// limit (and logs both as a run does), so that the warm-up's translations
+/// are filed under the key a run looks them up by
+/// (`translation_fingerprint`). Whether there is a device.
+#[cfg(windows)]
+pub fn use_host_device() -> bool {
+    crate::descriptor::host::probe_view_limit();
+    crate::host::host().is_some()
+}
+
+/// For the warm-up: the host pipeline of a compute container, made the way
+/// a run's first dispatch with it makes it, so that the pipeline library
+/// and the driver's own caches hold it. `None` if the container holds no
+/// compute program or does not translate; else whether the host made it.
+#[cfg(windows)]
+pub fn warm_compute(container: &[u8]) -> Option<bool> {
+    use victory_shader::{Container, FourCC, HwStage};
+    let dxil = Container::parse(container).ok()?.part(FourCC::DXIL)?.data;
+    let programs = victory_shader::native_programs(dxil).ok()?;
+    if !programs.iter().any(|p| p.stage == HwStage::Cs) {
+        return None;
+    }
+    // Not through the table of the title's containers: nothing leaves it.
+    let shader = Arc::new(Shader {
+        stage: "compute",
+        hash: blake3::hash(container).to_hex()[..16].to_owned(),
+        container: container.to_vec(),
+        translated: OnceLock::new(),
+    });
+    shader.translated()?;
+    Some(host::HostPipeline::new(&[shader], None).is_some())
+}
+
+/// What tells one host driver build from another for the warm-up's notes
+/// on pipelines that never came back: the BLAKE3 of the loaded
+/// `d3d12core.dll` (else `d3d12.dll`), 16 hex digits. vkd3d-proton builds
+/// differ there; a driver whose files cannot be read gives `None`.
+#[cfg(windows)]
+pub fn host_driver_id() -> Option<String> {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
+    crate::host::host()?;
+    ["d3d12core.dll", "d3d12.dll"].iter().find_map(|dll| {
+        let name: Vec<u16> = dll.encode_utf16().chain([0]).collect();
+        let mut path = [0u16; 1024];
+        // SAFETY: a null-terminated name; the buffer's length is passed.
+        let len = unsafe {
+            let module = GetModuleHandleW(name.as_ptr());
+            if module.is_null() {
+                return None;
+            }
+            GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) as usize
+        };
+        let bytes = std::fs::read(String::from_utf16_lossy(&path[..len])).ok()?;
+        Some(blake3::hash(&bytes).to_hex()[..16].to_owned())
+    })
 }
 
 #[cfg(test)]
