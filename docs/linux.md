@@ -1,14 +1,57 @@
 # Running under Wine on Linux
 
 Tested on one machine (2026-11-25): CachyOS, kernel 7.3.5, Radeon RX 9070 XT
-(RADV, Mesa 26.3.1), Wine 11.22, vkd3d-proton 2576c0b4 as shipped with Proton
-Experimental `experimental-11.0-20261112`. `scripts/run-linux.sh` starts a
-title with the settings below.
+(RADV, Mesa 26.3.1), system Wine 11.22, and Proton Experimental
+`experimental-11.0-20261112` (Wine 11.0, vkd3d-proton 2576c0b4).
+`scripts/run-linux.sh` starts a title with the settings below.
 
-State on that machine: the title boots, and the intro movie plays at 30 frames
-per second in a run with frame capture turned off. Some characters and scenes
-of the opening story render. Missing or wrong rendering and GPU resets are
-still being investigated (see "Known problems").
+## Latest tested runs
+
+The renderer at commit `7ec6682` (`e9c3bf8` after it only adds a test) reached
+the movement and camera prompt in the first room of the opening, with the
+player's hair and clothes, the walls and the wired glass textured:
+
+| Wine | time running | result |
+|---|---|---|
+| Proton Experimental 11.0 | 520 s | first room; the camera moved; no GPU fault |
+| system Wine 11.22, newly made test prefix | 420 s | the same room; no kernel fault |
+
+Both runs were started by a private launcher on a private Xwayland server, not
+by `scripts/run-linux.sh`, with:
+
+- a vkd3d-proton build with the matching dxil-spirv backport (see "Three
+  compute pipelines vkd3d-proton cannot make")
+- `RADV_DEBUG=zerovram`
+- `VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=0 VICTORY_LATE_WAIT=0`
+- `VICTORY_HEAP_SYNC_TABLES` unset, so only table slots whose host slot does
+  not show their record are mirrored (the default)
+
+These runs cover the opening only. They say nothing about later parts of the
+game or about speed with the default settings.
+
+The same settings through the script look like this. The command has not been
+run with `7ec6682`; `VKD3D_DLLS` is the folder holding your patched build's
+`d3d12.dll` and `d3d12core.dll`:
+
+```sh
+VICTORY_WARM=1 VICTORY_WINE=proton \
+VKD3D_DLLS="$HOME/vkd3d-proton-e084e35c" \
+PROTON_WINE_LIBS="$HOME/.local/share/Steam/steamapps/common/Proton - Experimental/files/lib/wine" \
+  scripts/run-linux.sh target/x86_64-pc-windows-msvc/release/victory.exe \
+  "$HOME/Games/Title" "Title.exe" \
+  VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=0 VICTORY_LATE_WAIT=0
+```
+
+Drop `VICTORY_WINE=proton` for system Wine.
+
+What was seen on screen, besides the first room:
+
+- **Logo movie.** Near 30 frames per second in sampled intervals with frame
+  capture turned off, under both system Wine and Proton (earlier builds).
+- **Loading screen.** It still stutters around the texture preparation for the
+  character bake. Not fixed.
+- **Bright frames in the intro.** Some of them are an authored title card. A
+  short bright fade of the window has not been shown to be a bug.
 
 ## What it needs
 
@@ -61,7 +104,8 @@ sandbox to share the host's IPC namespace (X11 shared-memory images) and a
 prefix of its own. `VICTORY_WINE=proton` has the script use it that way
 (`prefix-proton`, the X11 socket of `DISPLAY`).
 
-Checked on 2026-11-25 on the machine above:
+Earlier builds, checked on 2026-11-25 on the machine above (dated; the
+latest runs are listed under "Latest tested runs"):
 
 - System Wine 11.22 entered the opening story (the prologue).
 - Proton Experimental, started outside the script with its own
@@ -71,9 +115,10 @@ Checked on 2026-11-25 on the machine above:
   movie played at 30 frames per second in the three intervals measured.
 
 These runs still showed missing or wrong rendering, and some of them reset
-the GPU. An earlier run with Proton's Wine crashed after three and a half
-minutes with a write to address 0 in the title's own code; that crash has not
-been looked into since.
+the GPU. The script's Proton run with the warm-up is the only one of these
+started by `scripts/run-linux.sh`. An earlier run with Proton's Wine crashed
+after three and a half minutes with a write to address 0 in the title's own
+code; that crash has not been looked into since.
 
 ## Three compute pipelines vkd3d-proton cannot make
 
@@ -83,26 +128,28 @@ programs: dxil-spirv recurses until the worker's stack is gone
 The layer stops waiting for such a worker after 15 seconds
 (`pipeline/make.rs`). The fix is upstream commit e084e35c on the branch
 `legacy-struct-remove`. A vkd3d-proton built with that commit makes all three
-pipelines in under 200 ms; pass its folder as `VKD3D_DLLS`. The picture does
-not depend on it.
+pipelines in under 200 ms; pass its folder as `VKD3D_DLLS`. On earlier builds
+the picture did not depend on it; the latest runs used it.
 
 ## Known problems
 
-- **Missing or wrong rendering.** The latest runs (2026-11-25) still draw
-  parts of scenes and characters wrong or not at all. Not fixed.
-- **GPU resets.** Some of the latest runs reset the GPU. The cause is not
-  known.
-- **Black frames (earlier runs).** Earlier runs showed every second or third
-  frame of the 3D world black. In those runs the scene's brightness before
-  tone mapping swung by a factor of about 100 from frame to frame (large,
-  small, zero), and the black frames were the ones where it reached zero. The
-  title measures the picture's brightness on the card, reads it back and sets
-  later frames' exposure from it, so a measurement paired with the wrong frame
-  is one possible cause. It has not been confirmed.
-  `VICTORY_LATE_WAIT=0 VICTORY_RELAY=0` (everything waited for) was too slow
-  here to tell: 6.5 s a frame.
+- **Missing or wrong rendering.** Earlier builds drew parts of scenes and
+  characters wrong or not at all. With `7ec6682` the first room renders as
+  described above; later parts of the game have not been checked with it.
+- **GPU resets (earlier builds).** Some earlier runs reset the GPU, for a cause
+  not known. The two `7ec6682` runs showed no fault in 520 and 420 seconds.
+- **Loading-screen stutter.** See "Latest tested runs".
+- **Black frames (earlier builds).** Not seen in later samples. Earlier runs
+  showed every second or third frame of the 3D world black. In those runs the
+  scene's brightness before tone mapping swung by a factor of about 100 from
+  frame to frame (large, small, zero), and the black frames were the ones
+  where it reached zero. The title measures the picture's brightness on the
+  card, reads it back and sets later frames' exposure from it, so a
+  measurement paired with the wrong frame is one possible cause. It has not
+  been confirmed. On those builds `VICTORY_LATE_WAIT=0 VICTORY_RELAY=0`
+  (everything waited for) was too slow to tell: 6.5 s a frame.
 - **A fresh shader cache takes minutes.** The first launch translates about
-  3,200 shaders and vkd3d-proton compiles each pipeline; hundreds of draws a
+  3,260 shaders and vkd3d-proton compiles each pipeline; hundreds of draws a
   frame are dropped meanwhile. Every change to the translator (a new build,
   a switch it reads) keys the cache anew, so the next launch starts cold
   again. The warm-up below does that work before the launch.
@@ -148,8 +195,13 @@ Vulkan start-up waits for it), though the warm-up opens no window.
   launch. The Wine server is waited for at the end, so that a prefix the
   warm-up made is written out before the sandbox ends.
 
-Measured on the machine above (warm-up only, no title started, 4 translation
-threads, 2 pipeline threads):
+Latest, with `7ec6682` and the patched vkd3d-proton: a warm-up from a cold
+cache translated 3,263 of 3,264 containers (the one left uses a wave mask the
+translator does not support) and made 1,136 compute pipelines. A repeat
+warm-up took about 3 s on an earlier integrated build.
+
+Earlier measurements on the machine above (dated, earlier builds; warm-up
+only, no title started, 4 translation threads, 2 pipeline threads):
 
 | case | result |
 |---|---|
