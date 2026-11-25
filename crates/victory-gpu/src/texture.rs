@@ -54,6 +54,11 @@ pub(crate) struct Staging {
     /// of 1,120 textures in one frame of run 18.)
     dirty: std::sync::atomic::AtomicBool,
     uploaded: std::sync::atomic::AtomicBool,
+    /// Whether the staging buffer holds a whole read of the texture's
+    /// memory: false until a refresh first reads it. Only a read through
+    /// the kernel while the runtime remaps ([`no_wait`]) can fail, and one
+    /// that fails leaves the buffer as it was.
+    filled: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
     /// Levels on demand (`crate::tiles`): the texture's host copy was made
@@ -346,7 +351,9 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// through the kernel costs about 0.6 ms a megabyte against 0.3 in place.
 ///
 /// What changes for the picture: a texture that arrives while the runtime
-/// is remapping may show a frame later. It never shows partly read.
+/// is remapping may show a frame later. It never shows partly read, nor
+/// unread: a list records no upload from a staging buffer that holds no
+/// whole read yet ([`Staging::ready`]).
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
@@ -622,6 +629,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     };
     use std::sync::atomic::Ordering::Relaxed;
     staging.used.store(crate::host::moment(), Relaxed);
+    if !staging.ready(no_wait()) {
+        return;
+    }
     // Levels on demand: a view of the texture now starts at another
     // level, or another texture now starts inside its span, with no byte
     // of its memory changed. The levels are judged anew: detiled again at
@@ -916,6 +926,23 @@ impl Staging {
         held
     }
 
+    /// Whether a list may record an upload from the staging buffer now.
+    /// With [`no_wait`] a buffer that was never filled is filled here: the
+    /// refresh at submission runs after the copy is recorded, and when its
+    /// read failed the copy put an empty buffer over what the host texture
+    /// held, and a slot picked by index counted as uploaded. If this read
+    /// fails too, no upload is recorded and the host texture keeps what it
+    /// had. Without [`no_wait`] the refresh at submission waits for title
+    /// memory and always reads.
+    fn ready(&self, no_wait: bool) -> bool {
+        use std::sync::atomic::Ordering::Acquire;
+        if !no_wait || self.filled.load(Acquire) {
+            return true;
+        }
+        self.refresh_now(true);
+        self.filled.load(Acquire)
+    }
+
     /// Forgets what the staging buffer was last filled from: the next
     /// refresh detiles anew, whether the memory changed or not.
     fn forget(&self) {
@@ -932,28 +959,40 @@ impl Staging {
     pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let read = self.refresh_now();
+        let read = self.refresh_now(no_wait());
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
     }
 
     /// Returns the bytes of title memory read.
-    fn refresh_now(&self) -> usize {
+    fn refresh_now(&self, no_wait: bool) -> usize {
         let whole = std::time::Instant::now();
-        let read = self.refresh_timed();
+        let read = self.refresh_timed(no_wait);
         REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         read
     }
 
-    fn refresh_timed(&self) -> usize {
+    fn refresh_timed(&self, no_wait: bool) -> usize {
+        let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
+        let read = self.refresh_locked(&mut last, no_wait);
+        // Under the texture's lock: a list that finds the staging buffer
+        // filled finds the read in it.
+        if read.is_some() {
+            self.filled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        read.unwrap_or(0)
+    }
+
+    /// The bytes of title memory read; `None` if the memory could not be
+    /// read ([`Staging::refresh_unlocked`]): the staging buffer is as it was.
+    fn refresh_locked(&self, last: &mut Last, no_wait: bool) -> Option<usize> {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
-        let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
-        let last = &mut *last;
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
-                return 0;
+                return Some(0);
             }
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
@@ -964,7 +1003,7 @@ impl Staging {
             });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return size;
+            return Some(size);
         }
         // View memory has no write-watch, and a texture there was hashed
         // whole at every check: 229 MB and 51 ms a frame in a gameplay view
@@ -989,7 +1028,7 @@ impl Staging {
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
             if unwritten && !turn && last.unseen == 0 {
-                return 0;
+                return Some(0);
             }
             blind = unwritten;
         }
@@ -999,7 +1038,7 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        let _mapped = if no_wait {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
@@ -1020,7 +1059,7 @@ impl Staging {
             // arrive): a mip that streams in shows up to 30 frames late.
             let frame = crate::frame::current();
             if last.partial.is_some_and(|at| frame < at + 30) {
-                return 0;
+                return Some(0);
             }
             last.partial = Some(frame);
             #[cfg(feature = "diagnostics")]
@@ -1041,10 +1080,10 @@ impl Staging {
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
             }
             let _ = changed;
-            return size;
+            return Some(size);
         }
         if through_copy() {
-            return with_title(self.memory, size, |tiled| {
+            return Some(with_title(self.memory, size, |tiled| {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if !last.changed(blake3::hash(tiled), blind) {
@@ -1054,7 +1093,7 @@ impl Staging {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
-            });
+            }));
         }
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
@@ -1062,12 +1101,12 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if !last.changed(blake3::hash(tiled), blind) {
-            return size;
+            return Some(size);
         }
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        size
+        Some(size)
     }
 
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):
@@ -1075,8 +1114,9 @@ impl Staging {
     /// is not there at this moment. Then nothing is taken and the texture
     /// is looked at again at its next refresh (what was learnt about writes
     /// to it is forgotten, so that it is not passed over as unwritten).
-    /// Returns the bytes read.
-    fn refresh_unlocked(&self, last: &mut Last, size: usize, blind: bool) -> usize {
+    /// Returns the bytes read, `None` for none: the staging buffer keeps
+    /// the last read that was whole, or nothing (see [`Staging::filled`]).
+    fn refresh_unlocked(&self, last: &mut Last, size: usize, blind: bool) -> Option<usize> {
         use std::sync::atomic::Ordering::Relaxed;
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
@@ -1089,11 +1129,11 @@ impl Staging {
         });
         if read {
             UNLOCKED[0].fetch_add(1, Relaxed);
-            size
+            Some(size)
         } else {
             UNLOCKED[1].fetch_add(1, Relaxed);
             last.asked = 0;
-            0
+            None
         }
     }
 
@@ -1220,6 +1260,18 @@ pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
 pub(crate) fn is_staged(resource: This) -> bool {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
+}
+
+/// With [`no_wait`]: whether `resource`'s staging buffer holds no read of
+/// its memory, so no upload of it was recorded ([`Staging::ready`]).
+pub(crate) fn unread(resource: This) -> bool {
+    if !no_wait() {
+        return false;
+    }
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()
+        .and_then(|map| map.get(&(resource as usize)))
+        .is_some_and(|s| !s.filled.load(std::sync::atomic::Ordering::Acquire))
 }
 
 /// The bytes of a title texture's memory, and whether all of it is mapped,
@@ -1417,62 +1469,81 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         once!(?desc, "texture contents in an XOR mode not uploaded");
         return None;
     }
-    let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
-    let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
-        u32::from(d.MipLevels)
-    } else {
-        u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize)
-    };
-    let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
-    let mut rows = vec![0u32; count as usize];
-    let mut total = 0;
-    // SAFETY: outputs for `count` subresources.
-    unsafe {
-        host.device.GetCopyableFootprints(
-            &d,
-            0,
-            count,
-            0,
-            Some(footprints.as_mut_ptr()),
-            Some(rows.as_mut_ptr()),
-            None,
-            Some(&mut total),
-        );
-    }
-    let (buffer, data) = host.upload_buffer(total)?;
-    crate::host::name(&buffer, || {
+    let s = Arc::new(Staging::new(&d, layout, memory, on_demand)?);
+    crate::host::name(&s.buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
             d.Width, d.Height, d.DepthOrArraySize, d.Format.0
         )
     });
-    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
-    STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
-    let s = Arc::new(Staging {
-        buffer,
-        #[cfg(feature = "diagnostics")]
-        size: total,
-        data,
-        footprints,
-        rows,
-        layout,
-        mips: u32::from(d.MipLevels),
-        bytes: total,
-        memory,
-        last: Mutex::default(),
-        dirty: std::sync::atomic::AtomicBool::new(true),
-        uploaded: std::sync::atomic::AtomicBool::new(false),
-        used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
-        on_demand,
-        detiled: std::sync::atomic::AtomicU32::new(0),
-        judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
-        waiting: std::sync::atomic::AtomicU64::new(0),
-    });
+    tracing::debug!(
+        ?desc,
+        total = s.bytes,
+        "texture contents uploaded from title memory"
+    );
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+impl Staging {
+    /// A staging buffer laid out as the subresources of a host texture of
+    /// description `d`, for the title texture of `layout` at `memory`;
+    /// nothing read yet.
+    fn new(
+        d: &D3D12_RESOURCE_DESC,
+        layout: victory_formats::texture::Layout,
+        memory: *const u8,
+        on_demand: bool,
+    ) -> Option<Staging> {
+        let host = host()?;
+        let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+            u32::from(d.MipLevels)
+        } else {
+            u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize)
+        };
+        let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+        let mut rows = vec![0u32; count as usize];
+        let mut total = 0;
+        // SAFETY: outputs for `count` subresources.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                d,
+                0,
+                count,
+                0,
+                Some(footprints.as_mut_ptr()),
+                Some(rows.as_mut_ptr()),
+                None,
+                Some(&mut total),
+            );
+        }
+        let (buffer, data) = host.upload_buffer(total)?;
+        STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+        Some(Staging {
+            buffer,
+            #[cfg(feature = "diagnostics")]
+            size: total,
+            data,
+            footprints,
+            rows,
+            layout,
+            mips: u32::from(d.MipLevels),
+            bytes: total,
+            memory,
+            last: Mutex::default(),
+            dirty: std::sync::atomic::AtomicBool::new(true),
+            uploaded: std::sync::atomic::AtomicBool::new(false),
+            filled: std::sync::atomic::AtomicBool::new(false),
+            used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+            on_demand,
+            detiled: std::sync::atomic::AtomicU32::new(0),
+            judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
+            waiting: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1645,6 +1716,125 @@ mod mapped_tests {
             assert_eq!(mapped_bytes(base, SIZE), SIZE as u64);
             assert_eq!(mapped_bytes_between(base, SIZE), SIZE as u64);
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod no_wait_tests {
+    use super::Staging;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    /// With `VICTORY_TEXTURE_NO_WAIT=1`, a page of a texture goes away while
+    /// the runtime remaps title memory, and the read through the kernel
+    /// fails part way. A staging buffer that held a whole read keeps it; a
+    /// new one holds nothing, and no upload may be recorded from it (one
+    /// was, and its copy emptied the host texture). Once the pages hold
+    /// still, both read the new contents.
+    #[test]
+    fn a_read_that_fails_in_a_remap_uploads_nothing_and_keeps_the_last_read() {
+        use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+        use windows_sys::Win32::System::Memory::*;
+        if crate::host::host().is_none() {
+            eprintln!("no host D3D12 device: not run");
+            return;
+        }
+        const PAGE: usize = 0x1000;
+        let layout = Texture::new(&TextureDesc {
+            dimension: Dimension::Tex2d,
+            width: 64,
+            height: 64,
+            depth_or_array: 1,
+            mips: 1,
+            format: DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        })
+        .unwrap()
+        .planes[0]
+            .layout
+            .clone();
+        let size = layout.size as usize;
+        assert!(size >= 4 * PAGE, "a page in the middle to take away");
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        // A list that samples the texture: the upload is recorded or not,
+        // and at submission the check refreshes the staging buffer before
+        // the copy runs. What the copy puts in the host texture, if any.
+        let upload = |s: &Staging| {
+            let recorded = s.ready(true);
+            s.refresh_now(true);
+            // SAFETY: the staging buffer's mapping, `bytes` long.
+            recorded
+                .then(|| unsafe { std::slice::from_raw_parts(s.data, s.bytes as usize) }.to_vec())
+        };
+        // SAFETY: a private allocation of our own, written in place only
+        // while its pages are committed.
+        unsafe {
+            let memory = VirtualAlloc(
+                std::ptr::null(),
+                size,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!memory.is_null());
+            let fill = |seed: u8| {
+                for i in 0..size {
+                    memory
+                        .add(i)
+                        .write((i as u8).wrapping_mul(seed).wrapping_add(seed));
+                }
+            };
+            fill(7);
+            let held = Staging::new(&desc, layout.clone(), memory, false).unwrap();
+            let first = upload(&held).expect("uploaded while title memory holds still");
+            assert!(first.iter().any(|&b| b != 0));
+
+            // The title writes new contents and the runtime remaps: a page
+            // in the middle is not there for a moment.
+            fill(13);
+            let remapping = crate::watch::title_memory_remapping();
+            let middle = memory.add(2 * PAGE);
+            assert_ne!(VirtualFree(middle.cast(), PAGE, MEM_DECOMMIT), 0);
+            // A texture uploaded before: the upload keeps its last whole read.
+            assert_eq!(
+                upload(&held),
+                Some(first.clone()),
+                "the last whole read is kept"
+            );
+            // A texture staged anew (as every upload of a texture picked by
+            // index is): nothing read, nothing uploaded over the host texture.
+            let new = Staging::new(&desc, layout.clone(), memory, false).unwrap();
+            assert_eq!(
+                upload(&new),
+                None,
+                "an upload of a staging buffer that holds no read"
+            );
+
+            // The pages hold still again: both upload the new contents.
+            assert_eq!(
+                VirtualAlloc(middle.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE),
+                middle.cast()
+            );
+            fill(13);
+            drop(remapping);
+            let second = upload(&new).expect("uploaded once the pages hold still");
+            assert_ne!(second, first);
+            assert_eq!(upload(&held), Some(second));
+            assert_ne!(VirtualFree(memory.cast(), 0, MEM_RELEASE), 0);
         }
     }
 }

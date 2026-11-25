@@ -1996,6 +1996,16 @@ impl State {
                 crate::host::log_removal_context();
                 return;
             }
+            // `VICTORY_TEXTURE_NO_WAIT=1`: the memory could not be read while
+            // the runtime remapped it, and no upload was recorded. The host
+            // copy keeps what it had, and the slot stays due, as one whose
+            // memory is not there yet, to be uploaded once its pages hold
+            // still (a remap under it also makes it due at once).
+            if crate::texture::unread(resource) {
+                crate::texture::unstage(resource);
+                host.texture_slot_later(index, write, frame, most);
+                continue;
+            }
             let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
             // then on as a slot with nothing new (a placed texture: until
