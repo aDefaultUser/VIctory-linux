@@ -17,7 +17,8 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// reads buffers through descriptors it picks from the view heap at an
 /// index it computes (SM 6.6 dynamic resources): a raw buffer of
 /// [`SLOT_STRIDES_COUNT`] dwords the host keeps, dword `i` the bytes per
-/// element of the buffer view at heap slot `i` (0: none or not a buffer).
+/// element of the buffer view at heap slot `i` ([`SLOT_IMAGE`]: a view of
+/// a texture; 0: anything else, a constant buffer or nothing).
 /// The console's descriptor holds that stride and its hardware multiplies
 /// the element index by it; the program's code does not say it, and the
 /// used-resource list only names what tables hold. A shader that has this
@@ -26,6 +27,12 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// In the [`SLOT_STRIDES`] table: the slot holds a view of a texture. Its
+/// descriptor read as a buffer's or a constant buffer's is no address: on
+/// AMD the scalar cache faulted at 0 (RADV) or near it, reading the
+/// texture's descriptor as a constant buffer's. A stride no buffer view
+/// has.
+pub const SLOT_IMAGE: u32 = u32::MAX;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,

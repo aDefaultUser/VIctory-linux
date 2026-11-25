@@ -113,8 +113,8 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_IMAGE, SLOT_MEMORY,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit, view_heap_limit,
 };
 
@@ -1782,5 +1782,155 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+}
+
+#[cfg(test)]
+mod heap_pick_tests {
+    use super::*;
+    use crate::native::{ComputeIo, RootParam, StageIo};
+
+    /// A compute program that picks a view from the heap at an index it
+    /// computes (a root constant) and reads its first dword with
+    /// `s_buffer_load_dword`, as the title's meshlet culls read their
+    /// records, then stores it for every lane through a raw UAV it picks
+    /// from the heap too. The host's stride table says what each slot
+    /// holds: a raw buffer and a constant buffer are read, a texture is
+    /// not (its descriptor read as a constant buffer's is no address: the
+    /// scalar cache faulted at 0 on an RX 9070 XT under Proton); it reads
+    /// zeros.
+    #[test]
+    fn a_heap_slot_picked_for_a_scalar_load_is_read_only_if_it_holds_a_buffer() {
+        let words: [u32; 13] = [
+            0x8F04_8500, // s_lshl_b32 s4, s0, 5
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0201,
+            0x0800_0000, // s_load_dwordx4 s[8:11], s[2:3], s4
+            0xF408_0401,
+            0xFA00_0060, // s_load_dwordx4 s[16:19], s[2:3], 0x60
+            0xF420_0304,
+            0xFA00_0000, // s_buffer_load_dword s12, s[8:11], 0x0
+            0x7E02_020C, // v_mov_b32 v1, s12
+            0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+            0xE070_1000,
+            0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let param = |root, user_data, slot| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 3,
+            layout: vec![
+                param(RootType::Constants, 0, 0),
+                param(RootType::ResourceHeap, 2, 1),
+            ],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 3 << 1,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let l = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        // The loads go by the stride table.
+        assert_eq!(l.root_srvs, [SLOT_STRIDES]);
+        assert!(l.root_cbvs.is_empty());
+        #[cfg(windows)]
+        {
+            let mut dxil = l.dxil;
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                v.validate(&mut dxil).unwrap();
+            }
+            let Ok(host) = host::Host::new(false) else {
+                eprintln!("no SM 6.6 device; skipped");
+                return;
+            };
+            let cs = HostShader {
+                stage: HwStage::Cs,
+                dxil,
+                user_data: l.user_data,
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+                root_uavs: l.root_uavs,
+                root_indexed_views: Vec::new(),
+            };
+            let _one = super::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            let texel = [[1.0f32, 2.0, 3.0, 4.0]];
+            let constants = [0xC0_FFEE; 64];
+            let buffer = [0xB0_FFEE; 4];
+            // Heap: a texture, a constant buffer, a raw buffer, the UAV.
+            let views = [
+                host::View::Texture(1, 1, &texel),
+                host::View::Cbv(&constants),
+                host::View::Buffer {
+                    data: &buffer,
+                    stride: host::Stride::Raw,
+                },
+                host::View::RawUav(32),
+            ];
+            let strides = vec![SLOT_IMAGE, 0, 1, 1];
+            for (slot, want) in [(0, 0), (1, 0xC0_FFEE), (2, 0xB0_FFEE)] {
+                let mut ud = vec![0u32; cs.user_data_dwords().max(1) as usize];
+                for u in cs
+                    .user_data
+                    .iter()
+                    .filter(|u| u.root == RootType::Constants)
+                {
+                    ud[u.index as usize] = slot;
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &host::Dispatch {
+                            roots: vec![
+                                (0, host::Root::Constants(ud)),
+                                (
+                                    1,
+                                    host::Root::View {
+                                        srv: true,
+                                        data: strides.clone(),
+                                    },
+                                ),
+                            ],
+                            views: &views,
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("slot {slot}: {e}"));
+                assert_eq!(out[0], vec![want; 32], "slot {slot}");
+            }
+        }
     }
 }

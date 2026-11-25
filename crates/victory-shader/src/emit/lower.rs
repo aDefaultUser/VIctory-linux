@@ -5535,15 +5535,22 @@ impl<'a> Lower<'a> {
         // batch records, mesh headers and instance transforms this way, so
         // it passed no meshlet and every indirect mesh draw ran empty.
         // The host's table of strides by heap slot tells a buffer view
-        // (not 0) from anything else, which is still read as a constant
-        // buffer; only the load that fits the slot runs.
+        // (a stride) and a view of a texture (`SLOT_IMAGE`) from anything
+        // else, which is still read as a constant buffer; only the load
+        // that fits the slot runs, and none for a texture's: a heap index
+        // computed from data can fall on one (the meshlet culls, RX 9070 XT
+        // under Proton: scalar cache faults at 0), and its descriptor read
+        // as a constant buffer's is no address. Such a load gives zeros.
         let picked = match kind {
             None => self.slot_stride(src)?,
             Some(_) => None,
         };
         if let Some(stride) = picked {
             let zero = self.s.m.i32(0);
-            let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+            let image = self.s.m.i32(super::shader::SLOT_IMAGE);
+            let not_none = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+            let not_image = self.s.m.cmp(self.cur, pred::NE, stride, image);
+            let is_buffer = self.s.m.bin(self.cur, Bin::And, not_none, not_image);
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
@@ -10295,6 +10302,12 @@ impl<'a> Lower<'a> {
             && !typed
             && used.is_none()
         {
+            // A texture's slot (`SLOT_IMAGE`) scales by 0, as before that
+            // word was in the table.
+            let image = self.s.m.i32(super::shader::SLOT_IMAGE);
+            let is_image = self.s.m.cmp(c, pred::EQ, stride, image);
+            let zero = self.s.m.i32(0);
+            let stride = self.s.m.select(c, is_image, zero, stride);
             let at = self.s.m.bin(c, Bin::Mul, element, stride);
             off = self.s.m.bin(c, Bin::Add, at, off);
             index = None;

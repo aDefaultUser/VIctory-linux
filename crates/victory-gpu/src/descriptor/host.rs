@@ -786,6 +786,30 @@ fn view_stride(view: &View) -> Option<u32> {
     })
 }
 
+/// The stride table's dword ([`victory_shader::emit::SLOT_STRIDES`]) for a
+/// slot about to show `view` (none: a record that names no view), whose
+/// buffer view has `stride` bytes per element if it is one: that stride,
+/// [`victory_shader::emit::SLOT_IMAGE`] for a view of a texture (a shader
+/// that picks the slot to read a buffer or constant buffer reads zeros),
+/// 0 for anything else. Written before the host slot changes
+/// ([`HostHeap::note_buffer`] comes first in [`HostHeap::mirror`]); every
+/// slot starts null, with 0.
+fn slot_word(view: Option<&View>, stride: Option<u32>) -> u32 {
+    const BUFFER: u32 = 1;
+    let image = match view {
+        Some(View::Placed(_, resource, _)) => resource[0] != BUFFER,
+        Some(View::Shader(r, _) | View::Unordered(r, _, _)) => {
+            crate::resource::buffer_bytes(*r as crate::object::This).is_none()
+        }
+        _ => false,
+    };
+    match stride {
+        Some(stride) => stride,
+        None if image => victory_shader::emit::SLOT_IMAGE,
+        None => 0,
+    }
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -1634,9 +1658,10 @@ impl HostHeap {
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
+            let word = slot_word(view, stride);
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
@@ -1968,6 +1993,16 @@ impl HostHeap {
             self.keep(index, kept.flatten());
         }
         Some(view)
+    }
+
+    /// The stride table's dword for title slot `index` (tests).
+    #[cfg(test)]
+    pub(crate) fn stride_word(&self, index: u32) -> u32 {
+        let Some((_, _, data)) = &self.strides else {
+            return 0;
+        };
+        // SAFETY: inside the mapping for a slot of the heap.
+        unsafe { (*data as *const u32).add(index as usize).read_volatile() }
     }
 
     /// Whether slot `index` is backed by a made host descriptor (tests).

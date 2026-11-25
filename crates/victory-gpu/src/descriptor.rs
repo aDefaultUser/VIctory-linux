@@ -1255,6 +1255,40 @@ mod tests {
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 
+    /// The stride table tells shaders that pick a slot by index what it
+    /// holds as the slot changes: a texture (not to be read as a buffer or
+    /// a constant buffer), a constant buffer, then nothing.
+    #[cfg(windows)]
+    #[test]
+    fn the_stride_table_follows_what_a_slot_holds() {
+        use victory_shader::emit::SLOT_IMAGE;
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 8,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let mut h: This = std::ptr::null();
+        let placement = Placement { address: 0, size: 0 };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            let null = std::ptr::null();
+            let slot2 = heap(h).start + 2 * 32;
+            create_srv(null, null, std::ptr::null(), slot2);
+            assert_eq!(host.stride_word(2), SLOT_IMAGE);
+            create_cbv(null, &[0x1000, 1, 256, 0], slot2);
+            assert_eq!(host.stride_word(2), 0);
+            create_srv(null, null, std::ptr::null(), slot2);
+            assert_eq!(host.stride_word(2), SLOT_IMAGE);
+            // The title clears the slot: no view there.
+            // SAFETY: a slot of the heap's memory.
+            unsafe { std::ptr::write_bytes(slot2 as *mut u8, 0, 32) };
+            host.mirror(2, slot2, false);
+            assert_eq!(host.stride_word(2), 0);
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+    }
+
     #[test]
     fn views_survive_copies() {
         let null = std::ptr::null();
