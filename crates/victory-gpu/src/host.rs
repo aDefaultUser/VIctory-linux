@@ -6130,8 +6130,8 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
-    // SAFETY: the destination is mapped writable memory of `len` bytes; the
-    // kernel checks the source.
+    // SAFETY: the kernel checks the source, and the destination as it
+    // writes it (title memory, for [`copy_mapped`] and [`write_mapped`]).
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
@@ -6149,38 +6149,78 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-/// Whether title memory is written with the kernel's own call
-/// (`NtWriteVirtualMemory`) and not `WriteProcessMemory`, which first asks
-/// what the pages are (as `VirtualQuery` does: about 2 ms a call in the
-/// title's big pools, see [`copy_mapped`]): putting back what shaders wrote
-/// cost 1.2-1.9 s a frame for 430-800 pieces, 2 ms each whatever their size
-/// (run 24). On by default; `VICTORY_DIRECT_WRITES=0` writes as before.
-fn direct_writes() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_WRITES").is_none_or(|v| v != "0"))
+/// How title memory is written after a submission ([`write_mapped`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WriteRoute {
+    /// The kernel's own call (`NtWriteVirtualMemory`) and not
+    /// `WriteProcessMemory`, which first asks what the pages are (as
+    /// `VirtualQuery` does: about 2 ms a call in the title's big pools, see
+    /// [`copy_mapped`]): putting back what shaders wrote cost 1.2-1.9 s a
+    /// frame for 430-800 pieces, 2 ms each whatever their size (run 24).
+    /// The default; `VICTORY_DIRECT_WRITES=0` writes as before.
+    Direct,
+    /// `WriteProcessMemory` (`VICTORY_DIRECT_WRITES=0`).
+    Process,
+    /// The kernel's read into our own memory ([`read`], as [`copy_mapped`]
+    /// fills title destinations), taken when the route asked for is refused
+    /// even on our own memory. Under Wine the kernel's writes into a
+    /// process go through wineserver, which writes through
+    /// `/proc/<pid>/mem`; where ptrace is restricted
+    /// (`kernel.yama.ptrace_scope` 2) every one ends in
+    /// `STATUS_ACCESS_DENIED`, and nothing shaders wrote reached title
+    /// memory. Wine reads into the calling process's own memory in the
+    /// process, and stops at pages that are not mapped or not writable as
+    /// the write does, changing no protection.
+    Read,
+}
+
+/// The route [`write_mapped`] takes, chosen once: the one asked for, unless
+/// a write of one byte into our own memory through it is refused.
+fn write_route() -> WriteRoute {
+    static ROUTE: OnceLock<WriteRoute> = OnceLock::new();
+    *ROUTE.get_or_init(|| {
+        let asked = if std::env::var_os("VICTORY_DIRECT_WRITES").is_none_or(|v| v != "0") {
+            WriteRoute::Direct
+        } else {
+            WriteRoute::Process
+        };
+        let mut probe = 0u8;
+        if kernel_write(asked, &mut probe, &1, 1) && probe == 1 {
+            return asked;
+        }
+        tracing::warn!(
+            ?asked,
+            "the kernel refused a write into our own memory (Wine with ptrace restricted?): what shaders write is put into title memory through the kernel's read instead"
+        );
+        WriteRoute::Read
+    })
+}
+
+/// One write of [`write_mapped`] through `route`: whether all of it landed.
+fn kernel_write(route: WriteRoute, dst: *mut u8, src: *const u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut done = 0;
+    match route {
+        // SAFETY: the source is our mapped host copy; the kernel checks the
+        // destination and writes nothing it cannot (the caller opened its
+        // guards: `crate::watch::writing`).
+        WriteRoute::Direct => unsafe {
+            NtWriteVirtualMemory(GetCurrentProcess(), dst.cast(), src.cast(), len, &mut done) >= 0
+        },
+        // SAFETY: as above.
+        WriteRoute::Process => unsafe {
+            WriteProcessMemory(GetCurrentProcess(), dst.cast(), src.cast(), len, &mut done) != 0
+        },
+        WriteRoute::Read => read(src, dst, len),
+    }
 }
 
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let direct = direct_writes();
-    let write = |at: usize, n: usize| {
-        let from = src.wrapping_add(at - dst as usize);
-        let mut done = 0;
-        if direct {
-            // SAFETY: as below; the kernel checks the destination and
-            // writes nothing it cannot (the caller opened its guards:
-            // `crate::watch::writing`).
-            return unsafe {
-                NtWriteVirtualMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) >= 0
-            };
-        }
-        // SAFETY: the source is our mapped host copy; the kernel checks the
-        // destination.
-        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
-    };
+    let route = write_route();
+    let write = |at: usize, n: usize| kernel_write(route, at as *mut u8, src.wrapping_add(at - dst as usize), n);
     if len == 0 || write(dst as usize, len) {
         return;
     }
@@ -7180,6 +7220,45 @@ fn pump() {
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
+        }
+    }
+}
+
+#[cfg(test)]
+mod write_mapped_tests {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    /// What shaders wrote lands in our own memory, whatever route the
+    /// kernel lets us take (under Wine with ptrace restricted, its writes
+    /// into our own memory are refused); a write across into pages that
+    /// are read-only or only reserved lands where it can and leaves those
+    /// alone.
+    #[test]
+    fn writes_land_in_our_own_memory_and_leave_unwritable_pages_alone() {
+        const PAGE: usize = 64 << 10;
+        let bytes: Vec<u8> = (0..3 * PAGE).map(|i| (i * 7 + 3) as u8).collect();
+        let mut heap = vec![0u8; 256];
+        super::write_mapped(heap.as_mut_ptr().wrapping_add(16), bytes.as_ptr(), 64);
+        assert_eq!(&heap[16..80], &bytes[..64]);
+        assert!(heap[..16].iter().chain(&heap[80..]).all(|&b| b == 0));
+        // SAFETY: plain reservation and commits of memory of our own, freed
+        // below; read only where committed.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            assert!(!VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert!(!VirtualAlloc(base.add(PAGE).cast(), PAGE, MEM_COMMIT, PAGE_READONLY).is_null());
+            // From the last 16 bytes of the writable page on, across the
+            // read-only page into the reserved one.
+            let at = base.add(PAGE - 16);
+            super::write_mapped(at, bytes.as_ptr(), PAGE + 32);
+            let writable = std::slice::from_raw_parts(at, 16);
+            let read_only = std::slice::from_raw_parts(base.add(PAGE), PAGE);
+            assert_eq!(writable, &bytes[..16]);
+            assert!(read_only.iter().all(|&b| b == 0));
+            VirtualFree(base.cast(), 0, MEM_RELEASE);
         }
     }
 }
