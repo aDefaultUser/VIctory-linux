@@ -29,9 +29,10 @@ settings.
 These runs cover the opening. Later scenes and performance with default
 settings remain unverified.
 
-The command below applies those settings through the script. The direct
-launcher supplied the in-game results above. Set `VKD3D_DLLS` to the folder
-holding your patched build's `d3d12.dll` and `d3d12core.dll`.
+The command below applies those settings through the script. A separate
+140-second smoke test with the Proton script warmed the cache and entered the
+prologue without a GPU fault. Set `VKD3D_DLLS` to the folder holding your
+patched build's `d3d12.dll` and `d3d12core.dll`.
 
 ```sh
 VICTORY_WARM=1 VICTORY_WINE=proton \
@@ -69,8 +70,9 @@ In one matched Proton Experimental A/B with frame capture off, 60 against
 1500 raised the slowest five-second sample of the loading screen from 4.2 to
 14.9 frames per second and the median from 20 to 23, and the first room
 looked the same (the player's hair and clothes, the walls and the wired
-glass) with camera input working. The value bounds upload work, not the time
-between presented frames, and the loading screen still stutters.
+glass) with camera input working. The setting limits the upload pass. In the
+separate Proton script smoke test, one loading interval still dipped to
+1.6 frames per second.
 
 System Wine keeps 1500 because 60 is unproven there. One run with 60 reached
 the first room with camera control, but its loading screen still dropped to
@@ -162,8 +164,8 @@ dxil-spirv `114e664e` with a backport of upstream commit `e084e35c` from
   described above. Later parts of the game remain unverified.
 - **GPU resets (earlier builds).** Some earlier runs reset the GPU, for a cause
   not known. The two `7ec6682` runs showed no fault in 520 and 420 seconds.
-- **Loading-screen stutter.** Reduced under Proton, not gone; see "Texture
-  uploads before the character bake".
+- **Loading-screen stutter.** Stalls can still occur with the shorter bake
+  budget. See [Texture uploads before the character bake](#texture-uploads-before-the-character-bake).
 - **Black frames (earlier builds).** Not seen in later samples. Earlier runs
   showed every second or third frame of the 3D world black. In those runs the
   scene's brightness before tone mapping swung by a factor of about 100 from
@@ -222,8 +224,9 @@ Vulkan start-up waits for it), though the warm-up opens no window.
 
 Latest, with `7ec6682` and the patched vkd3d-proton: a warm-up from a cold
 cache translated 3,263 of 3,264 containers (the one left uses a wave mask the
-translator does not support) and made 1,136 compute pipelines. A repeat
-warm-up took about 3 s on an earlier integrated build.
+translator does not support) and made 1,136 compute pipelines. In the Proton
+script smoke test, a repeat loaded those shader translations from cache in
+3.0 s and the compute pipelines in 0.9 s.
 
 Earlier warm-up measurements used four translation threads and two pipeline
 threads.
