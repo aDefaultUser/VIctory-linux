@@ -2134,9 +2134,10 @@ impl State {
                 .then(|| crate::texture::title_memory(resource))
                 .flatten()
                 .map(|(at, len)| (at, len, crate::texture::fingerprint(at, len)));
-            if let Some(view) = &view {
-                readable(list, sampled.kind, view);
-            }
+            let upload = match &view {
+                Some(view) => readable(list, sampled.kind, view),
+                None => crate::texture::Upload::Nothing,
+            };
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !GONE.load(Ordering::Relaxed)
@@ -2152,8 +2153,10 @@ impl State {
             // the runtime remapped it, and no upload was recorded. The host
             // copy keeps what it had, and the slot stays due, as one whose
             // memory is not there yet, to be uploaded once its pages hold
-            // still (a remap under it also makes it due at once).
-            if crate::texture::unread(resource) {
+            // still (a remap under it also makes it due at once). Told by
+            // this upload, not by a look at the staging buffer: another slot
+            // of the texture let it go, and its absence is no upload.
+            if upload == crate::texture::Upload::Unread {
                 crate::texture::unstage(resource);
                 host.texture_slot_later(index, write, frame, most);
                 continue;
@@ -3413,8 +3416,11 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     }
 }
 
-fn readable(list: &HostList, kind: ResourceType, view: &View) {
+/// Makes `view` readable by the list; what the upload of a texture the
+/// title fills did ([`crate::texture::upload`]).
+fn readable(list: &HostList, kind: ResourceType, view: &View) -> crate::texture::Upload {
     const UNORDERED_ACCESS: u32 = 0x8;
+    let mut upload = crate::texture::Upload::Nothing;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
@@ -3446,7 +3452,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
             {
-                crate::texture::upload(list, *resource as This, t);
+                upload = crate::texture::upload(list, *resource as This, t);
             }
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(*resource as This, false, false);
@@ -3483,6 +3489,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         }
         _ => {}
     }
+    upload
 }
 
 /// The pixel shaders whose draws get their slots listed

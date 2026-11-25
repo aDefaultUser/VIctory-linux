@@ -3053,6 +3053,97 @@ mod tests {
         assert_eq!(t, u64::MAX, "no second subresource");
     }
 
+    /// `VICTORY_TEXTURE_NO_WAIT=1`: a texture whose memory cannot be read
+    /// while the runtime remaps it records no upload, and that is no use of
+    /// it by the list. A later draw of the same list asks again, and so does
+    /// another slot picked by index of the same texture after the first one
+    /// let its staging buffer go (it found the texture done, and its slot
+    /// counted as uploaded with nothing recorded).
+    #[cfg(windows)]
+    #[test]
+    fn an_unread_texture_is_asked_for_again_by_the_same_list() {
+        use crate::texture::{Upload, unstage, upload_with};
+        use windows_sys::Win32::System::Memory::*;
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host D3D12 device: not run");
+            return;
+        };
+        const PAGE: usize = 0x1000;
+        let desc = texture(64, 64, 28, 1);
+        let size = texture_layout(&desc).unwrap().size as usize;
+        assert!(size >= 3 * PAGE, "a page in the middle to take away");
+        // SAFETY: a private allocation of our own, written only while its
+        // pages are committed.
+        let memory = unsafe {
+            let memory = VirtualAlloc(
+                std::ptr::null(),
+                size,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!memory.is_null());
+            memory.write_bytes(0x5a, size);
+            memory
+        };
+        let null = std::ptr::null();
+        let mut image = null;
+        assert_eq!(
+            create_at_address(
+                null,
+                memory as u64,
+                &desc,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut image
+            ),
+            S_OK
+        );
+        let copy = host_resource(image).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: within the allocation.
+        let middle = unsafe { memory.add(PAGE) };
+        {
+            let _remapping = crate::watch::title_memory_remapping();
+            // SAFETY: a page of our allocation, committed again below.
+            assert_ne!(unsafe { VirtualFree(middle.cast(), PAGE, MEM_DECOMMIT) }, 0);
+            assert_eq!(upload_with(&list, image, copy, true), Upload::Unread);
+            assert_eq!(
+                upload_with(&list, image, copy, true),
+                Upload::Unread,
+                "a later draw of the list asks again"
+            );
+            unstage(image);
+            assert_eq!(
+                upload_with(&list, image, copy, true),
+                Upload::Unread,
+                "another slot of the texture asks again"
+            );
+            // SAFETY: as above.
+            unsafe {
+                let back = VirtualAlloc(middle.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE);
+                assert_eq!(back, middle.cast());
+                middle.write_bytes(0x5a, PAGE);
+            }
+        }
+        assert_eq!(
+            upload_with(&list, image, copy, true),
+            Upload::Recorded,
+            "the pages hold still"
+        );
+        assert_eq!(
+            upload_with(&list, image, copy, true),
+            Upload::Nothing,
+            "once per list"
+        );
+        drop(list);
+        unstage(image);
+        slot::<Release>(image, 0x10)(image);
+        // SAFETY: our allocation; the resource over it is released.
+        assert_ne!(unsafe { VirtualFree(memory.cast(), 0, MEM_RELEASE) }, 0);
+    }
+
     /// A 4x4 texture filled from a title buffer through our list and queue,
     /// then read back from the host GPU.
     #[cfg(windows)]

@@ -609,11 +609,36 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
     unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
 }
 
+/// What [`upload`] did in a list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Upload {
+    /// The list copies the staging buffer into the host copy, or checks at
+    /// submission whether the memory changed since the host copy took it.
+    Recorded,
+    /// Nothing to do: the list brought the texture up to date already, the
+    /// host wrote it, or it has no staging buffer.
+    Nothing,
+    /// With [`no_wait`]: the staging buffer holds no read of the memory, so
+    /// nothing was recorded, and the list's next use of the texture tries
+    /// again.
+    Unread,
+}
+
 /// Records, once per list, the copy of `resource`'s staging buffer into
 /// its host copy, and the detiling that refreshes the staging buffer at
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
-pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) -> Upload {
+    upload_with(list, resource, texture, no_wait())
+}
+
+/// [`upload`], with [`no_wait`] given.
+pub(crate) fn upload_with(
+    list: &HostList,
+    resource: This,
+    texture: &ID3D12Resource,
+    no_wait: bool,
+) -> Upload {
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -622,15 +647,18 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
     if host_written || !list.first_use(resource as usize) {
-        return;
+        return Upload::Nothing;
     }
     let Some(staging) = staging(resource, texture) else {
-        return;
+        return Upload::Nothing;
     };
     use std::sync::atomic::Ordering::Relaxed;
     staging.used.store(crate::host::moment(), Relaxed);
-    if !staging.ready(no_wait()) {
-        return;
+    if !staging.ready(no_wait) {
+        // Not a use: a later draw of this list, or another slot of the
+        // texture, asks again instead of finding it done.
+        list.forget_use(resource as usize);
+        return Upload::Unread;
     }
     // Levels on demand: a view of the texture now starts at another
     // level, or another texture now starts inside its span, with no byte
@@ -666,7 +694,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
         list.defer_texture(staging);
-        return;
+        return Upload::Recorded;
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
@@ -741,7 +769,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let Some(on_demand) = on_demand else {
         // Once per submission however many of its lists sample the texture.
         list.defer_texture(staging);
-        return;
+        return Upload::Recorded;
     };
     list.defer_texture(staging.clone());
     list.defer_host(move || {
@@ -753,6 +781,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             crate::descriptor::host::levels_waiting(staging.memory as u64);
         }
     });
+    Upload::Recorded
 }
 
 /// Levels on demand: the levels a list claimed for its zeros
@@ -1260,18 +1289,6 @@ pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
 pub(crate) fn is_staged(resource: This) -> bool {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
-}
-
-/// With [`no_wait`]: whether `resource`'s staging buffer holds no read of
-/// its memory, so no upload of it was recorded ([`Staging::ready`]).
-pub(crate) fn unread(resource: This) -> bool {
-    if !no_wait() {
-        return false;
-    }
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    map.as_ref()
-        .and_then(|map| map.get(&(resource as usize)))
-        .is_some_and(|s| !s.filled.load(std::sync::atomic::Ordering::Acquire))
 }
 
 /// The bytes of a title texture's memory, and whether all of it is mapped,

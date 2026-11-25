@@ -5763,6 +5763,12 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// Takes back a [`HostList::first_use`] that did nothing: the list's
+    /// next use of `key` is a first one again.
+    pub(crate) fn forget_use(&self, key: usize) {
+        self.deferred().textures.remove(&key);
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
