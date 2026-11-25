@@ -99,71 +99,65 @@ pub fn run(o: Options) -> Result<()> {
     let counts = [const { AtomicUsize::new(0) }; 3];
     let keep_compute = o.pipelines && device;
     let all_found = || only.as_ref().is_some_and(|w| lock(&done).len() >= w.len());
+    let stop = || late() || all_found();
+    let warm = |bytes: &[u8]| {
+        let hash = blake3::hash(bytes).to_hex()[..16].to_owned();
+        if only.as_ref().is_some_and(|w| !w.contains(&hash)) || !lock(&done).insert(hash.clone()) {
+            return;
+        }
+        let outcome = d3d12x::warm_shader(bytes);
+        let which = match outcome {
+            Ok(true) => 0,
+            Ok(false) => 1,
+            Err(_) => 2,
+        };
+        let n = counts[which].fetch_add(1, Ordering::Relaxed);
+        if n > 0 && n.is_multiple_of(500) {
+            println!(
+                "warm-up      {} shaders so far, {:.0} s",
+                lock(&done).len(),
+                began.elapsed().as_secs_f64()
+            );
+        }
+        if keep_compute && outcome.is_ok() && is_compute(bytes) {
+            lock(&compute).push((hash, bytes.to_vec()));
+        }
+    };
+    // Kept containers are one per file: their paths are gathered so the
+    // workers share many files, each reading its own.
+    let mut loose = Vec::new();
     'walk: for root in &roots {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
             .filter_map(Result::ok)
         {
-            if late() || all_found() {
+            if stop() {
                 break 'walk;
             }
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
+            // A kept container is the title's bytes exactly: they are the key.
+            if entry.path().extension().is_some_and(|e| e == "cdxil") {
+                loose.push(entry.into_path());
+                if loose.len() >= LOOSE_BATCH {
+                    warm_files(&loose, threads, &stop, &warm);
+                    loose.clear();
+                }
+                continue;
+            }
             let Ok(data) = std::fs::read(entry.path()) else {
                 continue;
             };
-            // A kept container is the title's bytes exactly: they are the key.
-            let whole = entry.path().extension().is_some_and(|e| e == "cdxil");
-            let found = if whole { Vec::new() } else { sources(&data) };
-            let count = if whole { 1 } else { found.len() };
-            let next = AtomicUsize::new(0);
-            std::thread::scope(|s| {
-                for _ in 0..threads.min(count) {
-                    s.spawn(|| {
-                        loop {
-                            let i = next.fetch_add(1, Ordering::Relaxed);
-                            if i >= count || late() {
-                                break;
-                            }
-                            let bytes = if whole {
-                                std::borrow::Cow::Borrowed(&data[..])
-                            } else {
-                                match found[i].bytes() {
-                                    Some(b) => trimmed(b),
-                                    None => continue,
-                                }
-                            };
-                            let bytes = &bytes[..];
-                            let hash = blake3::hash(bytes).to_hex()[..16].to_owned();
-                            if only.as_ref().is_some_and(|w| !w.contains(&hash))
-                                || !lock(&done).insert(hash.clone())
-                            {
-                                continue;
-                            }
-                            let outcome = d3d12x::warm_shader(bytes);
-                            let which = match outcome {
-                                Ok(true) => 0,
-                                Ok(false) => 1,
-                                Err(_) => 2,
-                            };
-                            let n = counts[which].fetch_add(1, Ordering::Relaxed);
-                            if n > 0 && n.is_multiple_of(500) {
-                                println!(
-                                    "warm-up      {} shaders so far, {:.0} s",
-                                    lock(&done).len(),
-                                    began.elapsed().as_secs_f64()
-                                );
-                            }
-                            if keep_compute && outcome.is_ok() && is_compute(bytes) {
-                                lock(&compute).push((hash, bytes.to_vec()));
-                            }
-                        }
-                    });
+            let found = sources(&data);
+            on_threads(&found, threads, &stop, |source| {
+                if let Some(bytes) = source.bytes() {
+                    warm(&trimmed(bytes));
                 }
             });
         }
     }
+    warm_files(&loose, threads, &stop, &warm);
     let [translated, there, failed] = counts.map(|c| c.into_inner());
     let asked = only
         .as_ref()
@@ -215,6 +209,48 @@ pub fn run(o: Options) -> Result<()> {
     }
     let _ = std::io::stdout().flush();
     Ok(())
+}
+
+/// Kept container files given to the workers at a time: enough to keep
+/// them all busy, few enough that a walk of many files holds little.
+const LOOSE_BATCH: usize = 256;
+
+/// Reads each of `paths` on up to `threads` threads and hands its bytes,
+/// whole, to `warm`; a file that does not read is passed over.
+fn warm_files(
+    paths: &[PathBuf],
+    threads: usize,
+    stop: &(impl Fn() -> bool + Sync),
+    warm: &(impl Fn(&[u8]) + Sync),
+) {
+    on_threads(paths, threads, stop, |path| {
+        if let Ok(data) = std::fs::read(path) {
+            warm(&data);
+        }
+    });
+}
+
+/// Runs `work` on each of `items`, on up to `threads` threads taking the
+/// next one in turn, until all are done or `stop`.
+fn on_threads<T: Sync>(
+    items: &[T],
+    threads: usize,
+    stop: &(impl Fn() -> bool + Sync),
+    work: impl Fn(&T) + Sync,
+) {
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..threads.min(items.len()) {
+            s.spawn(|| {
+                while let Some(item) = items.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    if stop() {
+                        break;
+                    }
+                    work(item);
+                }
+            });
+        }
+    });
 }
 
 /// A container found in a file, cut to the size its header gives (a raw
@@ -922,5 +958,39 @@ mod tests {
             Outcome::Made
         });
         assert_eq!(counts, PipelineCounts::default());
+    }
+
+    #[test]
+    fn kept_files_are_shared_by_the_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<Vec<u8>> = (0u8..10).map(|i| vec![i; 3 + i as usize]).collect();
+        let paths: Vec<PathBuf> = files
+            .iter()
+            .enumerate()
+            .map(|(i, bytes)| {
+                let path = dir.path().join(format!("{i}.cdxil"));
+                std::fs::write(&path, bytes).unwrap();
+                path
+            })
+            .collect();
+        // The first four files meet: only four workers at once get there.
+        let arrived = Mutex::new(0);
+        let all_here = Condvar::new();
+        let seen = Mutex::new(Vec::new());
+        warm_files(&paths, 4, &|| false, &|bytes: &[u8]| {
+            let mut n = lock(&arrived);
+            *n += 1;
+            let (n, waited) = all_here
+                .wait_timeout_while(n, Duration::from_secs(10), |n| *n < 4)
+                .unwrap();
+            all_here.notify_all();
+            drop(n);
+            lock(&seen).push((bytes.to_vec(), waited.timed_out()));
+        });
+        let mut seen = seen.into_inner().unwrap();
+        assert!(seen.iter().all(|(_, timed_out)| !timed_out));
+        seen.sort();
+        let seen: Vec<Vec<u8>> = seen.into_iter().map(|(bytes, _)| bytes).collect();
+        assert_eq!(seen, files);
     }
 }
