@@ -4550,6 +4550,13 @@ impl Host {
     /// to be done once they have run comes back with the submission lock
     /// still held.
     fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        // The order host lists reach the card in, for the frame's `ops` file
+        // (its other lines are in recording order).
+        #[cfg(feature = "diagnostics")]
+        crate::capture::op(0, || {
+            let named: Vec<String> = runs.iter().map(|r| format!("{:#x}", std::ptr::from_ref(*r) as usize)).collect();
+            format!("EXEC late {late} lists {named:?}")
+        });
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
