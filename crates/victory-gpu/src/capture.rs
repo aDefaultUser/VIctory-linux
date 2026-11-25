@@ -445,11 +445,12 @@ fn dump_one(
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
         }
+        let name = format!(
+            "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
+            d.Width, d.Height, d.Format.0
+        );
+        tracing::info!(name, "target dumped next");
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
-            let name = format!(
-                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
-                d.Width, d.Height, d.Format.0
-            );
             save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
@@ -613,7 +614,18 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     // lamp on black have the same highest value.
     let above = values.iter().filter(|v| v.iter().any(|c| c.is_finite() && *c > low)).count();
     let nonzero_percent = above as f32 * 100.0 / values.len().max(1) as f32;
-    tracing::info!(format, low, high, nonzero_percent, "target values");
+    let nan = values.iter().filter(|v| v.iter().any(|c| c.is_nan())).count();
+    let infinite = values.iter().filter(|v| v.iter().any(|c| c.is_infinite())).count();
+    // Where the first texels that are not numbers lie, and the middle texel.
+    let first_bad: Vec<(usize, usize)> = values
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.iter().any(|c| !c.is_finite()))
+        .take(4)
+        .map(|(i, _)| (i % w, i / w))
+        .collect();
+    let middle = values.get(h / 2 * w + w / 2).copied();
+    tracing::info!(format, w, h, low, high, nonzero_percent, nan, infinite, ?first_bad, ?middle, "target values");
     // Small float colour targets (the 1x1 luminance and exposure targets):
     // every texel's four channels as numbers. The picture has no alpha and
     // eight bits a channel.
