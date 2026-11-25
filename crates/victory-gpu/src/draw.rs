@@ -417,6 +417,17 @@ fn heap_recheck() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0"))
 }
+
+/// The fingerprint a whole upload of the texture memory `[at, at + len)`
+/// is looked at again against: `before` (address, bytes, fingerprint),
+/// taken before the upload read the memory, if it is of that memory.
+fn upload_print(before: Option<(u64, u64, u64)>, at: u64, len: u64) -> u64 {
+    match before {
+        Some((before_at, before_len, print)) if (before_at, before_len) == (at, len) => print,
+        _ => crate::texture::fingerprint(at, len),
+    }
+}
+
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.
 pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
@@ -1961,6 +1972,16 @@ impl State {
             // through a table: they upload it, and check it at every
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
+            // The fingerprint a whole upload is looked at again against,
+            // taken before the read. Bytes that land while it is read (a
+            // storage request into the texture finishing, which told of
+            // the write before it began) then differ at the first look;
+            // taken after the read, it matched them and the upload kept
+            // what was there before for good.
+            let before = (!tabled && partly.is_none() && heap_recheck())
+                .then(|| crate::texture::title_memory(resource))
+                .flatten()
+                .map(|(at, len)| (at, len, crate::texture::fingerprint(at, len)));
             if let Some(view) = &view {
                 readable(list, sampled.kind, view);
             }
@@ -2018,7 +2039,7 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
-                    let print = crate::texture::fingerprint(at, len);
+                    let print = upload_print(before, at, len);
                     host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
@@ -3490,5 +3511,33 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod recheck_tests {
+    use super::upload_print;
+    use crate::texture::fingerprint;
+
+    /// A storage request into a texture finishes while the pass reads the
+    /// texture for its upload: the look after the upload finds the memory
+    /// changed against the fingerprint taken before the read, and the
+    /// texture is uploaded again. A fingerprint taken after the read was
+    /// of the new bytes, every look found them unchanged, and the upload
+    /// kept the bytes from before.
+    #[test]
+    fn bytes_that_land_during_the_upload_are_found_by_the_next_look() {
+        let mut memory = vec![0x11u8; 256 << 10];
+        let (at, len) = (memory.as_ptr() as u64, memory.len() as u64);
+        let before = Some((at, len, fingerprint(at, len)));
+        // The upload read the memory here; the request's bytes land now.
+        memory[..64 << 10].fill(0x22);
+        let print = upload_print(before, at, len);
+        assert_ne!(fingerprint(at, len), print, "the look finds the texture changed");
+        // Taken after the read: the look matches the new bytes.
+        assert_eq!(fingerprint(at, len), upload_print(None, at, len));
+        // A fingerprint of other memory is not used.
+        let elsewhere = Some((at + 4096, len, 1));
+        assert_eq!(upload_print(elsewhere, at, len), fingerprint(at, len));
     }
 }

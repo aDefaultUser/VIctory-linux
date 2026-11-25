@@ -788,23 +788,32 @@ pub fn writing(at: usize, len: usize) {
 /// copies of buffers and textures read through tables take them again);
 /// 2, the placed textures picked by index that lie under it are due again;
 /// 4, both also for reads to plain addresses when they have finished.
-/// Unset or `guards`: bit 1 alone. `0`: nothing, counted only (the default
-/// until run 199). `1`: bits 1 and 2. `slots`: bit 2 alone. `all`:
+/// Unset or `1`: bits 1 and 2. `guards`: bit 1 alone. `0`: nothing,
+/// counted only (the default until run 199). `slots`: bit 2 alone. `all`:
 /// everything.
-/// (Bit 1 by default: in every run 10,000 to 50,000 guarded blocks of host
-/// copies lay under such writes and kept the bytes from before; runs 197
-/// and 198 opened them, 9,766 and 10,796 blocks, with nothing worse for
-/// it. Bit 2 makes texture slots due and is the one that flooded the
-/// queue in an earlier form: still asked for by name.)
+/// (Bit 1: in every run 10,000 to 50,000 guarded blocks of host copies lay
+/// under such writes and kept the bytes from before; runs 197 and 198
+/// opened them, 9,766 and 10,796 blocks, with nothing worse for it. Bit 2
+/// flooded the queue in an earlier form; in this one it makes due only
+/// slots uploaded before the write: 2,200 to 6,700 a run in twenty runs
+/// under Wine, against 50,000 to 130,000 uploads. Without it those keep
+/// the bytes from before for good once the looks after their upload are
+/// over. The seven of those runs that had it on drew their frames no
+/// slower than the others. `guards`: as before.)
 pub(crate) fn page_writes() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_PAGE_WRITES").as_deref().map(str::trim) {
-        Ok("0") => 0,
-        Ok("1") => 3,
-        Ok("slots") => 2,
-        Ok("all") => 7,
-        _ => 1,
-    })
+    *MODE.get_or_init(|| page_writes_mode(std::env::var("VICTORY_PAGE_WRITES").ok().as_deref()))
+}
+
+/// [`page_writes`] for the switch's value.
+fn page_writes_mode(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("0") => 0,
+        Some("guards") => 1,
+        Some("slots") => 2,
+        Some("all") => 7,
+        _ => 3,
+    }
 }
 
 /// Since the start: writes into physical pages through the runtime's own
@@ -1017,6 +1026,18 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// Unset, a storage write into physical pages under a texture slot
+    /// uploaded before it makes the slot due as well as opening the guards.
+    #[test]
+    fn page_writes_make_uploaded_texture_slots_due_by_default() {
+        assert_eq!(page_writes_mode(None), 3);
+        assert_eq!(page_writes_mode(Some("1")), 3);
+        assert_eq!(page_writes_mode(Some("guards")), 1);
+        assert_eq!(page_writes_mode(Some(" 0 ")), 0);
+        assert_eq!(page_writes_mode(Some("slots")), 2);
+        assert_eq!(page_writes_mode(Some("all")), 7);
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
