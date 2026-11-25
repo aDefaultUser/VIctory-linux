@@ -11,10 +11,11 @@ with or endorsed by the game's developer or publisher.
 
 ## Status
 
-On November 25, 2026, the opening reached player control on system Wine 11.22
-and Proton Experimental 11.0 (Radeon RX 9070 XT, Mesa 26.3.1). The player's
-hair and clothing and the first room's walls and wired glass rendered with
-the tested settings and a patched vkd3d-proton.
+The opening reached player control on system Wine 11.22 and Proton
+Experimental 11.0 on November 25, 2026. Both runs used a Radeon RX 9070 XT and
+a patched vkd3d-proton. With graphics pipelines cached from a previous run,
+faces rendered again in the opening cutscene on both runtimes. A launch
+without that cache can still leave faces or other materials missing.
 
 - The logo movie played near 30 fps in sampled earlier runs with frame
   capture turned off.
@@ -69,8 +70,9 @@ The opening-scene tests used a patched vkd3d-proton build and the flags in
   `VICTORY_WARM=only` does that and stops. Leave it out to start the title
   straight away. It translates the shader sources that earlier warm runs
   captured on your machine, and builds compute pipelines with `--pipelines`
-  (the default). The layer creates graphics pipelines on demand and uploads
-  texture bytes as the title streams them.
+  (the default). Keep the cache between launches so the layer can start
+  previously used graphics pipelines while the title loads. Texture bytes
+  arrive through the title's own streaming requests.
 - `VKD3D_DLLS` points at another vkd3d-proton build. Three of the title's
   compute shaders stall the compiler in stock vkd3d-proton. A build with the
   matching dxil-spirv backport makes all three. That build is not bundled

@@ -7,21 +7,26 @@ Tested on one machine (2026-11-25): CachyOS, kernel 7.3.5, Radeon RX 9070 XT
 
 ## Latest tested runs
 
-The renderer at commit `7ec6682` (`e9c3bf8` after it only adds a test) reached
-the movement and camera prompt in the first room of the opening, with the
-player's hair and clothes, the walls and the wired glass textured:
+The opening cutscene and first room ran on both runtimes. In the cold runs
+at `2d0c444`, clothes and parts of the room rendered, but faces were
+missing. Replays with the graphics cache from those runs restored faces in
+the cutscene and the player's head and hair in the first room at `36f8a35`.
+The renderer was the same in both builds. Both replays accepted camera
+input and completed without a GPU fault. Some lighting and materials still
+varied between runs.
 
-| Wine | time running | result |
-|---|---|---|
-| Proton Experimental 11.0 | 520 s | first room, camera input worked, no GPU fault |
-| System Wine 11.22 (initialized private prefix) | 420 s | first room, no GPU fault |
+| Runtime | Prior-run pipelines on the early list |
+|---|---:|
+| Proton Experimental 11.0 | 1,979 |
+| System Wine 11.22 | 1,842 |
 
-Both runs used a direct launcher and a private Xwayland server with these
-settings.
+The hardware runs used a direct launcher and a private Xwayland server with
+these settings.
 
 - a vkd3d-proton build with the matching dxil-spirv backport (see "Three
   compute pipelines vkd3d-proton cannot make")
 - `RADV_DEBUG=zerovram`
+- `VICTORY_BAKE_TEXTURES_MS=1500`
 - `VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=0 VICTORY_LATE_WAIT=0`
 - `VICTORY_HEAP_SYNC_TABLES` unset, so only table slots whose host slot does
   not show their record are mirrored (the default)
@@ -43,9 +48,13 @@ PROTON_WINE_LIBS="$HOME/.local/share/Steam/steamapps/common/Proton - Experimenta
   VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=0 VICTORY_LATE_WAIT=0
 ```
 
-Drop `VICTORY_WINE=proton` for system Wine.
+Drop `VICTORY_WINE=proton` for system Wine. Keep the same state directory
+across runs. The layer records graphics pipelines as the title uses them,
+then starts those pipelines early on the next launch. If the first run
+shows missing faces, let the opening finish, then restart with the same
+cache. The exact cause of the cold-run face loss is still open.
 
-What was seen on screen, besides the first room:
+Other observations from the opening:
 
 - **Logo movie.** Near 30 frames per second in sampled intervals with frame
   capture turned off, under both system Wine and Proton (earlier builds).
@@ -66,15 +75,12 @@ value keeps 1500), and a `VICTORY_BAKE_TEXTURES_MS=...` argument after the
 executable name wins over both. `0` turns the pass off. A shorter budget such
 as `VICTORY_BAKE_TEXTURES_MS=60` still works when given explicitly.
 
-The script defaulted to 60 under Proton for a while. A later private staging
-run of the opening (2026-11-25, graphics warm-up list empty) compared 60 and
-1500 on the same renderer (`d6a6651` against `2d0c444`, which differ only by
-a moved shader test fixture and warm-up notes). With 60, 40,000 to 45,000
-texture slots were still waiting during the following cutscene and the world
-looked flat, with detail missing. With 1500 more of them were uploaded during
-the decoration bake, and the courtyard walls and ground rendered clearly in
-the corresponding shot. Faces were missing in both runs; that is being
-investigated on its own.
+Two Proton Experimental runs on November 25, 2026 compared 60 and 1500
+with an empty early pipeline list and the same renderer. With 60, 40,000 to
+45,000 texture slots were still waiting during the cutscene, and world
+detail was missing. With 1500, more textures were uploaded during the bake,
+and the courtyard walls and ground rendered in the corresponding shot.
+Faces were missing at both budgets.
 
 The earlier speed comparison still holds for what it tested: in one matched
 Proton Experimental A/B with a warmed cache and frame capture off, 60 against
@@ -165,11 +171,11 @@ dxil-spirv `114e664e` with a backport of upstream commit `e084e35c` from
 
 ## Known problems
 
-- **Missing or wrong rendering.** Earlier builds drew parts of scenes and
-  characters wrong or not at all. With `7ec6682` the first room renders as
-  described above. Later parts of the game remain unverified.
-- **GPU resets (earlier builds).** Some earlier runs reset the GPU, for a cause
-  not known. The two `7ec6682` runs showed no fault in 520 and 420 seconds.
+- **Missing or wrong rendering.** Faces can be missing when graphics
+  pipelines are cold. First-room lighting and other materials can still
+  vary with a warm cache. Testing covers the opening.
+- **GPU resets.** Some earlier builds reset the GPU. The latest opening
+  replays at the settings above completed without a GPU fault.
 - **Loading-screen stutter.** The default 1500 ms bake budget stalls the
   loading screen. 60 ms stalls less but left world textures missing in a later
   cutscene. See [Texture uploads before the character bake](#texture-uploads-before-the-character-bake).

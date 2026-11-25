@@ -38,8 +38,9 @@ it from history.
 Reduce a rendering bug to a unit test next to the code it exercises, built
 from synthetic inputs: a small shader program, a texture layout, a descriptor
 table. Most translator tests run on the processor. Tests that need a host
-GPU use the host Direct3D 12 device, and on-card tests are `#[ignore]`d, so
-run them by name with `--ignored --nocapture`. Tests that need files outside the
+GPU use the host Direct3D 12 device. Run GPU tests with `--nocapture` to
+check that a device was actually used. Add `--ignored` for tests marked
+`#[ignore]`. Tests that need files outside the
 repository read their paths from environment variables (for example
 `VICTORY_XMA_STREAMS`, `VICTORY_BCPACK_TABLES`) and are also `#[ignore]`d.
 
