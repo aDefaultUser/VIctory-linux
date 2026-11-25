@@ -1933,4 +1933,233 @@ mod heap_pick_tests {
             }
         }
     }
+
+    /// A compute program of `words` with the layout of the programs here:
+    /// a root constant (s0, the heap slot to pick) and the view heap
+    /// (s[2:3]), 32 lanes.
+    fn lowered(words: &[u32], vgprs: u16) -> lower::Lowered {
+        let param = |root, user_data, slot| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs,
+            layout: vec![
+                param(RootType::Constants, 0, 0),
+                param(RootType::ResourceHeap, 2, 1),
+            ],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 3 << 1,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let l = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        // The accesses go by the stride table.
+        assert_eq!(l.root_srvs, [SLOT_STRIDES]);
+        l
+    }
+
+    /// Runs `l` once for each heap slot in `slots` over `views`, with
+    /// `strides` as the host's table by slot: each UAV's contents per run.
+    /// `None` without an SM 6.6 device.
+    #[cfg(windows)]
+    fn run_picking(
+        l: lower::Lowered,
+        views: &[host::View],
+        strides: &[u32],
+        slots: &[u32],
+    ) -> Option<Vec<Vec<Vec<u32>>>> {
+        let mut dxil = l.dxil;
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut dxil).unwrap();
+        }
+        let Ok(host) = host::Host::new(false) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return None;
+        };
+        let cs = HostShader {
+            stage: HwStage::Cs,
+            dxil,
+            user_data: l.user_data,
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            root_indexed_views: Vec::new(),
+        };
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (root, pso) = host.compute_pipeline(&cs).unwrap();
+        let runs = slots.iter().map(|&slot| {
+            let mut ud = vec![0u32; cs.user_data_dwords().max(1) as usize];
+            for u in cs
+                .user_data
+                .iter()
+                .filter(|u| u.root == RootType::Constants)
+            {
+                ud[u.index as usize] = slot;
+            }
+            let roots = vec![
+                (0, host::Root::Constants(ud)),
+                (
+                    1,
+                    host::Root::View {
+                        srv: true,
+                        data: strides.to_vec(),
+                    },
+                ),
+            ];
+            host.dispatch(
+                &root,
+                &pso,
+                &host::Dispatch {
+                    roots,
+                    views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("slot {slot}: {e}"))
+        });
+        Some(runs.collect())
+    }
+
+    /// Vector loads (`buffer_load_dword`, by element and by byte) through a
+    /// view the program picks from the heap read a buffer view as before,
+    /// the element scaled by the stride in the host's table and nothing
+    /// past the buffer's end, and do not run on a slot the table says
+    /// holds a texture: its descriptor read as a buffer's names no memory
+    /// of the buffer's (the scalar form faulted at 0 on an RX 9070 XT
+    /// under Proton). They read zeros there.
+    #[test]
+    fn a_heap_slot_picked_for_a_vector_load_is_read_only_if_it_holds_no_texture() {
+        let words: [u32; 16] = [
+            0x8F04_8500, // s_lshl_b32 s4, s0, 5
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0201,
+            0x0800_0000, // s_load_dwordx4 s[8:11], s[2:3], s4
+            0xF408_0401,
+            0xFA00_0060, // s_load_dwordx4 s[16:19], s[2:3], 0x60
+            0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            0xE030_1000,
+            0x8002_0302, // buffer_load_dword v3, v2, s[8:11], 0 offen
+            0xE070_1000,
+            0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen
+            0xE070_1080,
+            0x8004_0302, // buffer_store_dword v3, v2, s[16:19], 0 offen offset:128
+            0xBF81_0000, // s_endpgm
+        ];
+        let l = lowered(&words, 4);
+        #[cfg(not(windows))]
+        let _ = l;
+        #[cfg(windows)]
+        {
+            let texel = [[1.0f32, 2.0, 3.0, 4.0]];
+            let data: Vec<u32> = (0..48).map(|i| 0xB000 + i).collect();
+            // Heap: a texture, a buffer of 8-byte elements (made raw, as
+            // the host makes buffer views), the texture again (its word 0,
+            // so that the UAV sits at slot 3), the UAV the lanes write.
+            let views = [
+                host::View::Texture(1, 1, &texel),
+                host::View::Buffer {
+                    data: &data,
+                    stride: host::Stride::Raw,
+                },
+                host::View::Texture(1, 1, &texel),
+                host::View::RawUav(64),
+            ];
+            let strides = [SLOT_IMAGE, 8, SLOT_IMAGE, 1];
+            let Some(runs) = run_picking(l, &views, &strides, &[0, 1]) else {
+                return;
+            };
+            assert_eq!(runs[0][0], vec![0; 64], "a texture's slot");
+            // Element `lane` at byte 8 * lane: past the 48 dwords from
+            // lane 24 on.
+            let by_element = (0..32).map(|lane| if lane < 24 { 0xB000 + 2 * lane } else { 0 });
+            let by_byte = (0..32).map(|lane| 0xB000 + lane);
+            let want: Vec<u32> = by_element.chain(by_byte).collect();
+            assert_eq!(runs[1][0], want, "a buffer's slot");
+        }
+    }
+
+    /// A store and a returning atomic (`buffer_store_dword`,
+    /// `buffer_atomic_add ... glc`) through a view the program picks from
+    /// the heap write a buffer view as before, and write nothing on a slot
+    /// the table says holds a texture; the atomic returns 0 there.
+    #[test]
+    fn a_heap_slot_picked_for_a_vector_write_is_written_only_if_it_holds_no_texture() {
+        let words: [u32; 16] = [
+            0x8F04_8500, // s_lshl_b32 s4, s0, 5
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0201,
+            0x0800_0000, // s_load_dwordx4 s[8:11], s[2:3], s4
+            0xF408_0401,
+            0xFA00_0040, // s_load_dwordx4 s[16:19], s[2:3], 0x40
+            0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+            0x4A08_0081, // v_add_nc_u32 v4, 1, v0
+            0x7E0A_0281, // v_mov_b32 v5, 1
+            0xE070_1000,
+            0x8002_0402, // buffer_store_dword v4, v2, s[8:11], 0 offen
+            0xE0C8_5000,
+            0x8002_0502, // buffer_atomic_add v5, v2, s[8:11], 0 offen glc
+            0xE070_1000,
+            0x8004_0502, // buffer_store_dword v5, v2, s[16:19], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let l = lowered(&words, 6);
+        #[cfg(not(windows))]
+        let _ = l;
+        #[cfg(windows)]
+        {
+            // Heap: a texture UAV, a raw UAV, the UAV the lanes write.
+            let views = [
+                host::View::TextureUav(32, 1),
+                host::View::RawUav(32),
+                host::View::RawUav(32),
+            ];
+            let strides = [SLOT_IMAGE, 1, 1];
+            let Some(runs) = run_picking(l, &views, &strides, &[0, 1]) else {
+                return;
+            };
+            assert_eq!(runs[0][0], vec![0; 4 * 32], "the texture written");
+            assert_eq!(
+                runs[0][2],
+                vec![0; 32],
+                "the atomic's result on a texture's slot"
+            );
+            let stored: Vec<u32> = (0..32).map(|lane| lane + 2).collect();
+            let old: Vec<u32> = (0..32).map(|lane| lane + 1).collect();
+            assert_eq!(runs[1][1], stored, "a buffer's slot");
+            assert_eq!(runs[1][2], old, "the atomic's result on a buffer's slot");
+        }
+    }
 }

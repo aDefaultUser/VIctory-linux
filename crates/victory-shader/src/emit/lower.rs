@@ -10183,7 +10183,71 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// A buffer access (`buffer_*`, `tbuffer_*`). Through a descriptor the
+    /// program picks from the view heap at an index it computes, it runs
+    /// only where the host's table by heap slot does not say the slot holds
+    /// a texture ([`super::shader::SLOT_IMAGE`]): a texture's descriptor
+    /// read as a buffer's names no memory of the buffer's, as the scalar
+    /// loads found (scalar cache faults at 0, RX 9070 XT under Proton), and
+    /// a vector access through it is the texture cache's fault. Loads give
+    /// zeros there, stores and atomics write nothing.
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        let src = self.descriptors.get(&((b, i), false)).copied();
+        let picked = match src {
+            Some(src) => self.slot_stride(src)?,
+            None => None,
+        };
+        let (Some(&Source::Loaded { load, first }), Some(stride)) = (src, picked) else {
+            return self.buffer_access(inst, b, i);
+        };
+        let head = self.cur;
+        // What a written register holds where the access does not run: 0
+        // for a running lane, its old value for one the lane guard leaves.
+        let lanes = self.guard(b, i)?;
+        let zero = self.s.m.i32(0);
+        let mut outside = Vec::new();
+        for &(reg, new) in &inst.writes {
+            let x = match (lanes, reg) {
+                (Some(g), Reg::V(_)) => {
+                    let old = match inst.read(reg).map(|o| self.i32_of(o)) {
+                        Some(Ok(o)) => o,
+                        _ => zero,
+                    };
+                    self.s.m.select(head, g, zero, old)
+                }
+                _ => zero,
+            };
+            outside.push((new, x));
+        }
+        let image = self.s.m.i32(super::shader::SLOT_IMAGE);
+        let fits = self.s.m.cmp(head, pred::NE, stride, image);
+        let at = self.begin_guarded(Some(fits));
+        // The word read above serves the guarded access too.
+        self.strides.insert((self.cur, load, first), stride);
+        let r = self.buffer_access(inst, b, i);
+        let mut merged = Vec::new();
+        let mut values = Vec::new();
+        if r.is_ok() {
+            for &(new, x) in &outside {
+                match self.vals.get(&new) {
+                    Some(&Val::I32(inside)) => {
+                        merged.push(new);
+                        values.push((inside, x));
+                    }
+                    _ => {
+                        self.vals.insert(new, Val::Missing("a buffer result"));
+                    }
+                }
+            }
+        }
+        let values = self.end_guarded(at, &values);
+        for (new, x) in merged.into_iter().zip(values) {
+            self.vals.insert(new, Val::I32(x));
+        }
+        r
+    }
+
+    fn buffer_access(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Buffer {
             data,
             addr,
@@ -10296,18 +10360,13 @@ impl<'a> Lower<'a> {
         // table by heap slot does; the access becomes a raw one at the
         // element's byte. (Also tells the host this shader reads such
         // buffers.)
+        // A texture's slot (`SLOT_IMAGE`) does not get here ([`Self::buffer`]).
         let mut index = index;
         if let Some(stride) = self.slot_stride(src)?
             && let Some(element) = index
             && !typed
             && used.is_none()
         {
-            // A texture's slot (`SLOT_IMAGE`) scales by 0, as before that
-            // word was in the table.
-            let image = self.s.m.i32(super::shader::SLOT_IMAGE);
-            let is_image = self.s.m.cmp(c, pred::EQ, stride, image);
-            let zero = self.s.m.i32(0);
-            let stride = self.s.m.select(c, is_image, zero, stride);
             let at = self.s.m.bin(c, Bin::Mul, element, stride);
             off = self.s.m.bin(c, Bin::Add, at, off);
             index = None;
