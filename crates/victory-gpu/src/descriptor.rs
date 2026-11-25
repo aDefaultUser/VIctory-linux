@@ -1325,15 +1325,35 @@ mod tests {
 
     /// The stride table tells shaders that pick a slot by index what its
     /// host slot shows as the slot changes: a view of no texture (made as
-    /// a null view: nothing to read), a constant buffer not made (constant
-    /// buffers are made for draws, from a host copy), nothing. Slots never
-    /// written, and those past the title's (made per draw), have nothing to
-    /// read. (The words of views made from host resources:
+    /// a null view: nothing to read), a constant buffer (0) once a draw
+    /// makes it from its host copy, one the host cannot show (its copy not
+    /// 256-byte aligned: nothing to read), nothing. Slots never written,
+    /// and those past the title's (made per draw), have nothing to read.
+    /// (The words of views made from host resources:
     /// `host::tests::slot_words_say_what_a_view_shows`.)
     #[cfg(windows)]
     #[test]
     fn the_stride_table_follows_what_a_slot_shows() {
         use victory_shader::emit::SLOT_NONE;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // Title memory outside any buffer object, as titles keep constants:
+        // the host copies the window it lies in (`shadow::find`).
+        // SAFETY: a fresh allocation.
+        let constants = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                crate::watch::PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!constants.is_null());
+        let cbv = |offset: u64| {
+            let address = constants as u64 + offset;
+            [address as u32, (address >> 32) as u32, 256, 0]
+        };
         let desc = HeapDesc {
             kind: VIEWS_KIND,
             count: 8,
@@ -1352,12 +1372,18 @@ mod tests {
             create_srv(null, null, std::ptr::null(), slot2);
             assert!(host.made(2));
             assert_eq!(host.stride_word(2), SLOT_NONE);
-            // A constant buffer with no host copy: not made, for a draw
-            // either.
-            create_cbv(null, &[0x1000, 1, 256, 0], slot2);
+            // A constant buffer waits for a draw, which makes it.
+            create_cbv(null, &cbv(0x100), slot2);
+            assert!(!host.made(2), "constant buffers are made for draws");
             assert_eq!(host.stride_word(2), SLOT_NONE);
             host.mirror(2, slot2, true);
-            assert_eq!(host.stride_word(2), SLOT_NONE);
+            assert!(host.made(2));
+            assert_eq!(host.stride_word(2), 0, "a constant buffer made");
+            // One whose host copy is not 256-byte aligned: the draw makes
+            // the slot null, and shaders that pick it read nothing.
+            create_cbv(null, &cbv(0x110), slot2);
+            host.mirror(2, slot2, true);
+            assert_eq!(host.stride_word(2), SLOT_NONE, "a constant buffer not made");
             create_srv(null, null, std::ptr::null(), slot2);
             assert_eq!(host.stride_word(2), SLOT_NONE);
             // The title clears the slot: no view there.
@@ -1367,6 +1393,8 @@ mod tests {
             assert_eq!(host.stride_word(2), SLOT_NONE);
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        // SAFETY: this allocation belongs to the test.
+        unsafe { VirtualFree(constants, 0, MEM_RELEASE) };
     }
 
     #[test]
