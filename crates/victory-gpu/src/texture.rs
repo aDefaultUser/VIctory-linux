@@ -79,6 +79,38 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// Checks left in which a guarded texture is hashed although its guard
+    /// saw no write ([`UNSEEN_CHECKS`]).
+    unseen: u8,
+}
+
+/// How many checks in a row a guarded texture is hashed at every check
+/// after a hash found it changed with no write seen by its guard (the
+/// title writes it through another view of the same pages). Without
+/// this it was hashed only on its turn, every eighth frame: the intro
+/// movie's planes (three frames of a 3840x2160 luma plane and two
+/// 1920x1080 chroma planes, decoded on the CPU) took 0.9-1.7 MB of reads a
+/// frame where a frame's planes are 12.4 MB: most frames drew planes left
+/// from an earlier frame. Each check that finds it unchanged spends one;
+/// one that finds it changed starts the count again.
+const UNSEEN_CHECKS: u8 = 16;
+
+impl Last {
+    /// Whether `hash` differs from the one the staging buffer was detiled
+    /// from; keeps it. `blind`: the check rests on the hash alone (the
+    /// guard saw no write), so a change makes the next checks hash too.
+    fn changed(&mut self, hash: blake3::Hash, blind: bool) -> bool {
+        let changed = self.hash != Some(hash);
+        self.hash = Some(hash);
+        if blind {
+            self.unseen = if changed {
+                UNSEEN_CHECKS
+            } else {
+                self.unseen.saturating_sub(1)
+            };
+        }
+        changed
+    }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -940,11 +972,15 @@ impl Staging {
         // in view memory are: a write of the title's to it faults once and
         // is noted, a mapping is announced by the runtime. While neither
         // happened the texture is as it was. What the guard cannot see (a
-        // write to the same pages through another view) is still found by
-        // the hash, which is taken every eighth frame only, by the
-        // texture's address, so the textures take turns.
+        // write through another view of the same pages that the view guard
+        // does not cover: `VICTORY_VIEW_GUARD=0`, a page of more than
+        // `watch::MANY_VIEWS` views, the runtime's own views) is still found
+        // by the hash, which is taken every eighth frame only, by the
+        // texture's address, so the textures take turns, and at every
+        // check for a while once a hash found such a write ([`UNSEEN_CHECKS`]).
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mut blind = false;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
@@ -952,9 +988,10 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            if unwritten && !turn && last.unseen == 0 {
                 return 0;
             }
+            blind = unwritten;
         }
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
@@ -967,7 +1004,7 @@ impl Staging {
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
             let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
+                return self.refresh_unlocked(last, size, blind);
             };
             mapped
         } else {
@@ -990,11 +1027,9 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
-                if last.hash == Some(hash) {
+                if !last.changed(blake3::hash(read), blind) {
                     return false;
                 }
-                last.hash = Some(hash);
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
@@ -1010,13 +1045,11 @@ impl Staging {
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-                if last.hash == Some(hash) {
+                if !last.changed(blake3::hash(tiled), blind) {
                     return size;
                 }
-                last.hash = Some(hash);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1026,13 +1059,11 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        if !last.changed(blake3::hash(tiled), blind) {
             return size;
         }
-        last.hash = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1045,15 +1076,13 @@ impl Staging {
     /// is looked at again at its next refresh (what was learnt about writes
     /// to it is forgotten, so that it is not passed over as unwritten).
     /// Returns the bytes read.
-    fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
+    fn refresh_unlocked(&self, last: &mut Last, size: usize, blind: bool) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = blake3::hash(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
+            if last.changed(blake3::hash(read), blind) {
                 self.detile(read);
             }
             true
@@ -1292,17 +1321,26 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// at the start of its memory, and their pages are mapped first), none of
 /// one not there. With neither the first nor the last page committed the
 /// answer is none without a look at the pages between (two queries for the
-/// slots whose texture is away, which are asked again and again).
+/// slots whose texture is away, which are asked again and again). So a
+/// texture of which only blocks between its ends are mapped reads as none:
+/// [`mapped_bytes_between`] makes sure.
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
+    if len == 0 || !committed(at, 1) && !committed((at as usize).saturating_add(len - 1) as *const u8, 1) {
+        return 0;
+    }
+    mapped_bytes_between(at, len)
+}
+
+/// [`mapped_bytes`] without its look at the ends first: every block (or
+/// page, or run) of `[at, at + len)` is asked. For an answer of none that
+/// undoes something, as the host copy of a texture on the card.
+pub(crate) fn mapped_bytes_between(at: *const u8, len: usize) -> u64 {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     if len == 0 {
         return 0;
     }
     let start = at as usize;
     let end = start.saturating_add(len);
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
-        return 0;
-    }
     if !by_query() {
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
@@ -1536,6 +1574,69 @@ mod title_memory_tests {
                     .expect("the staging buffer's bytes are enough");
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod unseen_tests {
+    use super::{Last, UNSEEN_CHECKS};
+
+    /// A change found by the hash alone keeps the texture hashed at every
+    /// check until that many checks in a row find it unchanged; a change
+    /// the guard saw, or a hash taken anyway, leaves the count alone.
+    #[test]
+    fn a_change_the_guard_missed_is_hashed_at_every_check_for_a_while() {
+        let (a, b) = (blake3::hash(b"frame 1"), blake3::hash(b"frame 2"));
+        let mut last = Last::default();
+        assert!(last.changed(a, false));
+        assert_eq!(last.unseen, 0);
+        assert!(!last.changed(a, true));
+        assert_eq!(last.unseen, 0);
+        assert!(last.changed(b, true));
+        assert_eq!(last.unseen, UNSEEN_CHECKS);
+        for left in (0..UNSEEN_CHECKS).rev() {
+            assert!(!last.changed(b, true));
+            assert_eq!(last.unseen, left);
+        }
+        assert!(last.changed(a, true));
+        assert_eq!(last.unseen, UNSEEN_CHECKS);
+        assert!(last.changed(b, false));
+        assert_eq!(last.unseen, UNSEEN_CHECKS);
+    }
+}
+
+#[cfg(test)]
+mod mapped_tests {
+    use super::{mapped_bytes, mapped_bytes_between};
+
+    /// A texture whose ends are not mapped and some blocks between them
+    /// are reads as none by its ends and as those blocks when every block
+    /// is asked; one not mapped at all is none both ways, and one mapped
+    /// whole is all of it both ways.
+    #[test]
+    fn blocks_mapped_between_unmapped_ends_are_found_when_every_block_is_asked() {
+        use windows_sys::Win32::System::Memory::*;
+        const BLOCK: usize = 64 << 10;
+        const SIZE: usize = 16 * BLOCK;
+        // SAFETY: a private reservation of our own, read only through the
+        // queries and the kernel.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(mapped_bytes(base, SIZE), 0);
+            assert_eq!(mapped_bytes_between(base, SIZE), 0);
+            let middle = base.add(5 * BLOCK);
+            assert_eq!(VirtualAlloc(middle.cast(), 2 * BLOCK, MEM_COMMIT, PAGE_READWRITE), middle.cast());
+            assert_eq!(mapped_bytes(base, SIZE), 0, "the ends alone say none");
+            assert_eq!(mapped_bytes_between(base, SIZE), 2 * BLOCK as u64);
+            // Unmapped again: none both ways.
+            assert_ne!(VirtualFree(middle.cast(), 2 * BLOCK, MEM_DECOMMIT), 0);
+            assert_eq!(mapped_bytes_between(base, SIZE), 0);
+            assert_eq!(VirtualAlloc(base.cast(), SIZE, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            assert_eq!(mapped_bytes(base, SIZE), SIZE as u64);
+            assert_eq!(mapped_bytes_between(base, SIZE), SIZE as u64);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
     }
 }
