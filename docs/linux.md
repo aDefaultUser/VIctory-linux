@@ -228,8 +228,8 @@ translator does not support) and made 1,136 compute pipelines. In the Proton
 script smoke test, a repeat loaded those shader translations from cache in
 3.0 s and the compute pipelines in 0.9 s.
 
-Earlier warm-up measurements used four translation threads and two pipeline
-threads.
+Earlier warm-up measurements configured four translation workers and two
+pipeline workers. That version processed loose shader files one at a time.
 
 | case | result |
 |---|---|
