@@ -10250,12 +10250,14 @@ impl<'a> Lower<'a> {
     /// A buffer access (`buffer_*`, `tbuffer_*`). Through a descriptor the
     /// program picks from the view heap at an index it computes, it runs
     /// only where the host's table by heap slot says the slot shows a
-    /// buffer or a constant buffer (below [`super::shader::SLOT_NONE`]): a
-    /// texture's descriptor read as a buffer's names no memory of the
-    /// buffer's, as the scalar loads found (scalar cache faults at 0, RX
-    /// 9070 XT under Proton), and a vector access through it is the texture
-    /// cache's fault. Loads give zeros there, stores and atomics write
-    /// nothing.
+    /// buffer view (a stride: neither 0 nor [`super::shader::SLOT_NONE`]
+    /// and up). A texture's descriptor read as a buffer's names no memory
+    /// of the buffer's, as the scalar loads found (scalar cache faults at
+    /// 0, RX 9070 XT under Proton), and a vector access through it is the
+    /// texture cache's fault. A constant buffer's (0) is no buffer view
+    /// either: the access is a raw buffer load, store or atomic through a
+    /// handle of the wrong type there. Loads give zeros there, stores and
+    /// atomics write nothing.
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let src = self.descriptors.get(&((b, i), false)).copied();
         let picked = match src {
@@ -10285,7 +10287,9 @@ impl<'a> Lower<'a> {
             outside.push((new, x));
         }
         let none = self.s.m.i32(super::shader::SLOT_NONE);
-        let fits = self.s.m.cmp(head, pred::IULT, stride, none);
+        let not_constant = self.s.m.cmp(head, pred::NE, stride, zero);
+        let below_none = self.s.m.cmp(head, pred::IULT, stride, none);
+        let fits = self.s.m.bin(head, Bin::And, not_constant, below_none);
         let at = self.begin_guarded(Some(fits));
         // The word read above serves the guarded access too.
         self.strides.insert((self.cur, load, first), stride);
@@ -10425,8 +10429,8 @@ impl<'a> Lower<'a> {
         // table by heap slot does; the access becomes a raw one at the
         // element's byte. (Also tells the host this shader reads such
         // buffers.)
-        // A slot with no buffer (`SLOT_NONE` and up) does not get here
-        // ([`Self::buffer`]).
+        // A slot with no buffer view (a constant buffer, `SLOT_NONE` and
+        // up) does not get here ([`Self::buffer`]).
         let mut index = index;
         if let Some(stride) = self.slot_stride(src)?
             && let Some(element) = index

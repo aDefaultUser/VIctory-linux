@@ -2069,12 +2069,14 @@ mod heap_pick_tests {
     /// view the program picks from the heap read a buffer view as before,
     /// the element scaled by the stride in the host's table and nothing
     /// past the buffer's end, and do not run on a slot the table says
-    /// shows a texture or nothing (a slot past the title's, which a draw
-    /// may have made a texture's): a texture's descriptor read as a
-    /// buffer's names no memory of the buffer's (the scalar form faulted
-    /// at 0 on an RX 9070 XT under Proton). They read zeros there.
+    /// shows a texture, a constant buffer or nothing (a slot past the
+    /// title's, which a draw may have made a texture's): a texture's
+    /// descriptor read as a buffer's names no memory of the buffer's (the
+    /// scalar form faulted at 0 on an RX 9070 XT under Proton), and a raw
+    /// load through a constant buffer's is through a handle of the wrong
+    /// type. They read zeros there.
     #[test]
-    fn a_heap_slot_picked_for_a_vector_load_is_read_only_if_it_holds_no_texture() {
+    fn a_heap_slot_picked_for_a_vector_load_is_read_only_if_it_holds_a_buffer_view() {
         let words: [u32; 16] = [
             0x8F04_8500, // s_lshl_b32 s4, s0, 5
             0xBE83_0380, // s_mov_b32 s3, 0
@@ -2100,9 +2102,10 @@ mod heap_pick_tests {
         {
             let texel = [[1.0f32, 2.0, 3.0, 4.0]];
             let data: Vec<u32> = (0..48).map(|i| 0xB000 + i).collect();
+            let constants = [0xC0_FFEE; 64];
             // Heap: a texture, a buffer of 8-byte elements (made raw, as
             // the host makes buffer views), a texture in a slot with
-            // nothing to read, the UAV the lanes write.
+            // nothing to read, the UAV the lanes write, a constant buffer.
             let views = [
                 host::View::Texture(1, 1, &texel),
                 host::View::Buffer {
@@ -2111,13 +2114,15 @@ mod heap_pick_tests {
                 },
                 host::View::Texture(1, 1, &texel),
                 host::View::RawUav(64),
+                host::View::Cbv(&constants),
             ];
-            let strides = [SLOT_IMAGE, 8, SLOT_NONE, 1];
-            let Some(runs) = run_picking(l, &views, &strides, &[0, 1, 2]) else {
+            let strides = [SLOT_IMAGE, 8, SLOT_NONE, 1, 0];
+            let Some(runs) = run_picking(l, &views, &strides, &[0, 1, 2, 4]) else {
                 return;
             };
             assert_eq!(runs[0][0], vec![0; 64], "a texture's slot");
             assert_eq!(runs[2][0], vec![0; 64], "a slot with nothing to read");
+            assert_eq!(runs[3][0], vec![0; 64], "a constant buffer's slot");
             // Element `lane` at byte 8 * lane: past the 48 dwords from
             // lane 24 on.
             let by_element = (0..32).map(|lane| if lane < 24 { 0xB000 + 2 * lane } else { 0 });
@@ -2130,10 +2135,10 @@ mod heap_pick_tests {
     /// A store and a returning atomic (`buffer_store_dword`,
     /// `buffer_atomic_add ... glc`) through a view the program picks from
     /// the heap write a buffer view as before, and write nothing on a slot
-    /// the table says shows a texture or nothing; the atomic returns 0
-    /// there.
+    /// the table says shows a texture, a constant buffer or nothing; the
+    /// atomic returns 0 there.
     #[test]
-    fn a_heap_slot_picked_for_a_vector_write_is_written_only_if_it_holds_no_texture() {
+    fn a_heap_slot_picked_for_a_vector_write_is_written_only_if_it_holds_a_buffer_view() {
         let words: [u32; 16] = [
             0x8F04_8500, // s_lshl_b32 s4, s0, 5
             0xBE83_0380, // s_mov_b32 s3, 0
@@ -2157,18 +2162,31 @@ mod heap_pick_tests {
         let _ = l;
         #[cfg(windows)]
         {
+            let constants = [0xC0_FFEE; 64];
             // Heap: a texture UAV, a raw UAV, the UAV the lanes write, a
-            // texture UAV in a slot with nothing to read.
+            // texture UAV in a slot with nothing to read, a constant buffer.
             let views = [
                 host::View::TextureUav(32, 1),
                 host::View::RawUav(32),
                 host::View::RawUav(32),
                 host::View::TextureUav(32, 1),
+                host::View::Cbv(&constants),
             ];
-            let strides = [SLOT_IMAGE, 1, 1, SLOT_NONE];
-            let Some(runs) = run_picking(l, &views, &strides, &[0, 1, 3]) else {
+            let strides = [SLOT_IMAGE, 1, 1, SLOT_NONE, 0];
+            let Some(runs) = run_picking(l, &views, &strides, &[0, 1, 3, 4]) else {
                 return;
             };
+            assert_eq!(
+                runs[3][2],
+                vec![0; 32],
+                "the atomic's result on a constant buffer's slot"
+            );
+            for (k, uav) in runs[3].iter().enumerate().filter(|&(k, _)| k != 2) {
+                assert!(
+                    uav.iter().all(|&x| x == 0),
+                    "UAV {k} written through a constant buffer's slot"
+                );
+            }
             assert_eq!(runs[0][0], vec![0; 4 * 32], "the texture written");
             assert_eq!(
                 runs[0][2],
