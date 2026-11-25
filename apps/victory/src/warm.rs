@@ -423,7 +423,13 @@ struct PipelineCounts {
 /// is refused too, as the policy cannot resolve it. (A folder that links to
 /// nothing cannot be opened through.) Links the policy cannot see, such as
 /// a Unix link under Wine, are never written through: see [`open_notes`].
+/// The folder is checked on its own, as the new notes are made and renamed
+/// there even when the note file links out of it.
 fn notes_allowed(notes: &Path) -> Result<()> {
+    let dir = notes
+        .parent()
+        .with_context(|| format!("{} is in no folder", notes.display()))?;
+    victory_core::ensure_outside_repo(dir)?;
     victory_core::ensure_outside_repo(notes)?;
     let dangling = std::fs::symlink_metadata(notes).is_ok_and(|m| m.file_type().is_symlink())
         && std::fs::metadata(notes).is_err();
@@ -854,6 +860,20 @@ mod tests {
         symlink(&nowhere, &notes).unwrap();
         assert!(notes_allowed(&notes).is_err(), "note file links to nothing");
         assert!(!nowhere.exists());
+        std::fs::remove_file(&notes).unwrap();
+
+        // The folder is in a tree, and the note file links out of it.
+        let outside = cache.path().join("outside.txt");
+        std::fs::write(&outside, "").unwrap();
+        let inner = tree.path().join("pipelines");
+        std::fs::create_dir(&inner).unwrap();
+        let notes = inner.join("warm-pipelines-x.txt");
+        symlink(&outside, &notes).unwrap();
+        victory_core::ensure_outside_repo(&notes).unwrap();
+        assert!(
+            notes_allowed(&notes).is_err(),
+            "folder is in the tree, note file links out"
+        );
     }
 
     /// A note file that is another name of a file elsewhere (a hard link,
