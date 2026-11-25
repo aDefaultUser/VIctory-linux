@@ -13,11 +13,11 @@ player's hair and clothes, the walls and the wired glass textured:
 
 | Wine | time running | result |
 |---|---|---|
-| Proton Experimental 11.0 | 520 s | first room; the camera moved; no GPU fault |
-| system Wine 11.22, newly made test prefix | 420 s | the same room; no kernel fault |
+| Proton Experimental 11.0 | 520 s | first room, camera input worked, no GPU fault |
+| System Wine 11.22 (initialized private prefix) | 420 s | first room, no GPU fault |
 
-Both runs were started by a private launcher on a private Xwayland server, not
-by `scripts/run-linux.sh`, with:
+Both runs used a direct launcher and a private Xwayland server with these
+settings.
 
 - a vkd3d-proton build with the matching dxil-spirv backport (see "Three
   compute pipelines vkd3d-proton cannot make")
@@ -26,12 +26,12 @@ by `scripts/run-linux.sh`, with:
 - `VICTORY_HEAP_SYNC_TABLES` unset, so only table slots whose host slot does
   not show their record are mirrored (the default)
 
-These runs cover the opening only. They say nothing about later parts of the
-game or about speed with the default settings.
+These runs cover the opening. Later scenes and performance with default
+settings remain unverified.
 
-The same settings through the script look like this. The command has not been
-run with `7ec6682`; `VKD3D_DLLS` is the folder holding your patched build's
-`d3d12.dll` and `d3d12core.dll`:
+The command below applies those settings through the script. The direct
+launcher supplied the in-game results above. Set `VKD3D_DLLS` to the folder
+holding your patched build's `d3d12.dll` and `d3d12core.dll`.
 
 ```sh
 VICTORY_WARM=1 VICTORY_WINE=proton \
@@ -48,8 +48,8 @@ What was seen on screen, besides the first room:
 
 - **Logo movie.** Near 30 frames per second in sampled intervals with frame
   capture turned off, under both system Wine and Proton (earlier builds).
-- **Loading screen.** It still stutters around the texture preparation for the
-  character bake. Not fixed.
+- **Loading screen.** Texture preparation for the character bake still
+  causes stutter.
 - **Bright frames in the intro.** Some of them are an authored title card. A
   short bright fade of the window has not been shown to be a bug.
 
@@ -104,8 +104,7 @@ sandbox to share the host's IPC namespace (X11 shared-memory images) and a
 prefix of its own. `VICTORY_WINE=proton` has the script use it that way
 (`prefix-proton`, the X11 socket of `DISPLAY`).
 
-Earlier builds, checked on 2026-11-25 on the machine above (dated; the
-latest runs are listed under "Latest tested runs"):
+Earlier runs on the same machine on November 25, 2026.
 
 - System Wine 11.22 entered the opening story (the prologue).
 - Proton Experimental, started outside the script with its own
@@ -126,16 +125,16 @@ code; that crash has not been looked into since.
 programs: dxil-spirv recurses until the worker's stack is gone
 ([dxil-spirv #376](https://github.com/HansKristian-Work/dxil-spirv/issues/376)).
 The layer stops waiting for such a worker after 15 seconds
-(`pipeline/make.rs`). The fix is upstream commit e084e35c on the branch
-`legacy-struct-remove`. A vkd3d-proton built with that commit makes all three
-pipelines in under 200 ms; pass its folder as `VKD3D_DLLS`. On earlier builds
-the picture did not depend on it; the latest runs used it.
+(`pipeline/make.rs`). The tested DLLs use vkd3d-proton `2576c0b4` and
+dxil-spirv `114e664e` with a backport of upstream commit `e084e35c` from
+`legacy-struct-remove`. The patched build made all three pipelines in under
+200 ms in offline tests.
 
 ## Known problems
 
 - **Missing or wrong rendering.** Earlier builds drew parts of scenes and
   characters wrong or not at all. With `7ec6682` the first room renders as
-  described above; later parts of the game have not been checked with it.
+  described above. Later parts of the game remain unverified.
 - **GPU resets (earlier builds).** Some earlier runs reset the GPU, for a cause
   not known. The two `7ec6682` runs showed no fault in 520 and 420 seconds.
 - **Loading-screen stutter.** See "Latest tested runs".
@@ -200,8 +199,8 @@ cache translated 3,263 of 3,264 containers (the one left uses a wave mask the
 translator does not support) and made 1,136 compute pipelines. A repeat
 warm-up took about 3 s on an earlier integrated build.
 
-Earlier measurements on the machine above (dated, earlier builds; warm-up
-only, no title started, 4 translation threads, 2 pipeline threads):
+Earlier warm-up measurements used four translation threads and two pipeline
+threads.
 
 | case | result |
 |---|---|

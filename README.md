@@ -11,19 +11,17 @@ with or endorsed by the game's developer or publisher.
 
 ## Status
 
-Not playable yet, and only the opening has been tested. On one Linux machine
-(2026-11-25, Radeon RX 9070 XT, Mesa 26.3.1), the renderer at commit
-`7ec6682` reached the movement and camera prompt in the first room under both
-system Wine 11.22 and Proton Experimental 11.0, with the player's hair and
-clothes, the walls and the wired glass textured. Those runs used non-default
-settings and a patched vkd3d-proton.
+On November 25, 2026, the opening reached player control on system Wine 11.22
+and Proton Experimental 11.0 (Radeon RX 9070 XT, Mesa 26.3.1). The player's
+hair and clothing and the first room's walls and wired glass rendered with
+the tested settings and a patched vkd3d-proton.
 
 - The logo movie played near 30 fps in sampled earlier runs with frame
   capture turned off.
 - The loading screen after it still stutters while textures are prepared for
   the character bake.
-- Nothing is claimed yet for the rest of the game or for speed with the
-  default settings.
+- Testing covers the opening. Later scenes and performance with default
+  settings remain unverified.
 
 [docs/linux.md](docs/linux.md) has the exact versions, settings and known
 problems.
@@ -52,9 +50,9 @@ cargo install --locked cargo-xwin
 cargo xwin build --release -p victory --target x86_64-pc-windows-msvc
 ```
 
-Start the title in a sandbox without network, with the optional warm-up
-first. The Proton path below is Steam's default; the game folder and
-executable name are examples, so use your own:
+Start the title in a sandbox without network. The example below uses Steam's
+default Proton path and enables the optional warm-up. Replace the game folder
+and executable name with your own.
 
 ```sh
 VICTORY_WARM=1 \
@@ -72,8 +70,8 @@ tested runs. Two are worth knowing first:
   `VICTORY_WARM=only` does that and stops. Leave it out to start the title
   straight away. It translates the shader sources that earlier warm runs
   captured on your machine, and builds compute pipelines with `--pipelines`
-  (the default). Graphics pipelines and streamed
-  textures are created as the title reaches them.
+  (the default). The title creates graphics pipelines and streams textures
+  as it reaches them.
 - `VKD3D_DLLS` points at another vkd3d-proton build. Three of the title's
   compute shaders stall the compiler in stock vkd3d-proton. A build with the
   matching dxil-spirv backport makes all three. That build is not bundled
