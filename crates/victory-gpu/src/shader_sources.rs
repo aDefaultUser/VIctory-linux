@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -28,13 +29,22 @@ pub(crate) fn keep_source(hash: &str, stage: &str, container: &[u8]) {
     }
 }
 
+/// A temporary file of this writer's own for `name`: two threads (or two
+/// runs) translating one container at once each write their own, and
+/// neither renames or removes the other's while it is being written.
+fn temporary(dir: &Path, name: &str) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("{name}.{}-{n}.tmp", std::process::id()))
+}
+
 /// Writes a source file whole or not at all: a reader never sees a part.
 fn write_source(dir: &Path, name: &str, container: &[u8]) {
     let path = dir.join(name);
     if path.exists() {
         return;
     }
-    let tmp = dir.join(format!("{name}.tmp"));
+    let tmp = temporary(dir, name);
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| std::fs::write(&tmp, container))
         .and_then(|()| std::fs::rename(&tmp, &path));
@@ -77,5 +87,20 @@ mod tests {
         std::fs::write(&blocked, b"").unwrap();
         write_source(&blocked.join("sub"), &name, b"x");
         assert!(!blocked.join("sub").exists());
+    }
+
+    /// Another writer of the same container, part way through its own
+    /// temporary file, keeps it: this writer neither writes over it nor
+    /// renames it into place.
+    #[test]
+    fn writers_of_one_source_do_not_share_a_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = source_name("fedcba9876543210", "pixel");
+        assert_ne!(temporary(dir.path(), &name), temporary(dir.path(), &name));
+        let theirs = temporary(dir.path(), &name);
+        std::fs::write(&theirs, b"par").unwrap();
+        write_source(dir.path(), &name, b"whole");
+        assert_eq!(std::fs::read(dir.path().join(&name)).unwrap(), b"whole");
+        assert_eq!(std::fs::read(&theirs).unwrap(), b"par");
     }
 }
