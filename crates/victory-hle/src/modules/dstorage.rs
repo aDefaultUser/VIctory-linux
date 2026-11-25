@@ -1495,13 +1495,19 @@ mod tests {
 
     /// Polls as the title does, then returns the entry's result.
     fn wait(array: *mut c_void, index: u32) -> HRESULT {
+        wait_for_completion(array, index).expect("never completed")
+    }
+
+    fn wait_for_completion(array: *mut c_void, index: u32) -> Option<HRESULT> {
         let done: extern "system" fn(*mut c_void, u32) -> bool = call(array, 0x18);
         let start = Instant::now();
         while !done(array, index) {
-            assert!(start.elapsed() < Duration::from_secs(10), "never completed");
+            if start.elapsed() >= Duration::from_secs(10) {
+                return None;
+            }
             std::thread::sleep(Duration::from_millis(1));
         }
-        result(array, index)
+        Some(result(array, index))
     }
 
     fn file_with(bytes: &[u8]) -> (tempfile::TempDir, *mut c_void) {
@@ -2397,43 +2403,41 @@ mod tests {
         let queue = small_queue(4);
         let array = status_array(1);
         let lists = page_list_of(&stale);
-        let (done, enqueued) = std::sync::mpsc::channel();
-        let title = {
-            let (queue, array, plain_at, lists_at, fresh) = (
-                queue as usize,
-                array as usize,
-                plain.as_ptr() as usize,
-                lists.as_ptr() as usize,
-                fresh.clone(),
-            );
-            std::thread::spawn(move || {
-                let queue = queue as *mut c_void;
-                // SAFETY: the test's lists and source outlive the thread.
-                let (plain, lists) = unsafe {
-                    (
-                        std::slice::from_raw_parts(plain_at as *const u8, 32),
-                        std::slice::from_raw_parts(lists_at as *const AtomicUsize, N),
-                    )
-                };
+        let (held, status) = std::thread::scope(|scope| {
+            let (done, enqueued) = std::sync::mpsc::channel();
+            let (allow_submit, wait_for_submit) = std::sync::mpsc::channel();
+            let (queue_at, array_at) = (queue as usize, array as usize);
+            let (plain, lists, fresh) = (&plain, &lists, &fresh);
+            let title = scope.spawn(move || {
+                let queue = queue_at as *mut c_void;
                 // From the fourth command on, the queue is full of these.
                 for list in lists {
                     enqueue(queue, &page_request(list, plain, 0));
                 }
-                enqueue_status(queue, array as *mut c_void, 0);
-                done.send(unsubmitted(queue)).unwrap();
-                // Nothing ran: the title maps its pages, which fills the
-                // lists, and submits.
-                std::thread::sleep(Duration::from_millis(30));
-                set(lists, &fresh);
-                void(queue, 0x30);
-            })
-        };
-        let held = enqueued
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the enqueues return before the title's submit");
+                enqueue_status(queue, array_at as *mut c_void, 0);
+                if done.send(unsubmitted(queue)).is_ok() && wait_for_submit.recv().is_ok() {
+                    set(lists, fresh);
+                    void(queue, 0x30);
+                }
+            });
+            let held = enqueued.recv_timeout(Duration::from_secs(10));
+            let status = if held.as_ref().is_ok_and(|&count| count == N + 1)
+                && allow_submit.send(()).is_ok()
+            {
+                wait_for_completion(array, 0)
+            } else {
+                None
+            };
+            drop(allow_submit);
+            // Close wakes a blocked Enqueue and waits for reads using the
+            // fixture. Join the title before asserting either result.
+            void(queue, 0x40);
+            title.join().unwrap();
+            (held, status)
+        });
+        let held = held.expect("the enqueues return before the title's submit");
         assert_eq!(held, N + 1, "all held for the title's submit");
-        assert_eq!(wait(array, 0), S_OK);
-        title.join().unwrap();
+        assert_eq!(status.expect("never completed"), S_OK);
         for (old, new) in stale.iter().zip(&fresh) {
             let (at_old, at_new) = (show(&[*old]), show(&[*new]));
             // SAFETY: both pages are mapped read-write.
@@ -2452,7 +2456,6 @@ mod tests {
             unshow(at_old, 1);
             unshow(at_new, 1);
         }
-        void(queue, 0x40);
         for pages in [&stale, &fresh] {
             assert_eq!(
                 crate::modules::xmem::XMemFreePhysicalPages(N, pages.as_ptr()),
