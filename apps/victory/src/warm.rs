@@ -157,7 +157,9 @@ pub fn run(o: Options) -> Result<()> {
             });
         }
     }
-    warm_files(&loose, threads, &stop, &warm);
+    if !stop() {
+        warm_files(&loose, threads, &stop, &warm);
+    }
     let [translated, there, failed] = counts.map(|c| c.into_inner());
     let asked = only
         .as_ref()
@@ -469,26 +471,34 @@ fn replace_notes(notes: &Path, kept: &str) -> std::io::Result<std::fs::File> {
         return Err(std::io::ErrorKind::InvalidInput.into());
     };
     std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(
-        "{}.{}.tmp",
-        name.to_string_lossy(),
-        std::process::id()
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)?;
-    match file
-        .write_all(kept.as_bytes())
-        .and_then(|()| std::fs::rename(&tmp, notes))
-    {
-        Ok(()) => Ok(file),
-        Err(e) => {
-            drop(file);
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
+    let name = name.to_string_lossy();
+    let pid = std::process::id();
+    for attempt in 0..16 {
+        let tmp = dir.join(format!("{name}.{pid}-{attempt}.tmp"));
+        let mut file = match std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        // Keep the owned handle across the rename so later notes cannot
+        // follow a link placed at the destination by another process.
+        return match file
+            .write_all(kept.as_bytes())
+            .and_then(|()| std::fs::rename(&tmp, notes))
+        {
+            Ok(()) => Ok(file),
+            Err(e) => {
+                drop(file);
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
+        };
     }
+    Err(std::io::ErrorKind::AlreadyExists.into())
 }
 
 /// Makes the compute pipelines of `todo` on `threads` workers, as
@@ -930,6 +940,21 @@ mod tests {
         assert_eq!(read, Notes::default());
         assert!(notes.is_dir());
         assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn notes_pass_over_an_occupied_temp_name() {
+        let cache = tempfile::tempdir().unwrap();
+        let notes = cache.path().join("warm-pipelines-x.txt");
+        let occupied = cache
+            .path()
+            .join(format!("warm-pipelines-x.txt.{}-0.tmp", std::process::id()));
+        std::fs::write(&occupied, b"partial").unwrap();
+
+        drop(replace_notes(&notes, "made pipeline\n").unwrap());
+
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"partial");
+        assert_eq!(std::fs::read_to_string(&notes).unwrap(), "made pipeline\n");
     }
 
     #[test]
