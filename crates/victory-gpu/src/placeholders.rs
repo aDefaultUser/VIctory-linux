@@ -180,6 +180,16 @@ pub fn title_placeholder_leaving(at: usize, len: usize) {
     }
 }
 
+/// The system changed some range of the title's that was not told (a call
+/// whose arguments could not be read, which succeeded all the same): every
+/// range goes, as though each had left. What is held of them is asked about
+/// again ([`held_untracked`]); what is told from now on is tracked again.
+pub fn title_placeholders_lost() {
+    if placeholder_ranges() {
+        ranges().by_first.clear();
+    }
+}
+
 /// Windows has refused a class-7 question in this run (it always does under
 /// Wine, never on Windows).
 static REFUSES: AtomicBool = AtomicBool::new(false);

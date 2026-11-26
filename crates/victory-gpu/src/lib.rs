@@ -137,8 +137,10 @@ pub use inplace::{title_memory_freeing, title_memory_section, title_memory_secti
 #[cfg(windows)]
 pub use placeholders::{
     placeholder_ranges, placeholder_ranges_for_tests, title_placeholder_known, title_placeholder_leaving,
-    title_placeholder_reserved, title_placeholder_returned, title_placeholder_tracked,
+    title_placeholder_reserved, title_placeholder_returned, title_placeholder_tracked, title_placeholders_lost,
 };
+#[cfg(windows)]
+pub use safecopy::title_word;
 #[cfg(windows)]
 pub use watch::{
     kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,

@@ -401,6 +401,28 @@ pub(crate) unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
     unsafe { victory_safe_copy(dst, src, len) != 0 }
 }
 
+/// The word at `at`, which the title passed and which may point at nothing
+/// (null, no page, a page that cannot be read): `None` then, where a plain
+/// read would fault. Need not be aligned. By [`copy`], or by the kernel with
+/// `VICTORY_SAFE_COPY=0`.
+pub fn title_word(at: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if at == 0 {
+        return None;
+    }
+    let mut word = [0u8; size_of::<usize>()];
+    let read = if on() {
+        // SAFETY: the destination is ours; a source page that is not there
+        // fails the copy.
+        unsafe { copy(word.as_mut_ptr(), at as *const u8, word.len()) }
+    } else {
+        // SAFETY: as above; the kernel checks the source.
+        unsafe { ReadProcessMemory(GetCurrentProcess(), at as *const _, word.as_mut_ptr().cast(), word.len(), std::ptr::null_mut()) != 0 }
+    };
+    read.then(|| usize::from_ne_bytes(word))
+}
+
 /// For the fault handler: where a fault at instruction `at` is to go on, if
 /// it is [`copy`]'s.
 pub(crate) fn failing_exit(at: usize) -> Option<usize> {

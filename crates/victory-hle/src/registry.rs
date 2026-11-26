@@ -54,7 +54,12 @@ pub fn registry() -> &'static [HleModule] {
 }
 
 pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
-    registry()
+    lookup_in(registry(), dll, name)
+}
+
+/// [`lookup`] among `modules`.
+pub(crate) fn lookup_in(modules: &[HleModule], dll: &str, name: &str) -> Option<usize> {
+    modules
         .iter()
         .filter(|m| m.serves(dll))
         .flat_map(|m| m.exports.iter())

@@ -2044,30 +2044,32 @@ pub(crate) fn module() -> HleModule {
 /// placeholder ranges first (`victory_gpu::title_placeholder_leaving`), and
 /// the GPU side asks about it again after (`title_memory_allocated`); a
 /// release is told as our `VirtualFree` tells one. Not served without the
-/// switch. (The host's function is looked up at the first call; one the host
-/// lacks fails as the system fails a call it refuses.)
+/// switch. Each DLL serves only what the host's DLL of that name has (Wine
+/// lacks some): a title that looks for one the host lacks finds it missing,
+/// as it would without the switch.
 ///
 /// Not covered: `NtAllocateVirtualMemory` and `NtMapViewOfSection`, which
 /// take no placeholder flags, and system calls made without an import.
-pub(crate) fn bypass_module() -> Option<HleModule> {
-    victory_gpu::placeholder_ranges().then(|| HleModule {
-        name: "xmem-bypass",
-        dlls: &["kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*", "ntdll.dll"],
-        exports: bypass::exports(),
-    })
+pub(crate) fn bypass_modules() -> Vec<HleModule> {
+    if !victory_gpu::placeholder_ranges() {
+        return Vec::new();
+    }
+    bypass::modules(|dll, name| crate::host::function(dll, name).is_some())
 }
 
 mod bypass {
     use std::ffi::c_void;
     use std::sync::OnceLock;
 
-    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Foundation::{GetLastError, HANDLE, SetLastError};
     use windows_sys::Win32::System::Memory::{
         MEM_EXTENDED_PARAMETER, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MEMORY_BASIC_INFORMATION,
         VirtualQuery,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, GetProcessId};
     use windows_sys::core::BOOL;
+
+    use crate::HleModule;
 
     const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
 
@@ -2089,6 +2091,27 @@ mod bypass {
         ]
     }
 
+    /// The DLLs served, each with the host DLL whose exports it may serve.
+    pub(super) const SERVED: [(&[&str], &str); 3] = [
+        (&["kernel32.dll"], "kernel32.dll"),
+        (&["kernelbase.dll", "api-ms-win-core-memory-*"], "kernelbase.dll"),
+        (&["ntdll.dll"], "ntdll.dll"),
+    ];
+
+    /// A module for each of [`SERVED`], of the functions `present` says the
+    /// host DLL has (by its name and the function's).
+    pub(super) fn modules(present: impl Fn(&str, &str) -> bool) -> Vec<HleModule> {
+        SERVED
+            .iter()
+            .map(|&(dlls, host)| HleModule {
+                name: "xmem-bypass",
+                dlls,
+                exports: exports().into_iter().filter(|e| present(host, e.name)).collect(),
+            })
+            .filter(|m| !m.exports.is_empty())
+            .collect()
+    }
+
     /// The host's `name` from `dll`, as `T`: what the title's import would
     /// have been bound to.
     macro_rules! real {
@@ -2101,17 +2124,41 @@ mod bypass {
         }};
     }
 
-    /// What the system answers for a function it does not have.
+    /// What the system answers for a function it does not have. (Only a
+    /// function served for `kernel32.dll` that `kernelbase.dll` lacks.)
     const STATUS_PROCEDURE_NOT_FOUND: i32 = 0xc000_007a_u32 as i32;
 
     fn missing() {
         // SAFETY: sets this thread's last error.
-        unsafe { windows_sys::Win32::Foundation::SetLastError(windows_sys::Win32::Foundation::ERROR_PROC_NOT_FOUND) };
+        unsafe { SetLastError(windows_sys::Win32::Foundation::ERROR_PROC_NOT_FOUND) };
+    }
+
+    /// `f`, with this thread's last error left as it was: what the title
+    /// finds there after the call is what the host's function left.
+    fn quietly<T>(f: impl FnOnce() -> T) -> T {
+        // SAFETY: this thread's last error.
+        let error = unsafe { GetLastError() };
+        let done = f();
+        // SAFETY: as above.
+        unsafe { SetLastError(error) };
+        done
     }
 
     fn ours(process: HANDLE) -> bool {
         // SAFETY: plain queries; a handle that is no process's gives 0.
-        unsafe { process == GetCurrentProcess() || GetProcessId(process) == GetCurrentProcessId() }
+        quietly(|| unsafe { process == GetCurrentProcess() || GetProcessId(process) == GetCurrentProcessId() })
+    }
+
+    /// Whether a call of `kind` in `process` may put something in a
+    /// placeholder's place here.
+    fn replaces(process: HANDLE, kind: u32) -> bool {
+        kind & MEM_REPLACE_PLACEHOLDER != 0 && ours(process)
+    }
+
+    /// Whether a free of `kind` in `process` may release (or decommit)
+    /// memory here: not a split or a join of placeholders.
+    fn frees(process: HANDLE, kind: u32) -> bool {
+        kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 && ours(process)
     }
 
     /// The length of the region at `at` (what a length of 0 stands for).
@@ -2123,24 +2170,68 @@ mod bypass {
         if n == 0 { 0 } else { (info.BaseAddress as usize + info.RegionSize).saturating_sub(at) }
     }
 
-    /// Around a call that may put something in a placeholder's place.
-    fn replacing<T>(process: HANDLE, at: usize, len: usize, kind: u32, call: impl FnOnce() -> T) -> T {
-        if kind & MEM_REPLACE_PLACEHOLDER == 0 || at == 0 || !ours(process) {
-            return call();
-        }
+    /// Before something may be put in place of `[at, at + len)`: it leaves
+    /// the ranges. The length told.
+    fn leaving(at: usize, len: usize) -> usize {
         let len = if len != 0 { len } else { region(at) };
         victory_gpu::title_placeholder_leaving(at, len);
+        len
+    }
+
+    /// Before a release or a decommit: as our `VirtualFree`.
+    fn freeing(at: usize, len: usize) -> usize {
+        victory_gpu::title_placeholder_leaving(at, len);
+        victory_gpu::title_memory_freed(at, len);
+        len
+    }
+
+    /// Around a call that takes its address and length as they are and may
+    /// put something in a placeholder's place.
+    fn replacing<T>(process: HANDLE, at: usize, len: usize, kind: u32, call: impl FnOnce() -> T) -> T {
+        if at == 0 || !replaces(process, kind) {
+            return call();
+        }
+        let len = quietly(|| leaving(at, len));
         let done = call();
-        victory_gpu::title_memory_allocated(at, len);
+        quietly(|| victory_gpu::title_memory_allocated(at, len));
         done
     }
 
-    /// Before a call that may release (or decommit) memory: as our `VirtualFree`.
-    fn freeing(process: HANDLE, at: usize, len: usize, kind: u32) {
-        if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 && ours(process) {
-            victory_gpu::title_placeholder_leaving(at, len);
-            victory_gpu::title_memory_freed(at, len);
-        }
+    /// What the title's pointers to an address and a length hold, if both
+    /// can be read and the address is not 0 (which the system refuses).
+    fn read(at: *mut *mut c_void, len: *mut usize) -> Option<(usize, usize)> {
+        let at = victory_gpu::title_word(at as usize).filter(|&at| at != 0)?;
+        Some((at, victory_gpu::title_word(len as usize)?))
+    }
+
+    /// Around an Nt call that takes its address and length by pointer and
+    /// writes them back if it succeeds: `before` is told what they hold
+    /// before it (and gives the length told), `after` is told that after it.
+    /// The pointers are read so that one that is null, unaligned or to
+    /// nothing fails the read and not this thread, and the call is made as
+    /// asked all the same, for the system to answer as it does. A call that
+    /// succeeded on pointers that could not be read before is told of late,
+    /// by what they hold after it; and if not even then, the ranges are all
+    /// let go (`victory_gpu::title_placeholders_lost`): what is held of them
+    /// is asked about again, never taken for a placeholder that went.
+    pub(super) fn by_pointer(
+        at: *mut *mut c_void,
+        len: *mut usize,
+        before: impl Fn(usize, usize) -> usize,
+        after: impl Fn(usize, usize),
+        call: impl FnOnce() -> i32,
+    ) -> i32 {
+        let told = quietly(|| read(at, len).map(|(at, len)| (at, before(at, len))));
+        let status = call();
+        quietly(|| match told {
+            Some((at, len)) => after(at, len),
+            None if status >= 0 => match read(at, len) {
+                Some((at, len)) => after(at, before(at, len)),
+                None => victory_gpu::title_placeholders_lost(),
+            },
+            None => {}
+        });
+        status
     }
 
     type Alloc2 = unsafe extern "system" fn(HANDLE, *mut c_void, usize, u32, u32, *mut MEM_EXTENDED_PARAMETER, u32) -> *mut c_void;
@@ -2160,7 +2251,7 @@ mod bypass {
         *mut MEM_EXTENDED_PARAMETER,
         u32,
     ) -> i32;
-    type NtFree = unsafe extern "system" fn(HANDLE, *mut *mut c_void, *mut usize, u32) -> i32;
+    pub(super) type NtFree = unsafe extern "system" fn(HANDLE, *mut *mut c_void, *mut usize, u32) -> i32;
 
     macro_rules! alloc2 {
         ($name:ident, $real:literal) => {
@@ -2237,15 +2328,11 @@ mod bypass {
             missing();
             return 0;
         };
-        freeing(process, at as usize, size, kind);
+        if !at.is_null() && frees(process, kind) {
+            quietly(|| freeing(at as usize, size));
+        }
         // SAFETY: as above.
         unsafe { real(process, at, size, kind) }
-    }
-
-    /// What the title's pointers to an address and a length hold (0 for null).
-    fn read(at: *mut *mut c_void, len: *mut usize) -> (usize, usize) {
-        // SAFETY: the title passes valid pointers or null.
-        unsafe { (if at.is_null() { 0 } else { *at as usize }, if len.is_null() { 0 } else { *len }) }
     }
 
     macro_rules! nt_alloc_ex {
@@ -2262,9 +2349,12 @@ mod bypass {
                 let Some(real) = real!("ntdll.dll", $real: NtAllocEx) else {
                     return STATUS_PROCEDURE_NOT_FOUND;
                 };
-                let (at, len) = read(base, size);
-                // SAFETY: as above.
-                replacing(process, at, len, kind, || unsafe { real(process, base, size, kind, protect, params, count) })
+                // SAFETY (both): as above; the pointers too go as they are.
+                let call = || unsafe { real(process, base, size, kind, protect, params, count) };
+                if !replaces(process, kind) {
+                    return call();
+                }
+                by_pointer(base, size, leaving, victory_gpu::title_memory_allocated, call)
             }
         };
     }
@@ -2288,11 +2378,12 @@ mod bypass {
                 let Some(real) = real!("ntdll.dll", $real: NtMapEx) else {
                     return STATUS_PROCEDURE_NOT_FOUND;
                 };
-                let (at, len) = read(base, size);
-                // SAFETY: as above.
-                replacing(process, at, len, kind, || unsafe {
-                    real(section, process, base, offset, size, kind, protect, params, count)
-                })
+                // SAFETY (both): as above.
+                let call = || unsafe { real(section, process, base, offset, size, kind, protect, params, count) };
+                if !replaces(process, kind) {
+                    return call();
+                }
+                by_pointer(base, size, leaving, victory_gpu::title_memory_allocated, call)
             }
         };
     }
@@ -2305,10 +2396,12 @@ mod bypass {
                 let Some(real) = real!("ntdll.dll", $real: NtFree) else {
                     return STATUS_PROCEDURE_NOT_FOUND;
                 };
-                let (at, len) = read(base, size);
-                freeing(process, at, len, kind);
-                // SAFETY: as above.
-                unsafe { real(process, base, size, kind) }
+                // SAFETY (both): as above.
+                let call = || unsafe { real(process, base, size, kind) };
+                if !frees(process, kind) {
+                    return call();
+                }
+                by_pointer(base, size, freeing, |_, _| {}, call)
             }
         };
     }
@@ -2988,6 +3081,13 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
     }
 
+    /// For the tests that look at the placeholder ranges, one at a time: one
+    /// of them lets every range go (`victory_gpu::title_placeholders_lost`).
+    fn ranges_alone() -> MutexGuard<'static, ()> {
+        static ALONE: Mutex<()> = Mutex::new(());
+        ALONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// `VICTORY_PLACEHOLDER_RANGES=1` (`victory_gpu::title_placeholder_leaving`):
     /// for a placeholder reservation of `pages` pages, whether each page is
     /// tracked, and whether it is taken for a hole where Windows will not say.
@@ -2999,17 +3099,32 @@ mod tests {
         )
     }
 
-    /// Releases what is left of a reservation, piece by piece, as the title does.
-    fn release_all(base: *mut c_void, pages: usize) {
+    /// The pieces a reservation is in now. To be taken before any of it is
+    /// released: after that, another test may have the address.
+    fn pieces(base: *mut c_void, pages: usize) -> Vec<*mut c_void> {
+        let mut found = Vec::new();
         let mut at = base as usize;
         while at < base as usize + pages * PAGE {
             let info = query(at as *const c_void).host;
             let next = info.BaseAddress as usize + info.RegionSize;
-            if info.State != windows_sys::Win32::System::Memory::MEM_FREE {
-                title_virtual_free(info.AllocationBase, 0, MEM_RELEASE);
+            if info.State != windows_sys::Win32::System::Memory::MEM_FREE && !found.contains(&info.AllocationBase) {
+                found.push(info.AllocationBase);
             }
             at = next.max(at + PAGE);
         }
+        found
+    }
+
+    /// Releases `pieces`, as the title does.
+    fn release(pieces: &[*mut c_void]) {
+        for &piece in pieces {
+            assert_ne!(title_virtual_free(piece, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// Releases a reservation none of which was released yet, piece by piece.
+    fn release_all(base: *mut c_void, pages: usize) {
+        release(&pieces(base, pages));
     }
 
     /// Every way `xmem` maps and unmaps pages tells the ranges: what a view is
@@ -3017,6 +3132,7 @@ mod tests {
     /// views mapped again for a moment leave again.
     #[test]
     fn placeholder_ranges_follow_every_mapping_path() {
+        let _alone = ranges_alone();
         victory_gpu::placeholder_ranges_for_tests();
         const N: usize = 8;
         let base = XMemVirtualAlloc(std::ptr::null_mut(), N * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
@@ -3065,9 +3181,10 @@ mod tests {
         assert_eq!(holes(base, N), all(true));
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
         // Released by the title: gone, every piece of it.
+        let rest: Vec<*mut c_void> = pieces(base, N).into_iter().filter(|&piece| piece != base).collect();
         title_virtual_free(base, 0, MEM_RELEASE);
         assert_eq!(holes(base, N), all(false));
-        release_all(base, N);
+        release(&rest);
     }
 
     /// A placeholder released, cut, or replaced by private memory leaves the
@@ -3076,6 +3193,7 @@ mod tests {
     /// is a placeholder as well.
     #[test]
     fn placeholders_released_or_replaced_leave_the_ranges() {
+        let _alone = ranges_alone();
         victory_gpu::placeholder_ranges_for_tests();
         let base = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, GRAPHICS | ADDRESS_32BIT, PAGE_NOACCESS);
         assert!(!base.is_null());
@@ -3106,10 +3224,13 @@ mod tests {
             let placeholder = XMemVirtualAlloc(base, PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
             if placeholder == base {
                 assert_eq!(holes(base, 1), (vec![true], vec![true]));
+                release(&[base]);
+                assert_eq!(holes(base, 1).0, [false]);
             }
         }
-        release_all(base, 4);
-        assert_eq!(holes(base, 4).0, [false; 4]);
+        // (Only what is still ours: the address given up may be another test's now.)
+        release(&[at(2), at(3)]);
+        assert_eq!(holes(at(2), 2).0, [false; 2]);
     }
 
     /// The host's memory functions the title may call past `xmem` (served
@@ -3118,6 +3239,7 @@ mod tests {
     #[test]
     fn calls_past_xmem_leave_the_ranges() {
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, MEM_FREE};
+        let _alone = ranges_alone();
         victory_gpu::placeholder_ranges_for_tests();
         let base = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
         assert!(!base.is_null());
@@ -3150,15 +3272,265 @@ mod tests {
             assert_eq!(holes(other, 1), (vec![false], vec![false]));
             assert_ne!(bypass::virtual_free_ex(process, other, 0, MEM_RELEASE), 0);
         }
-        // What the host has of them, for the record (Wine may lack some).
-        let missing: Vec<&str> = bypass::exports()
-            .iter()
-            .map(|e| e.name)
-            .filter(|name| {
-                let dll = if name.starts_with("Nt") || name.starts_with("Zw") { "ntdll.dll" } else { "kernelbase.dll" };
-                crate::host::function(dll, name).is_none()
-            })
-            .collect();
-        eprintln!("host functions not there for the calls past xmem: {missing:?}");
+    }
+
+    /// The calls past `xmem` are served for a DLL only where the host's DLL
+    /// of that name has them: one the host lacks (Wine lacks some) is as
+    /// missing for the title's imports and its `GetProcAddress` (by the same
+    /// lookup) as without the switch.
+    #[test]
+    fn calls_past_xmem_are_served_only_where_the_host_has_them() {
+        let wrapper = |name: &str| bypass::exports().into_iter().find(|e| e.name == name).map(|e| e.address);
+        // A host with just these two.
+        let modules = bypass::modules(|dll, name| {
+            matches!((dll, name), ("kernelbase.dll", "VirtualAlloc2") | ("ntdll.dll", "NtFreeVirtualMemory"))
+        });
+        let lookup = |dll, name| crate::registry::lookup_in(&modules, dll, name);
+        assert_eq!(lookup("KernelBase.dll", "VirtualAlloc2"), wrapper("VirtualAlloc2"));
+        assert_eq!(lookup("api-ms-win-core-memory-l1-1-6.dll", "VirtualAlloc2"), wrapper("VirtualAlloc2"));
+        assert_eq!(lookup("ntdll.dll", "NtFreeVirtualMemory"), wrapper("NtFreeVirtualMemory"));
+        for (dll, name) in [
+            ("kernel32.dll", "VirtualAlloc2"),
+            ("kernelbase.dll", "MapViewOfFile3FromApp"),
+            ("kernelbase.dll", "MapViewOfFileNuma2"),
+            ("ntdll.dll", "ZwFreeVirtualMemory"),
+            ("ntdll.dll", "VirtualAlloc2"),
+            ("kernel32.dll", "NtFreeVirtualMemory"),
+        ] {
+            assert_eq!(lookup(dll, name), None, "{dll}!{name}");
+        }
+        assert!(bypass::modules(|_, _| false).is_empty());
+        // This host.
+        let modules = bypass::modules(|dll, name| crate::host::function(dll, name).is_some());
+        let mut lacks = Vec::new();
+        for (dlls, host) in bypass::SERVED {
+            for export in bypass::exports() {
+                let has = crate::host::function(host, export.name).is_some();
+                for dll in dlls {
+                    let dll = dll.replace('*', "l1-1-6.dll");
+                    assert_eq!(crate::registry::lookup_in(&modules, &dll, export.name), has.then_some(export.address), "{dll}!{}", export.name);
+                }
+                if !has && (host == "ntdll.dll") == export.name.starts_with(['N', 'Z']) {
+                    lacks.push(format!("{host}!{}", export.name));
+                }
+            }
+        }
+        eprintln!("not served, as the host lacks them: {lacks:?}");
+    }
+
+    /// The Nt calls past `xmem` read the title's pointers so that one that is
+    /// null, unaligned or to nothing cannot fault here: the host's function
+    /// gets them as they are and answers as it does, and nothing is told of
+    /// a call that did nothing. Another process's memory, or a handle that is
+    /// no process's, is not ours to tell of either; and the title finds the
+    /// last error the host's function left.
+    #[test]
+    fn calls_past_xmem_forward_what_they_cannot_read() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        use windows_sys::Win32::System::Memory::MEM_FREE;
+        use windows_sys::Win32::System::Threading::GetCurrentThread;
+        let _alone = ranges_alone();
+        victory_gpu::placeholder_ranges_for_tests();
+        let base = XMemVirtualAlloc(std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!base.is_null());
+        let at = |page: usize| base.wrapping_byte_add(page * PAGE);
+        let tracked = || holes(base, 2) == (vec![true; 2], vec![true; 2]);
+        assert!(tracked());
+        // SAFETY (all): the host's function with its own signature; pointers
+        // to our own memory, or to none, which is what is being tried.
+        unsafe {
+            let real: bypass::NtFree = std::mem::transmute(crate::host::function("ntdll.dll", "NtFreeVirtualMemory").unwrap());
+            let process = GetCurrentProcess();
+            // (Reserved, never committed: nothing there to read. A page made
+            // no-access instead would do as well, but a protection changed
+            // beside `a_title_thread_goes_on_using_the_rest_of_a_view` makes
+            // that test fail now and then under Wine.)
+            let nothing = VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE, PAGE_NOACCESS).cast::<usize>();
+            assert!(!nothing.is_null());
+            let (mut address, mut size) = (base, 0usize);
+            let (address, size) = (&raw mut address, &raw mut size);
+            let locked: (*mut *mut c_void, *mut usize) = (nothing.cast(), nothing.add(1));
+            for (process, address, size, what) in [
+                (process, std::ptr::null_mut(), size, "no address"),
+                (process, address, std::ptr::null_mut(), "no length"),
+                (process, locked.0, locked.1, "neither readable"),
+                (process, address, locked.1, "the length not readable"),
+                (std::ptr::null_mut(), address, size, "no process"),
+                (GetCurrentThread(), address, size, "a thread"),
+            ] {
+                let direct = real(process, address, size, MEM_RELEASE);
+                assert!(direct < 0, "{what}: {direct:#x}");
+                assert_eq!(bypass::nt_free(process, address, size, MEM_RELEASE), direct, "{what}");
+                assert!(tracked() && query(base).host.State != MEM_FREE, "{what}");
+            }
+            // Another process: what it frees or allocates there is not here.
+            let mut other = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--list")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let remote = other.as_raw_handle() as HANDLE;
+            bypass::nt_free(remote, address, size, MEM_RELEASE);
+            bypass::virtual_alloc2(remote, at(0), PAGE, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0);
+            bypass::virtual_free_ex(remote, at(0), 0, MEM_RELEASE);
+            // (Ended here: it need not have got far, and under Proton it may not end of itself.)
+            let _ = other.kill();
+            other.wait().unwrap();
+            assert!(tracked() && query(base).host.State != MEM_FREE, "another process");
+            // The last error the host's function leaves, as it leaves it.
+            let real_free_ex: unsafe extern "system" fn(HANDLE, *mut c_void, usize, u32) -> BOOL =
+                std::mem::transmute(crate::host::function("kernelbase.dll", "VirtualFreeEx").unwrap());
+            // (Past what a process has: refused everywhere.)
+            let nowhere = 0xffff_8000_0000_0000_usize as *mut c_void;
+            SetLastError(7);
+            assert_eq!(real_free_ex(process, nowhere, 0, MEM_RELEASE), 0);
+            let error = GetLastError();
+            SetLastError(7);
+            assert_eq!(bypass::virtual_free_ex(process, nowhere, 0, MEM_RELEASE), 0);
+            assert_eq!(GetLastError(), error);
+            // Unaligned but readable: the system's to refuse (Windows) or to
+            // do (Wine). Told before it either way, so never left tracked
+            // once released.
+            assert_ne!(title_virtual_free(at(1), PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), 0);
+            let mut words = [0usize; 3];
+            let odd = words.as_mut_ptr().cast::<u8>().add(1);
+            odd.cast::<usize>().write_unaligned(at(1) as usize);
+            odd.add(8).cast::<usize>().write_unaligned(0);
+            let status = bypass::nt_free(process, odd.cast(), odd.add(8).cast(), MEM_RELEASE);
+            // (Once released, the address may be another test's at once.)
+            let freed = status >= 0;
+            eprintln!("an unaligned release: {status:#x}");
+            assert!(freed || query(at(1)).host.State != MEM_FREE);
+            // (With no length, what is side by side with it goes too.)
+            assert!(!victory_gpu::title_placeholder_tracked(at(1) as usize));
+            assert!(!victory_gpu::title_placeholder_tracked(at(0) as usize) && query(at(0)).host.State != MEM_FREE);
+            VirtualFree(nothing.cast(), 0, MEM_RELEASE);
+            // (Only what is still ours.)
+            release(&[base]);
+            if !freed {
+                release(&[at(1)]);
+            }
+        }
+    }
+
+    /// A call past `xmem` that succeeds on pointers that could not be read
+    /// before it is told of after it, by what they hold then; if they cannot
+    /// be read then either, every range is let go, and none is left to be
+    /// taken for a placeholder that went. One that fails tells nothing.
+    #[test]
+    fn calls_past_xmem_told_late_or_all_let_go() {
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, MEM_FREE};
+        let _alone = ranges_alone();
+        victory_gpu::placeholder_ranges_for_tests();
+        let base = XMemVirtualAlloc(std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let elsewhere = XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!base.is_null() && !elsewhere.is_null());
+        let at = |page: usize| base.wrapping_byte_add(page * PAGE);
+        let tracked = |at: *mut c_void| victory_gpu::title_placeholder_tracked(at as usize);
+        assert_ne!(title_virtual_free(at(0), PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), 0);
+        // SAFETY (all): as in the test above.
+        unsafe {
+            let real: bypass::NtFree = std::mem::transmute(crate::host::function("ntdll.dll", "NtFreeVirtualMemory").unwrap());
+            let process = GetCurrentProcess();
+            // The title's two words, on a page that is not there (reserved,
+            // not committed; see the test above) until the call makes it so.
+            let words = VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE, PAGE_NOACCESS).cast::<usize>();
+            assert!(!words.is_null());
+            let (address, size) = (words.cast::<*mut c_void>(), words.add(1));
+            let leaving = |at: usize, len: usize| {
+                victory_gpu::title_placeholder_leaving(at, len);
+                len
+            };
+            // The call as the system makes it: it frees `at` and writes back
+            // what it freed, to the title's words if `there` (made so).
+            let release = |at: *mut c_void, there: bool| {
+                move || {
+                    let (mut freed, mut len) = (at, 0usize);
+                    let status = real(process, &mut freed, &mut len, MEM_RELEASE);
+                    if there {
+                        assert!(!VirtualAlloc(words.cast(), 4096, MEM_COMMIT, PAGE_READWRITE).is_null());
+                        address.write(freed);
+                        size.write(len);
+                    }
+                    status
+                }
+            };
+            // Refused: nothing told.
+            assert!(bypass::by_pointer(address, size, leaving, |_, _| {}, || real(process, address, size, MEM_RELEASE)) < 0);
+            assert!(tracked(at(0)) && tracked(at(1)) && tracked(elsewhere));
+            // Readable by the time the system writes back: told of then.
+            assert_eq!(bypass::by_pointer(address, size, leaving, |_, _| {}, release(at(0), true)), 0);
+            assert_eq!(query(at(0)).host.State, MEM_FREE);
+            assert!(!tracked(at(0)) && tracked(at(1)) && tracked(elsewhere));
+            // Not readable after either: all of them go.
+            assert_ne!(VirtualFree(words.cast(), 4096, MEM_DECOMMIT), 0);
+            assert_eq!(bypass::by_pointer(address, size, leaving, |_, _| {}, release(at(1), false)), 0);
+            assert_eq!(query(at(1)).host.State, MEM_FREE);
+            assert!(!tracked(at(1)) && !tracked(elsewhere));
+            assert!(!victory_gpu::title_placeholder_known(elsewhere as usize));
+            VirtualFree(words.cast(), 0, MEM_RELEASE);
+        }
+        // What is told from then on is tracked again.
+        let again = XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(tracked(again) && victory_gpu::title_placeholder_known(again as usize));
+        release_all(again, 1);
+        release_all(elsewhere, 1);
+    }
+
+    /// Threads that reserve placeholders, release them past `xmem` (and call
+    /// with pointers to nothing between), and take the addresses again as
+    /// ordinary memory, beside a thread that maps pages: a placeholder
+    /// released is never taken for one after, and nothing waits on another.
+    #[test]
+    fn calls_past_xmem_side_by_side() {
+        let _alone = ranges_alone();
+        victory_gpu::placeholder_ranges_for_tests();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let stop = &stop;
+            s.spawn(move || {
+                let base = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+                let pages = allocate(2);
+                while !stop.load(Ordering::Relaxed) {
+                    assert_eq!(XMemMapPhysicalPages(base.wrapping_byte_add(PAGE), 2, pages.as_ptr()), base.wrapping_byte_add(PAGE));
+                    assert_eq!(XMemMapPhysicalPages(base, 4, std::ptr::null()), base);
+                }
+                assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+                release_all(base, 4);
+            });
+            let workers: Vec<_> = (0..4)
+                .map(|t| {
+                    s.spawn(move || {
+                        let process = unsafe { GetCurrentProcess() };
+                        let known = |at: *mut c_void| victory_gpu::title_placeholder_known(at as usize);
+                        for round in 0..64 {
+                            let p = XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+                            assert!(!p.is_null());
+                            // SAFETY (all): our own placeholder; pointers to nothing.
+                            unsafe {
+                                assert!(bypass::nt_free(process, std::ptr::null_mut(), std::ptr::null_mut(), MEM_RELEASE) < 0);
+                                let (mut at, mut size) = (p, 0usize);
+                                if (t + round) % 2 == 0 {
+                                    assert_eq!(bypass::nt_free(process, &mut at, &mut size, MEM_RELEASE), 0);
+                                } else {
+                                    assert_ne!(bypass::virtual_free_ex(process, p, 0, MEM_RELEASE), 0);
+                                }
+                                assert!(!known(p), "released");
+                                if VirtualAlloc(p, PAGE, MEM_RESERVE, PAGE_NOACCESS) == p {
+                                    assert!(!known(p), "ordinary memory there now");
+                                    VirtualFree(p, 0, MEM_RELEASE);
+                                }
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
     }
 }
