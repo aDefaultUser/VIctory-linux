@@ -17,24 +17,58 @@ stopped and pick up where they left off later.
 
 ## Tested result
 
-One machine, November 2026: CachyOS, Radeon RX 9070 XT, RADV (Mesa 26.3.1),
-Proton Experimental `experimental-11.0-20261112`, a private `wineserver`
-build in place of Proton's (`RUN_LINUX_WINESERVER`), `/dev/ntsync`, an
-app-local vkd3d-proton build matched to that Proton, and a native
-`d3dcompiler_47.dll`. The `VICTORY_*` settings were the script's defaults
-(below), on a Series X.
+One machine, November 2026: CachyOS, Radeon RX 9070 XT, Ryzen 9 9950X3D,
+RADV (Mesa 26.3.1), Proton Experimental `experimental-11.0-20261112`, a
+private `wineserver` build in place of Proton's (`RUN_LINUX_WINESERVER`),
+`/dev/ntsync`, an app-local vkd3d-proton 3.2.0 build matched to that Proton,
+and a native `d3dcompiler_47.dll`. Logs, images and saves are not
+published. The tested wineserver indexes views by address using the approach
+in [Wine's memory-view change](https://github.com/wine-mirror/wine/commit/3217449b),
+backported to the Wine revision in that Proton build.
 
-- **Opening:** a median of 23.1 frames per second over 14 samples during the
-  heavy opening.
-- **First room:** a median of 22.3 frames per second over six five-second
-  samples. These runs started from a private checkpoint in a save the
-  tester made.
-- The camera responded to input.
-- **Missing face textures remain.**
-- A steady 30 frames per second has not been shown.
+### Series S at 1920x1080
 
-No other title, scene or machine has been tested. Logs, images and the save
-are not published.
+A plain release build of d9dfc31 (see "What it needs"), as a Series S, with
+three settings after the script's defaults:
+
+```sh
+RUN_LINUX_EXE=target/x86_64-pc-windows-msvc/release/victory.exe \
+RUN_LINUX_CONSOLE=series-s \
+  scripts/run-linux.sh run "$HOME/Games/Title" Title.exe \
+  VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_UNDER_FUSED=0 VICTORY_PLACEHOLDER_RANGES=1
+```
+
+- **First room:** a median of 29.9 FPS across six readings after camera
+  input, and 30.0 FPS across twelve readings after stepping and turning.
+  Readings were logged about five seconds apart.
+- **Faces rendered** in that camera check. Other camera views in the
+  first room measured about 24 to 26 FPS. In some replays of the same
+  checkpoint, faces were missing in both the opening and first room.
+- The card's buffer budget was left to its automatic size, which was 2 GiB
+  on this card. `VICTORY_CARD_BUFFERS_MB` was not set.
+
+In an A/B with one diagnostics build, `VICTORY_PLACEHOLDER_RANGES=1` raised
+the median from 22.5 to 28.45 frames per second and cut the per-frame
+refresh time the diagnostics report from 25.6 to 9.6 ms.
+
+The three settings are optional.
+
+- `VICTORY_PLACEHOLDER_RANGES=1` has the runtime tell the guards which
+  memory is a placeholder, since Wine will not answer that question. It is
+  off by default.
+- `VICTORY_UNDER_FUSED=0` was used in runs that restored faces. The two
+  buffer update paths produce identical outputs in unit tests, and faces
+  can still be missing with this setting.
+- `VICTORY_CARD_BUFFERS_MIN_MB=1` makes eligible buffers of at least 1 MiB
+  candidates for GPU memory, within the card's buffer budget. The automatic
+  minimum with a 2 GiB budget is 4 MiB.
+
+### Earlier result, Series X
+
+The script's defaults, as a Series X: medians of 23.1 frames per second over
+14 readings in the opening and 22.3 over six readings in the first
+room, starting from a private checkpoint in a save the tester made. The
+camera responded to input, and **face textures were missing**.
 
 ## What it needs
 
@@ -54,6 +88,9 @@ None of these ship with the repository. Point the script at your own copies.
   The first build downloads Microsoft's CRT and SDK with
   [xwin](https://github.com/Jake-Shadle/xwin), which means accepting
   [Microsoft's license](https://go.microsoft.com/fwlink/?LinkId=2086102).
+  `cargo xwin build --locked --release -p victory --target x86_64-pc-windows-msvc`
+  makes the plain release build in
+  `target/x86_64-pc-windows-msvc/release/victory.exe`.
 - **Proton** (`PROTON_WINE_LIBS`, its `files/lib/wine` folder). Proton's Wine
   runs the commands, and DXVK's `dxgi.dll` comes from it. With
   `RUN_LINUX_WINE=wine` the system's Wine runs them instead, and Proton still
@@ -100,7 +137,7 @@ setting or DLL differs, the run makes its own translations and pipelines
 again rather than using the warm-up's.
 
 `run` asks for a Series X (`--console series-x`). `RUN_LINUX_CONSOLE=series-s`
-changes that.
+changes that (see "Tested result").
 
 ## Where things are kept
 
@@ -182,9 +219,10 @@ pipelines.
 
 ## Known gaps
 
-- Missing face textures in the tested runs.
-- A steady 30 frames per second has not been shown. The tested medians are
-  22 to 23.
-- Only the opening and the first room have been tested, on one AMD card.
+- Only the opening and the first room of one title have been tested, on one
+  machine.
+- A Series S at 1280x720 crashed in the same test.
+- As a Series X, face textures were missing in the earlier runs.
+- Cold runs can behave differently from the measured ones.
 - System Wine and the stock vkd3d-proton inside Proton were not part of the
   tested result.
