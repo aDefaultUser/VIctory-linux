@@ -2101,6 +2101,21 @@ pub fn title_memory_allocated(at: usize, len: usize) {
     }
 }
 
+/// Every hole held is forgotten, its bit with it: the placeholder ranges are
+/// let go by `let_go` (`crate::title_placeholders_lost`), with the guards'
+/// lock held (guards, then ranges, as [`placeholder`] takes them). So no
+/// asking takes a hole by the ranges between the two, and none publishes one
+/// after: [`publish`] sets a bit only for a block still held.
+pub(crate) fn holes_lost(let_go: impl FnOnce()) {
+    let g = guards();
+    let_go();
+    let held: Vec<usize> = g.held.range(..).collect();
+    for block in held {
+        g.held.remove(block);
+        PUBLISHED.clear(block);
+    }
+}
+
 /// Once a frame: a hundredth of the known holes are looked at, in case one
 /// was filled with nobody telling ([`title_memory_allocated`],
 /// [`title_memory_remapped`]), which no title we know does.
@@ -4190,6 +4205,7 @@ mod tests {
     /// the runtime has begun to change; after that it is again.
     #[test]
     fn what_is_left_alone_is_no_known_hole() {
+        let _alone = crate::placeholders::tests::alone();
         let p = placeholder(3);
         // Told as `xmem` tells, for where Windows will not say (Wine).
         crate::placeholders::placeholder_ranges_for_tests();
@@ -4220,6 +4236,36 @@ mod tests {
         assert!((0..3).all(known) == holes);
         title_memory_freed(p, BLOCK);
         assert!(!known(0) && !guards().held.contains(p / BLOCK));
+        title_memory_unmapping(p, 3 * BLOCK);
+        crate::title_placeholder_leaving(p, 3 * BLOCK);
+        // SAFETY: our placeholders.
+        unsafe {
+            for block in 0..3 {
+                VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+        }
+    }
+
+    /// The ranges let go (a call past `xmem` that succeeded on pointers that
+    /// could not be read): the holes held are known by their bits no more
+    /// from then on, with no look at the holes between, nor after the next
+    /// asking.
+    #[test]
+    fn holes_known_by_the_ranges_go_with_them_at_once() {
+        let _alone = crate::placeholders::tests::alone();
+        let p = placeholder(3);
+        crate::placeholders::placeholder_ranges_for_tests();
+        crate::title_placeholder_reserved(p, 3 * BLOCK);
+        let known = |block: usize| published(p + block * BLOCK, p + (block + 1) * BLOCK);
+        let held = |block: usize| guards().held.contains(p / BLOCK + block);
+        let ask = || writes(p, p + 3 * BLOCK, true).expect("as a view");
+        ask();
+        let holes = known_holes();
+        assert!((0..3).all(|block| known(block) == holes && held(block) == holes));
+        crate::title_placeholders_lost();
+        assert!(!(0..3).any(|block| known(block) || held(block)), "still known");
+        ask();
+        assert!(!(0..3).any(|block| known(block) || held(block)), "known again");
         title_memory_unmapping(p, 3 * BLOCK);
         crate::title_placeholder_leaving(p, 3 * BLOCK);
         // SAFETY: our placeholders.
@@ -5473,6 +5519,7 @@ mod many_askers_tests {
     /// allocated there. A hole that is no placeholder's is asked about.
     #[test]
     fn holes_are_known_until_the_runtime_tells() {
+        let _alone = crate::placeholders::tests::alone();
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         const BLOCKS: usize = 8;
         // SAFETY (all): a placeholder and a section of our own, which stay.
@@ -5563,6 +5610,7 @@ mod many_askers_tests {
     /// whoever asks after it, and blocks are known by their bits meanwhile.
     #[test]
     fn no_mapping_is_lost_between_askers() {
+        let _alone = crate::placeholders::tests::alone();
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         const BLOCKS: usize = 12;

@@ -182,11 +182,13 @@ pub fn title_placeholder_leaving(at: usize, len: usize) {
 
 /// The system changed some range of the title's that was not told (a call
 /// whose arguments could not be read, which succeeded all the same): every
-/// range goes, as though each had left. What is held of them is asked about
-/// again ([`held_untracked`]); what is told from now on is tracked again.
+/// range goes, as though each had left, and every hole the guards hold goes
+/// with them before this returns (`crate::watch::holes_lost`), not when a
+/// look at the holes comes to it: one may have been filled or released.
+/// What is told from now on is tracked again.
 pub fn title_placeholders_lost() {
     if placeholder_ranges() {
-        ranges().by_first.clear();
+        crate::watch::holes_lost(|| ranges().by_first.clear());
     }
 }
 
@@ -341,6 +343,13 @@ pub(crate) mod tests {
         /// Run by [`known`] between its look at the ranges and its look
         /// again, on this thread, once.
         pub(crate) static BETWEEN: std::cell::Cell<Option<fn(usize)>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// For the tests that look at the ranges or at the holes known by them,
+    /// one at a time: one lets every range go ([`title_placeholders_lost`]).
+    pub(crate) fn alone() -> std::sync::MutexGuard<'static, ()> {
+        static ALONE: Mutex<()> = Mutex::new(());
+        ALONE.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn all(r: &Ranges) -> Vec<(usize, usize, u64)> {
@@ -525,6 +534,7 @@ pub(crate) mod tests {
     /// that left, is not.
     #[test]
     fn tracked_holes_are_known_and_others_are_not() {
+        let _alone = alone();
         let at = tracked(3);
         let known_at = |block: usize| known(at / BLOCK + block);
         assert!((0..3).all(known_at));
@@ -548,6 +558,7 @@ pub(crate) mod tests {
     /// memory) is no hole: Windows says what it is.
     #[test]
     fn what_was_put_there_untold_is_no_hole() {
+        let _alone = alone();
         let at = tracked(2);
         view_at(section(1), at);
         assert!(
@@ -576,6 +587,7 @@ pub(crate) mod tests {
     /// A region Windows reports past what is tracked is not taken for one.
     #[test]
     fn a_region_past_the_ranges_is_no_hole() {
+        let _alone = alone();
         placeholder_ranges_for_tests();
         let at = untracked(2, false);
         title_placeholder_reserved(at, BLOCK);
@@ -589,6 +601,7 @@ pub(crate) mod tests {
     /// runtime's, as the system changes the mapping) is no hole.
     #[test]
     fn a_change_between_the_looks_is_no_hole() {
+        let _alone = alone();
         let at = tracked(1);
         let block = at / BLOCK;
         let between = |f: fn(usize)| BETWEEN.with(|b| b.set(Some(f)));
@@ -611,6 +624,7 @@ pub(crate) mod tests {
     /// memory is no hole; a placeholder made there again is, as a new one.
     #[test]
     fn a_released_address_used_again_is_no_hole() {
+        let _alone = alone();
         let at = tracked(1);
         assert!(known(at / BLOCK));
         release(at, 1);

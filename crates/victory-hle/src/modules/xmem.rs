@@ -2044,17 +2044,23 @@ pub(crate) fn module() -> HleModule {
 /// placeholder ranges first (`victory_gpu::title_placeholder_leaving`), and
 /// the GPU side asks about it again after (`title_memory_allocated`); a
 /// release is told as our `VirtualFree` tells one. Not served without the
-/// switch. Each DLL serves only what the host's DLL of that name has (Wine
-/// lacks some): a title that looks for one the host lacks finds it missing,
-/// as it would without the switch.
+/// switch.
+///
+/// The wrapper of the title's `dll!name` (an import, or its `GetProcAddress`
+/// of a host module, by that module's file name), if one is served: only
+/// where the host binds that name of that DLL to the very function the
+/// wrapper calls (kernel32's wrappers call kernel32's, the API sets' and
+/// kernelbase's kernelbase's). A DLL that lacks it (Wine lacks some), or an
+/// API set contract the host has not or that it binds elsewhere, is left to
+/// the host, as without the switch.
 ///
 /// Not covered: `NtAllocateVirtualMemory` and `NtMapViewOfSection`, which
 /// take no placeholder flags, and system calls made without an import.
-pub(crate) fn bypass_modules() -> Vec<HleModule> {
+pub(crate) fn bypass_lookup(dll: &str, name: &str) -> Option<usize> {
     if !victory_gpu::placeholder_ranges() {
-        return Vec::new();
+        return None;
     }
-    bypass::modules(|dll, name| crate::host::function(dll, name).is_some())
+    bypass::lookup(dll, name, crate::host::function)
 }
 
 mod bypass {
@@ -2069,47 +2075,48 @@ mod bypass {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, GetProcessId};
     use windows_sys::core::BOOL;
 
-    use crate::HleModule;
-
     const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
 
-    pub(super) fn exports() -> Vec<crate::HleExport> {
-        let export = |name, address: usize| crate::HleExport { name, address };
+    /// The wrappers, each with the host DLL whose function of its name it
+    /// calls (`real!`).
+    pub(super) fn exports() -> Vec<(crate::HleExport, &'static str)> {
+        let export = |host, name, address: usize| (crate::HleExport { name, address }, host);
+        let (kernelbase, kernel32, ntdll) = ("kernelbase.dll", "kernel32.dll", "ntdll.dll");
         vec![
-            export("VirtualAlloc2", virtual_alloc2 as *const () as usize),
-            export("VirtualAlloc2FromApp", virtual_alloc2_from_app as *const () as usize),
-            export("MapViewOfFile3", map_view_of_file3 as *const () as usize),
-            export("MapViewOfFile3FromApp", map_view_of_file3_from_app as *const () as usize),
-            export("MapViewOfFileNuma2", map_view_of_file_numa2 as *const () as usize),
-            export("VirtualFreeEx", virtual_free_ex as *const () as usize),
-            export("NtAllocateVirtualMemoryEx", nt_allocate_ex as *const () as usize),
-            export("ZwAllocateVirtualMemoryEx", zw_allocate_ex as *const () as usize),
-            export("NtMapViewOfSectionEx", nt_map_ex as *const () as usize),
-            export("ZwMapViewOfSectionEx", zw_map_ex as *const () as usize),
-            export("NtFreeVirtualMemory", nt_free as *const () as usize),
-            export("ZwFreeVirtualMemory", zw_free as *const () as usize),
+            export(kernelbase, "VirtualAlloc2", virtual_alloc2 as *const () as usize),
+            export(kernelbase, "VirtualAlloc2FromApp", virtual_alloc2_from_app as *const () as usize),
+            export(kernelbase, "MapViewOfFile3", map_view_of_file3 as *const () as usize),
+            export(kernelbase, "MapViewOfFile3FromApp", map_view_of_file3_from_app as *const () as usize),
+            export(kernelbase, "MapViewOfFileNuma2", map_view_of_file_numa2 as *const () as usize),
+            export(kernelbase, "VirtualFreeEx", virtual_free_ex as *const () as usize),
+            export(kernel32, "VirtualAlloc2", kernel32_virtual_alloc2 as *const () as usize),
+            export(kernel32, "VirtualAlloc2FromApp", kernel32_virtual_alloc2_from_app as *const () as usize),
+            export(kernel32, "MapViewOfFile3", kernel32_map_view_of_file3 as *const () as usize),
+            export(kernel32, "MapViewOfFile3FromApp", kernel32_map_view_of_file3_from_app as *const () as usize),
+            export(kernel32, "MapViewOfFileNuma2", kernel32_map_view_of_file_numa2 as *const () as usize),
+            export(kernel32, "VirtualFreeEx", kernel32_virtual_free_ex as *const () as usize),
+            export(ntdll, "NtAllocateVirtualMemoryEx", nt_allocate_ex as *const () as usize),
+            export(ntdll, "ZwAllocateVirtualMemoryEx", zw_allocate_ex as *const () as usize),
+            export(ntdll, "NtMapViewOfSectionEx", nt_map_ex as *const () as usize),
+            export(ntdll, "ZwMapViewOfSectionEx", zw_map_ex as *const () as usize),
+            export(ntdll, "NtFreeVirtualMemory", nt_free as *const () as usize),
+            export(ntdll, "ZwFreeVirtualMemory", zw_free as *const () as usize),
         ]
     }
 
-    /// The DLLs served, each with the host DLL whose exports it may serve.
-    pub(super) const SERVED: [(&[&str], &str); 3] = [
-        (&["kernel32.dll"], "kernel32.dll"),
-        (&["kernelbase.dll", "api-ms-win-core-memory-*"], "kernelbase.dll"),
-        (&["ntdll.dll"], "ntdll.dll"),
-    ];
+    /// Whether the title's `dll` is served by the wrappers of `host`'s
+    /// functions: its own name, or a memory API set's for `kernelbase.dll`.
+    fn stands_for(dll: &str, host: &str) -> bool {
+        let dll = dll.to_ascii_lowercase();
+        dll == host || host == "kernelbase.dll" && dll.starts_with("api-ms-win-core-memory-")
+    }
 
-    /// A module for each of [`SERVED`], of the functions `present` says the
-    /// host DLL has (by its name and the function's).
-    pub(super) fn modules(present: impl Fn(&str, &str) -> bool) -> Vec<HleModule> {
-        SERVED
-            .iter()
-            .map(|&(dlls, host)| HleModule {
-                name: "xmem-bypass",
-                dlls,
-                exports: exports().into_iter().filter(|e| present(host, e.name)).collect(),
-            })
-            .filter(|m| !m.exports.is_empty())
-            .collect()
+    /// See [`super::bypass_lookup`]; `resolve` is the host's binding of a
+    /// DLL's function by name.
+    pub(super) fn lookup(dll: &str, name: &str, resolve: impl Fn(&str, &str) -> Option<usize>) -> Option<usize> {
+        let (export, host) = exports().into_iter().find(|&(e, host)| e.name == name && stands_for(dll, host))?;
+        let bound = resolve(dll, name)?;
+        (resolve(host, name) == Some(bound)).then_some(export.address)
     }
 
     /// The host's `name` from `dll`, as `T`: what the title's import would
@@ -2124,8 +2131,8 @@ mod bypass {
         }};
     }
 
-    /// What the system answers for a function it does not have. (Only a
-    /// function served for `kernel32.dll` that `kernelbase.dll` lacks.)
+    /// What the system answers for a function it does not have. (Never
+    /// served so: a wrapper is served only where the host has its function.)
     const STATUS_PROCEDURE_NOT_FOUND: i32 = 0xc000_007a_u32 as i32;
 
     fn missing() {
@@ -2253,8 +2260,13 @@ mod bypass {
     ) -> i32;
     pub(super) type NtFree = unsafe extern "system" fn(HANDLE, *mut *mut c_void, *mut usize, u32) -> i32;
 
+    // A wrapper of each for `kernelbase.dll` (and the API sets) and one for
+    // `kernel32.dll`, each calling its own DLL's function: kernel32's may be
+    // its own and not kernelbase's (`VirtualFreeEx` under Wine and Proton, a
+    // stub on Windows).
+
     macro_rules! alloc2 {
-        ($name:ident, $real:literal) => {
+        ($name:ident, $dll:literal, $real:literal) => {
             pub(super) extern "system" fn $name(
                 process: HANDLE,
                 base: *mut c_void,
@@ -2264,7 +2276,7 @@ mod bypass {
                 params: *mut MEM_EXTENDED_PARAMETER,
                 count: u32,
             ) -> *mut c_void {
-                let Some(real) = real!("kernelbase.dll", $real: Alloc2) else {
+                let Some(real) = real!($dll, $real: Alloc2) else {
                     missing();
                     return std::ptr::null_mut();
                 };
@@ -2273,11 +2285,13 @@ mod bypass {
             }
         };
     }
-    alloc2!(virtual_alloc2, "VirtualAlloc2");
-    alloc2!(virtual_alloc2_from_app, "VirtualAlloc2FromApp");
+    alloc2!(virtual_alloc2, "kernelbase.dll", "VirtualAlloc2");
+    alloc2!(virtual_alloc2_from_app, "kernelbase.dll", "VirtualAlloc2FromApp");
+    alloc2!(kernel32_virtual_alloc2, "kernel32.dll", "VirtualAlloc2");
+    alloc2!(kernel32_virtual_alloc2_from_app, "kernel32.dll", "VirtualAlloc2FromApp");
 
     macro_rules! map3 {
-        ($name:ident, $real:literal) => {
+        ($name:ident, $dll:literal, $real:literal) => {
             #[allow(clippy::too_many_arguments)]
             pub(super) extern "system" fn $name(
                 section: HANDLE,
@@ -2290,7 +2304,7 @@ mod bypass {
                 params: *mut MEM_EXTENDED_PARAMETER,
                 count: u32,
             ) -> *mut c_void {
-                let Some(real) = real!("kernelbase.dll", $real: Map3) else {
+                let Some(real) = real!($dll, $real: Map3) else {
                     missing();
                     return std::ptr::null_mut();
                 };
@@ -2301,39 +2315,53 @@ mod bypass {
             }
         };
     }
-    map3!(map_view_of_file3, "MapViewOfFile3");
-    map3!(map_view_of_file3_from_app, "MapViewOfFile3FromApp");
+    map3!(map_view_of_file3, "kernelbase.dll", "MapViewOfFile3");
+    map3!(map_view_of_file3_from_app, "kernelbase.dll", "MapViewOfFile3FromApp");
+    map3!(kernel32_map_view_of_file3, "kernel32.dll", "MapViewOfFile3");
+    map3!(kernel32_map_view_of_file3_from_app, "kernel32.dll", "MapViewOfFile3FromApp");
 
-    #[allow(clippy::too_many_arguments)]
-    pub(super) extern "system" fn map_view_of_file_numa2(
-        section: HANDLE,
-        process: HANDLE,
-        offset: u64,
-        base: *const c_void,
-        size: usize,
-        kind: u32,
-        protect: u32,
-        node: u32,
-    ) -> *mut c_void {
-        let Some(real) = real!("kernelbase.dll", "MapViewOfFileNuma2": MapNuma2) else {
-            missing();
-            return std::ptr::null_mut();
+    macro_rules! map_numa2 {
+        ($name:ident, $dll:literal) => {
+            #[allow(clippy::too_many_arguments)]
+            pub(super) extern "system" fn $name(
+                section: HANDLE,
+                process: HANDLE,
+                offset: u64,
+                base: *const c_void,
+                size: usize,
+                kind: u32,
+                protect: u32,
+                node: u32,
+            ) -> *mut c_void {
+                let Some(real) = real!($dll, "MapViewOfFileNuma2": MapNuma2) else {
+                    missing();
+                    return std::ptr::null_mut();
+                };
+                // SAFETY: as above.
+                replacing(process, base as usize, size, kind, || unsafe { real(section, process, offset, base, size, kind, protect, node) })
+            }
         };
-        // SAFETY: as above.
-        replacing(process, base as usize, size, kind, || unsafe { real(section, process, offset, base, size, kind, protect, node) })
     }
+    map_numa2!(map_view_of_file_numa2, "kernelbase.dll");
+    map_numa2!(kernel32_map_view_of_file_numa2, "kernel32.dll");
 
-    pub(super) extern "system" fn virtual_free_ex(process: HANDLE, at: *mut c_void, size: usize, kind: u32) -> BOOL {
-        let Some(real) = real!("kernelbase.dll", "VirtualFreeEx": FreeEx) else {
-            missing();
-            return 0;
+    macro_rules! free_ex {
+        ($name:ident, $dll:literal) => {
+            pub(super) extern "system" fn $name(process: HANDLE, at: *mut c_void, size: usize, kind: u32) -> BOOL {
+                let Some(real) = real!($dll, "VirtualFreeEx": FreeEx) else {
+                    missing();
+                    return 0;
+                };
+                if !at.is_null() && frees(process, kind) {
+                    quietly(|| freeing(at as usize, size));
+                }
+                // SAFETY: as above.
+                unsafe { real(process, at, size, kind) }
+            }
         };
-        if !at.is_null() && frees(process, kind) {
-            quietly(|| freeing(at as usize, size));
-        }
-        // SAFETY: as above.
-        unsafe { real(process, at, size, kind) }
     }
+    free_ex!(virtual_free_ex, "kernelbase.dll");
+    free_ex!(kernel32_virtual_free_ex, "kernel32.dll");
 
     macro_rules! nt_alloc_ex {
         ($name:ident, $real:literal) => {
@@ -3270,52 +3298,96 @@ mod tests {
             let other = bypass::virtual_alloc2(process, std::ptr::null_mut(), PAGE, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0);
             assert!(!other.is_null());
             assert_eq!(holes(other, 1), (vec![false], vec![false]));
-            assert_ne!(bypass::virtual_free_ex(process, other, 0, MEM_RELEASE), 0);
+            // (By kernel32's, as told as kernelbase's.)
+            assert_ne!(bypass::kernel32_virtual_free_ex(process, other, 0, MEM_RELEASE), 0);
         }
     }
 
-    /// The calls past `xmem` are served for a DLL only where the host's DLL
-    /// of that name has them: one the host lacks (Wine lacks some) is as
-    /// missing for the title's imports and its `GetProcAddress` (by the same
-    /// lookup) as without the switch.
+    /// The calls past `xmem` are served for the title's `dll!name` only where
+    /// the host binds it to the very function the wrapper calls: one the
+    /// host's DLL lacks (Wine lacks some), and an API set contract that lacks
+    /// it, binds it elsewhere or is not there, are as missing for the title's
+    /// imports and its `GetProcAddress` (by the same lookup) as without the
+    /// switch. kernel32's wrappers call kernel32's own.
     #[test]
     fn calls_past_xmem_are_served_only_where_the_host_has_them() {
-        let wrapper = |name: &str| bypass::exports().into_iter().find(|e| e.name == name).map(|e| e.address);
-        // A host with just these two.
-        let modules = bypass::modules(|dll, name| {
-            matches!((dll, name), ("kernelbase.dll", "VirtualAlloc2") | ("ntdll.dll", "NtFreeVirtualMemory"))
-        });
-        let lookup = |dll, name| crate::registry::lookup_in(&modules, dll, name);
-        assert_eq!(lookup("KernelBase.dll", "VirtualAlloc2"), wrapper("VirtualAlloc2"));
-        assert_eq!(lookup("api-ms-win-core-memory-l1-1-6.dll", "VirtualAlloc2"), wrapper("VirtualAlloc2"));
-        assert_eq!(lookup("ntdll.dll", "NtFreeVirtualMemory"), wrapper("NtFreeVirtualMemory"));
+        let wrapper = |host: &str, name: &str| {
+            bypass::exports().into_iter().find(|&(e, of)| of == host && e.name == name).map(|(e, _)| e.address)
+        };
+        // A host: kernel32 forwards VirtualFreeEx and has a MapViewOfFile3 of
+        // its own; one contract has VirtualAlloc2, an older one not, another
+        // binds VirtualFreeEx elsewhere, and a newer one is not there.
+        let host = |dll: &str, name: &str| -> Option<usize> {
+            let kernelbase = match name {
+                "VirtualAlloc2" => Some(0x10),
+                "VirtualFreeEx" => Some(0x20),
+                "MapViewOfFile3" => Some(0x30),
+                _ => None,
+            };
+            match (dll.to_ascii_lowercase().as_str(), name) {
+                ("kernelbase.dll" | "api-ms-win-core-memory-l1-1-6.dll", _) => kernelbase,
+                ("api-ms-win-core-memory-l1-1-0.dll", "VirtualFreeEx") => kernelbase,
+                ("api-ms-win-core-memory-l1-1-7.dll", "VirtualFreeEx") => Some(0x77),
+                ("kernel32.dll", "VirtualFreeEx") => kernelbase,
+                ("kernel32.dll", "MapViewOfFile3") => Some(0x99),
+                ("ntdll.dll", "NtFreeVirtualMemory") => Some(0x50),
+                // (Never the wrappers' host for these.)
+                ("ntdll.dll" | "user32.dll", "VirtualAlloc2") => kernelbase,
+                _ => None,
+            }
+        };
+        let lookup = |dll, name| bypass::lookup(dll, name, host);
+        for (dll, name, of) in [
+            ("KernelBase.dll", "VirtualAlloc2", "kernelbase.dll"),
+            ("api-ms-win-core-memory-l1-1-6.dll", "VirtualAlloc2", "kernelbase.dll"),
+            ("API-MS-WIN-CORE-MEMORY-L1-1-0.DLL", "VirtualFreeEx", "kernelbase.dll"),
+            ("KERNEL32.dll", "VirtualFreeEx", "kernel32.dll"),
+            ("kernel32.dll", "MapViewOfFile3", "kernel32.dll"),
+            ("ntdll.dll", "NtFreeVirtualMemory", "ntdll.dll"),
+        ] {
+            assert!(wrapper(of, name).is_some());
+            assert_eq!(lookup(dll, name), wrapper(of, name), "{dll}!{name}");
+        }
+        assert_ne!(wrapper("kernel32.dll", "MapViewOfFile3"), wrapper("kernelbase.dll", "MapViewOfFile3"));
         for (dll, name) in [
             ("kernel32.dll", "VirtualAlloc2"),
+            ("api-ms-win-core-memory-l1-1-0.dll", "VirtualAlloc2"),
+            ("api-ms-win-core-memory-l1-1-7.dll", "VirtualFreeEx"),
+            ("api-ms-win-core-memory-l1-1-9.dll", "VirtualFreeEx"),
             ("kernelbase.dll", "MapViewOfFile3FromApp"),
             ("kernelbase.dll", "MapViewOfFileNuma2"),
+            ("kernelbase.dll", "VirtualAlloc"),
             ("ntdll.dll", "ZwFreeVirtualMemory"),
             ("ntdll.dll", "VirtualAlloc2"),
+            ("user32.dll", "VirtualAlloc2"),
             ("kernel32.dll", "NtFreeVirtualMemory"),
         ] {
             assert_eq!(lookup(dll, name), None, "{dll}!{name}");
         }
-        assert!(bypass::modules(|_, _| false).is_empty());
-        // This host.
-        let modules = bypass::modules(|dll, name| crate::host::function(dll, name).is_some());
+        // This host: what is served is what the title would have been bound
+        // to, and through the registry with the switch on.
+        victory_gpu::placeholder_ranges_for_tests();
         let mut lacks = Vec::new();
-        for (dlls, host) in bypass::SERVED {
-            for export in bypass::exports() {
-                let has = crate::host::function(host, export.name).is_some();
-                for dll in dlls {
-                    let dll = dll.replace('*', "l1-1-6.dll");
-                    assert_eq!(crate::registry::lookup_in(&modules, &dll, export.name), has.then_some(export.address), "{dll}!{}", export.name);
+        let dlls = ["kernel32.dll", "kernelbase.dll", "ntdll.dll"]
+            .map(String::from)
+            .into_iter()
+            .chain((0..=8).map(|minor| format!("api-ms-win-core-memory-l1-1-{minor}.dll")));
+        for dll in dlls {
+            for (export, host) in bypass::exports() {
+                if !(host == dll || host == "kernelbase.dll" && dll.starts_with("api-")) {
+                    continue;
                 }
-                if !has && (host == "ntdll.dll") == export.name.starts_with(['N', 'Z']) {
-                    lacks.push(format!("{host}!{}", export.name));
+                let served = crate::registry::lookup(&dll, export.name);
+                let bound = crate::host::function(&dll, export.name);
+                if bound.is_some() && bound == crate::host::function(host, export.name) {
+                    assert_eq!(served, Some(export.address), "{dll}!{}", export.name);
+                } else {
+                    assert_eq!(served, None, "{dll}!{}", export.name);
+                    lacks.push(format!("{dll}!{}{}", export.name, if bound.is_some() { " (bound elsewhere)" } else { "" }));
                 }
             }
         }
-        eprintln!("not served, as the host lacks them: {lacks:?}");
+        eprintln!("not served, as the host binds them elsewhere or not at all: {lacks:?}");
     }
 
     /// The Nt calls past `xmem` read the title's pointers so that one that is
