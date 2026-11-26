@@ -116,8 +116,20 @@ title's folder:
 
 The title's folder, `victory.exe` and the DLLs are bound read-only. Inside
 the sandbox, `victory.exe` sees `VICTORY_DATA_DIR=Z:\state\data` and
-`VICTORY_CACHE_DIR=Z:\state\cache\victory`. `shaders --list FILE` writes
-that file on the host.
+`VICTORY_CACHE_DIR=Z:\state\cache\victory`, where it cannot tell whether
+they are in a checkout. So before anything is written, the script resolves
+the three folders on the host (through symbolic links too) and stops if one
+is inside a VIctory checkout, holds one, or overlaps the title's folder, a
+shader input, `victory.exe`, a DLL or Proton.
+
+`shaders --list FILE` writes FILE on the host, only when the command
+succeeds: the list is made in the cache and then replaces FILE. Until then
+an existing FILE is left as it is. The script refuses a FILE that is a
+symbolic link or not a plain file, is in a checkout, or is or lies in one of
+the shader inputs.
+
+`scripts/check-run-linux.sh` checks these rules with a stand-in `bwrap`,
+without Wine or a title.
 
 ### Existing saves
 

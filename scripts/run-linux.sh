@@ -32,6 +32,9 @@ set -euo pipefail
 repo=$(realpath "$(dirname "${BASH_SOURCE[0]}")/..")
 die() { echo "run-linux.sh: $*" >&2; exit 1; }
 usage() { sed -n '5,7s/^#   //p' "${BASH_SOURCE[0]}" >&2; exit 2; }
+# Real paths, also of paths that do not exist yet; `within a b`: a is b or below it.
+resolve() { realpath -m -- "$1"; }
+within() { [[ $2 == / || $1 == "$2" || $1 == "$2"/* ]]; }
 
 (($# > 0)) || usage
 command=$1
@@ -63,8 +66,11 @@ inherited=$(compgen -e | grep '^VICTORY_' || true)
 [[ -z $inherited ]] || echo "run-linux.sh: not passed on (give them as NAME=value arguments):" $inherited >&2
 
 # What the sandbox binds beyond the common set, and the command's arguments.
+# Everything bound read-only is also named in read_only, so that no place the
+# sandbox writes to can reach it.
 binds=()
 args=()
+declare -A read_only=(["the VIctory checkout"]=$repo)
 is_setting() { [[ $1 =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; }
 case $command in
   run)
@@ -72,8 +78,10 @@ case $command in
     title=$(realpath "$1")
     title_exe=$2
     shift 2
-    [[ -f $title/$title_exe ]] || die "no $title_exe in $title"
+    title_path=$(resolve "$title/$title_exe")
+    [[ -f $title_path ]] && within "$title_path" "$title" || die "no $title_exe in $title"
     binds+=(--ro-bind "$title" /title)
+    read_only["the title folder"]=$title
     args=(run --console "${RUN_LINUX_CONSOLE:-series-x}" --execute "Z:\\title\\${title_exe//\//\\}")
     while (($#)); do
       case $1 in
@@ -92,9 +100,9 @@ case $command in
         set_setting "${1%%=*}" "${1#*=}"
       elif [[ $1 == --list ]]; then
         (($# >= 2)) || die "shaders: --list needs a file"
-        # Written by the sandbox: the file is made here and bound in.
-        : >"$2"
-        binds+=(--bind "$(realpath "$2")" /output/list.txt)
+        [[ ! -v list_output ]] || die "shaders: --list is given twice"
+        # Nothing is written to it here: see "The list" below.
+        list_output=$2
         args+=(--list 'Z:\output\list.txt')
         shift
       elif [[ $1 == --jobs ]]; then
@@ -105,8 +113,10 @@ case $command in
         args+=("$1")
       else
         [[ -e $1 ]] || die "shaders: no $1"
-        name=$(basename "$(realpath "$1")")
-        binds+=(--ro-bind "$(realpath "$1")" "/input/$inputs/$name")
+        input=$(realpath -- "$1")
+        name=$(basename "$input")
+        binds+=(--ro-bind "$input" "/input/$inputs/$name")
+        read_only["shader input $1"]=$input
         args+=("Z:\\input\\$inputs\\$name")
         inputs=$((inputs + 1))
       fi
@@ -134,6 +144,7 @@ dxgi=$proton/dxvk/x86_64-windows/dxgi.dll
 compiler=${D3DCOMPILER:-$HOME/.cache/winetricks/d3dcompiler_47/d3dcompiler_47.dll}
 for file in "$exe" "$vkd3d/d3d12.dll" "$vkd3d/d3d12core.dll" "$dxgi" "$compiler"; do
   [[ -f $file ]] || die "no $file"
+  read_only["$file"]=$(realpath -- "$file")
 done
 wine_kind=${RUN_LINUX_WINE:-proton}
 state=${RUN_LINUX_STATE:-${XDG_DATA_HOME:-$HOME/.local/share}/victory/linux}
@@ -156,6 +167,7 @@ case $wine_kind in
     files=$(realpath "$proton/../..")
     wine=$files/bin/wine
     [[ -x $wine ]] || die "no Proton Wine at $wine"
+    read_only["Proton's files"]=$files
     wine_setup=(--ro-bind "$files" "$files"
       --setenv LD_LIBRARY_PATH "$files/lib/x86_64-linux-gnu:$files/lib/i386-linux-gnu")
     if [[ -n $wineserver ]]; then
@@ -163,7 +175,8 @@ case $wine_kind in
       # WINESERVER, so the replacement is mounted over Proton's, in the
       # sandbox only. The final `wineserver -w` waits for it too.
       [[ -f $wineserver && -x $wineserver ]] || die "RUN_LINUX_WINESERVER: no executable file at $wineserver"
-      wine_setup+=(--ro-bind "$(realpath "$wineserver")" "$files/bin/wineserver")
+      read_only[RUN_LINUX_WINESERVER]=$(realpath -- "$wineserver")
+      wine_setup+=(--ro-bind "${read_only[RUN_LINUX_WINESERVER]}" "$files/bin/wineserver")
     fi
     # It draws through X11 (Xwayland). The warm-ups need the display too: without
     # one, explorer.exe restarts over and over and Vulkan start-up waits for it.
@@ -205,10 +218,53 @@ for name in "${order[@]}"; do
   fi
 done
 
+# The host paths written to are checked here, before anything is written: in
+# the sandbox they are under /state, where victory.exe cannot see a
+# .victory-root above them.
+check_writable() {
+  local what=$1 path=$2 dir=$2 name
+  while :; do
+    [[ ! -f $dir/.victory-root ]] || die "$what ($path) is inside a VIctory checkout ($dir)"
+    [[ $dir != / ]] || break
+    dir=$(dirname "$dir")
+  done
+  for name in "${!read_only[@]}"; do
+    ! within "$path" "${read_only[$name]}" && ! within "${read_only[$name]}" "$path" ||
+      die "$what ($path) overlaps $name (${read_only[$name]}), which the sandbox reads"
+  done
+}
+prefix=$(resolve "$prefix")
+data=$(resolve "$data")
+cache=$(resolve "$cache")
+check_writable RUN_LINUX_PREFIX "$prefix"
+check_writable RUN_LINUX_DATA "$data"
+check_writable RUN_LINUX_CACHE "$cache"
+
+# The list: victory.exe writes a fresh file in the cache, which replaces FILE
+# only once the command has succeeded. A FILE that is there already is left as
+# it is until then, and a symbolic link or anything else that is not a plain
+# file is not replaced at all.
+if [[ -v list_output ]]; then
+  list_dir=$(dirname -- "$list_output")
+  list_name=$(basename -- "$list_output")
+  [[ $list_output != */ && $list_name != . && $list_name != .. ]] || die "shaders: --list $list_output is not a file name"
+  [[ -d $list_dir ]] || die "shaders: --list $list_output: no folder $list_dir"
+  [[ ! -L $list_output ]] || die "shaders: --list $list_output is a symbolic link"
+  [[ ! -e $list_output || -f $list_output ]] || die "shaders: --list $list_output is not a file"
+  list_dir=$(realpath -- "$list_dir")
+  list_path=$list_dir/$list_name
+  check_writable "shaders --list" "$list_path"
+fi
+
 mkdir -p "$prefix" "$data" "$cache/victory" "$cache/vkd3d" "$cache/mesa"
+if [[ -v list_output ]]; then
+  list_stage=$(mktemp "$cache/.shaders-list.XXXXXX")
+  trap 'rm -f -- "$list_stage" "${list_pending:-}"' EXIT
+  binds+=(--bind "$list_stage" /output/list.txt)
+fi
 # The Wine server is waited for at the end: a prefix made by this start is
 # only written out when it ends, and the sandbox's end would cut it off.
-exec bwrap --unshare-net --unshare-pid --new-session --die-with-parent --clearenv \
+sandbox=(bwrap --unshare-net --unshare-pid --new-session --die-with-parent --clearenv \
   --ro-bind /usr /usr --ro-bind /etc /etc --ro-bind /sys /sys \
   --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib /lib64 \
   --proc /proc --dev /dev --dev-bind /dev/dri /dev/dri "${ntsync[@]}" --tmpfs /tmp \
@@ -235,4 +291,13 @@ exec bwrap --unshare-net --unshare-pid --new-session --die-with-parent --clearen
   "${environment[@]}" \
   --chdir /state \
   -- /usr/bin/bash -c '"$1" "${@:3}"; status=$?; "$2" -w; exit $status' \
-  victory "$wine" "${wine%wine}wineserver" /application/victory.exe "${args[@]}"
+  victory "$wine" "${wine%wine}wineserver" /application/victory.exe "${args[@]}")
+[[ -v list_output ]] || exec "${sandbox[@]}"
+
+status=0
+"${sandbox[@]}" || status=$?
+((status == 0)) || exit "$status"
+list_pending=$(mktemp "$list_dir/.$list_name.XXXXXX")
+cp -- "$list_stage" "$list_pending"
+chmod -- "$(printf %o $((0666 & ~$(umask))))" "$list_pending"
+mv -T -- "$list_pending" "$list_path"
