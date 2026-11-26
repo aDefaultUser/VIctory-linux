@@ -3617,7 +3617,11 @@ impl State {
                     continue;
                 }
                 let used = group.entry(k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let view = crate::descriptor::view(table + u64::from(k) * 32);
+                // (What shaders ask of a typed view in a table: its kind.
+                // `make_listed` writes it for the views it makes.)
+                host.dynamic_word(index, view.as_ref());
+                match view {
                     Some(View::Constant(address, size)) => {
                         // Renderer port 5: title memory in place is the
                         // card's to read where it is; nothing is copied.

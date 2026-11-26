@@ -369,3 +369,45 @@ fn a_tables_raw_buffer_is_read_at_its_raw_twin() {
         assert_eq!(got[..2], [0, 6], "{label}");
     }
 }
+
+/// A 16-bit typed access (`_d16`) to a view in a table asks the host's table
+/// of strides for the view's kind, as one to a view picked from the heap
+/// does: through an integer format the halves are bits, not f16 (the face
+/// network's views of halves are in tables; its result was all zeros and
+/// faces stood still). Other typed accesses do not ask.
+#[test]
+fn a_d16_typed_access_through_a_table_asks_the_views_kind() {
+    use super::SLOT_STRIDES;
+    let load = |op: u32| {
+        let words = [
+            0xF408_0201u32, // s_load_dwordx4 s[8:11], s[2:3], 0
+            0xFA00_0000,
+            0x7E02_0280, // v_mov_b32 v1, 0
+            op,          // buffer_load_format(_d16)_xy v2, v1, s[8:11], 0 idxen
+            0x8002_0201,
+            0x7E08_0502, // v_readfirstlane_b32 s4, v2
+            0xBE85_0380, // s_mov_b32 s5, 0
+        ];
+        build(&[TABLE, &words, STORE].concat(), (4, 0)).expect("translates")
+    };
+    let store = |op: u32| {
+        let words = [
+            0x7E02_0280u32, // v_mov_b32 v1, 0
+            0x7E04_0280,    // v_mov_b32 v2, 0
+            0x7E06_0280,    // v_mov_b32 v3, 0
+            op,             // buffer_store_format(_d16)_xyzw v[2:3], v1, s[20:23], 0 idxen
+            0x8005_0201,
+            0xBF81_0000, // s_endpgm
+        ];
+        build(&[TABLE, &words].concat(), (4, 0)).expect("translates")
+    };
+    for (label, shader, d16) in [
+        ("load d16", load(0xE204_2000), true),
+        ("load", load(0xE004_2000), false),
+        ("store d16", store(0xE21C_2000), true),
+        ("store", store(0xE01C_2000), false),
+    ] {
+        let strides = shader.root_srvs.contains(&SLOT_STRIDES);
+        assert_eq!(strides, d16, "{label}: {:?}", shader.root_srvs);
+    }
+}
