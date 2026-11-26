@@ -2032,8 +2032,14 @@ fn known_holes() -> bool {
 
 /// Whether `block` lies in a placeholder: a reservation in which pages come
 /// to be only by mapping a view (or an allocation) in its place, which an
-/// ordinary commit cannot do.
+/// ordinary commit cannot do. Where Windows will not say (Wine), what the
+/// runtime knows, if it is asked (`VICTORY_PLACEHOLDER_RANGES=1`); else no.
 fn placeholder(block: usize) -> bool {
+    class7(block).unwrap_or_else(|| crate::placeholders::known(block))
+}
+
+/// What Windows says of [`placeholder`]; `None` if it refuses the question.
+pub(crate) fn class7(block: usize) -> Option<bool> {
     /// `MEMORY_REGION_INFORMATION` (ntddk).
     #[repr(C)]
     #[derive(Default)]
@@ -2061,6 +2067,7 @@ fn placeholder(block: usize) -> bool {
     const MEMORY_REGION_INFORMATION_EX: u32 = 7;
     const PLACEHOLDER_RESERVATION: u32 = 1 << 8;
     let mut region = Region::default();
+    crate::placeholders::asked();
     // SAFETY: the answer's room and its size.
     let status = unsafe {
         NtQueryVirtualMemory(
@@ -2072,7 +2079,12 @@ fn placeholder(block: usize) -> bool {
             std::ptr::null_mut(),
         )
     };
-    status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0
+    (status >= 0).then_some(region.region_type & PLACEHOLDER_RESERVATION != 0)
+}
+
+/// How many blocks are held as holes of placeholders now.
+pub(crate) fn held_now() -> usize {
+    guards_shared().held.len()
 }
 
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
@@ -2109,6 +2121,15 @@ pub(crate) fn look_at_holes() {
     for block in blocks {
         if block >= until {
             until = uncommitted_end(block);
+        }
+        // (`VICTORY_PLACEHOLDER_RANGES=1`: one the runtime no longer tracks
+        // as a placeholder is asked about again, whatever it is now.)
+        if block < until && crate::placeholders::held_untracked(block) {
+            if guards().held.remove(block) {
+                PUBLISHED.clear(block);
+                crate::placeholders::dropped();
+            }
+            continue;
         }
         if block >= until {
             // (Or unmapped memory was mapped since the part was taken: told
@@ -4170,6 +4191,9 @@ mod tests {
     #[test]
     fn what_is_left_alone_is_no_known_hole() {
         let p = placeholder(3);
+        // Told as `xmem` tells, for where Windows will not say (Wine).
+        crate::placeholders::placeholder_ranges_for_tests();
+        crate::title_placeholder_reserved(p, 3 * BLOCK);
         let known = |block: usize| published(p + block * BLOCK, p + (block + 1) * BLOCK);
         let ask = || writes(p, p + 3 * BLOCK, true).expect("as a view");
         ask();
@@ -4197,6 +4221,7 @@ mod tests {
         title_memory_freed(p, BLOCK);
         assert!(!known(0) && !guards().held.contains(p / BLOCK));
         title_memory_unmapping(p, 3 * BLOCK);
+        crate::title_placeholder_leaving(p, 3 * BLOCK);
         // SAFETY: our placeholders.
         unsafe {
             for block in 0..3 {
@@ -5465,9 +5490,13 @@ mod many_askers_tests {
                 CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (BLOCKS * PAGE) as u32, std::ptr::null());
             (at, section)
         };
+        // Told as `xmem` tells, for where Windows will not say (Wine).
+        crate::placeholders::placeholder_ranges_for_tests();
+        crate::title_placeholder_reserved(at, BLOCKS * PAGE);
         let map = |block: usize| unsafe {
             let to = at + block * PAGE;
             VirtualFree(to as *mut _, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            crate::title_placeholder_leaving(to, PAGE);
             let view = MapViewOfFile3(
                 section,
                 GetCurrentProcess(),
@@ -5510,6 +5539,7 @@ mod many_askers_tests {
             let view = MEMORY_MAPPED_VIEW_ADDRESS { Value: (at + 5 * PAGE) as *mut _ };
             UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
         }
+        crate::title_placeholder_returned(at + 5 * PAGE, PAGE);
         let (fifth, all) = ask(fourth);
         assert_eq!(all, [5]);
         assert!(super::published(at, end));
@@ -5554,6 +5584,9 @@ mod many_askers_tests {
                 CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (BLOCKS * PAGE) as u32, std::ptr::null());
             (at, section as usize)
         };
+        // Told as `xmem` tells, for where Windows will not say (Wine).
+        crate::placeholders::placeholder_ranges_for_tests();
+        crate::title_placeholder_reserved(at, BLOCKS * PAGE);
         let end = at + BLOCKS * PAGE;
         let (stop, by_bits) = (AtomicBool::new(false), AtomicUsize::new(0));
         let number = |written: &[(usize, u64)], block: usize| written.iter().find(|w| w.0 == at / PAGE + block).map_or(0, |w| w.1);
@@ -5566,6 +5599,7 @@ mod many_askers_tests {
                             let block = t * 3 + round % 3;
                             let to = at + block * PAGE;
                             let (before, _) = writes(at, end, true).expect("a view");
+                            crate::title_placeholder_leaving(to, PAGE);
                             unsafe {
                                 let view = MapViewOfFile3(
                                     section as _,
@@ -5592,6 +5626,7 @@ mod many_askers_tests {
                                 let view = MEMORY_MAPPED_VIEW_ADDRESS { Value: to as *mut _ };
                                 assert_ne!(UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER), 0);
                             }
+                            crate::title_placeholder_returned(to, PAGE);
                             let _ = again;
                         }
                     })
