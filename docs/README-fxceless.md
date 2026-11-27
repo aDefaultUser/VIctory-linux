@@ -90,9 +90,19 @@ Memory sync between the title's memory and the copies on the card:
   guarded again in between no longer fails the read.
 - Writes of the storage layer into physical pages are counted where the title
   has those pages mapped (10,000 to 50,000 guarded blocks of copies lay under
-  them in every run) and the guards there are opened (by default, as
-  `VICTORY_PAGE_WRITES=guards`; `0` counts them only; `1`, `slots`, `all` do
-  more or other things).
+  them in every run). By default each finished storage write is told to the
+  GPU side as one about to begin, which opens the guards there and makes the
+  placed textures there due again. With that notice off
+  (`VICTORY_STREAM_NOTICE=0`), `VICTORY_PAGE_WRITES` says what is done: by
+  default the guards are opened and the texture slots uploaded before the
+  bytes landed are due again, for plain-address reads too (otherwise a face
+  uploaded early kept zeros); `guards` opens the guards alone, `0` counts
+  only, `1`, `slots`, `all` do more or other things.
+- Textures picked by index are looked at again a few times after their
+  upload (4 to 400 frames on). `VICTORY_HEAP_RECHECK_EVERY=<frames>` keeps
+  looking after that, for a title that rewrites a texture's memory much
+  later with nothing to tell of it (off by default: every uploaded texture
+  stays in the queue).
 - Failed page-destination reads are retried (`VICTORY_DSTORAGE_RETRIES=0` = as before).
 
 Card memory (the test card is full from the first frame of the world: 85 to

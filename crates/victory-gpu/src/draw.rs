@@ -733,6 +733,36 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
+/// Frames between looks at an uploaded texture picked by index once
+/// [`RECHECK_FRAMES`] is through (`VICTORY_HEAP_RECHECK_EVERY=<frames>`;
+/// unset or 0: it is not looked at again, as before). A title may fill or
+/// rewrite a texture's memory long after its view was written, with nothing
+/// to tell of it (a write of its own, not the storage layer's); what
+/// changes after the last look stays as it was on the card for the rest of
+/// the run. Off by default: every slot uploaded whole stays in the queue,
+/// a 48 KiB look each time it is due. (fxceless e4245f3, after
+/// RyanCase94's 920423a9.)
+fn recheck_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let every = std::env::var("VICTORY_HEAP_RECHECK_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        if every > 0 {
+            tracing::info!("uploaded textures picked by index are looked at again every {every} frames (VICTORY_HEAP_RECHECK_EVERY)");
+        }
+        every
+    })
+}
+
+/// After the `looks`-th look at an uploaded texture found its memory as it
+/// was: the frames to the next look and the number to note it as, or
+/// `None` for no more looks. `every`: [`recheck_every`].
+fn next_look(looks: u8, every: u64) -> Option<(u64, u8)> {
+    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+        Some(&wait) => Some((wait, looks + 1)),
+        None => (every > 0).then_some((every, looks)),
+    }
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -2497,9 +2527,9 @@ impl State {
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+                    match next_look(looks, recheck_every()) {
+                        Some((wait, looks)) => {
+                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks, uploaded)
                         }
                         None => host.texture_slot_done(index, write, None),
                     }
@@ -4907,8 +4937,24 @@ mod record_hash_tests {
 
 #[cfg(test)]
 mod recheck_tests {
-    use super::upload_print;
+    use super::{RECHECK_FRAMES, next_look, upload_print};
     use crate::texture::fingerprint;
+
+    /// The looks after an upload follow [`RECHECK_FRAMES`]; past its end
+    /// there are none, unless `VICTORY_HEAP_RECHECK_EVERY` asks for one
+    /// every so many frames, for as long as the slot shows the texture.
+    #[test]
+    fn looks_after_the_schedule_only_when_asked() {
+        let last = (RECHECK_FRAMES.len() - 1) as u8;
+        assert_eq!(next_look(0, 0), Some((RECHECK_FRAMES[1], 1)));
+        assert_eq!(next_look(last - 1, 0), Some((RECHECK_FRAMES[last as usize], last)));
+        assert_eq!(next_look(last, 0), None, "off by default: the schedule ends");
+        assert_eq!(next_look(last, 600), Some((600, last)));
+        // And again, every 600 frames.
+        assert_eq!(next_look(last, 600), next_look(last, 600));
+        // The schedule comes first.
+        assert_eq!(next_look(0, 600), Some((RECHECK_FRAMES[1], 1)));
+    }
 
     /// A storage request into a texture finishes while the pass reads the
     /// texture for its upload: the look after the upload finds the memory

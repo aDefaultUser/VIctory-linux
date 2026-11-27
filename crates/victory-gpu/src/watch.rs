@@ -3320,32 +3320,52 @@ impl Drop for KernelWrite {
 /// 1, the guarded blocks under it are opened and count as written (host
 /// copies of buffers and textures read through tables take them again);
 /// 2, the placed textures picked by index that lie under it are due again;
-/// 4, both also for reads to plain addresses when they have finished.
-/// Unset or `guards`: bit 1 alone. `0`: nothing, counted only (the default
-/// until run 199). `1`: bits 1 and 2. `slots`: bit 2 alone. `all`:
-/// everything.
-/// (Bit 1 by default: in every run 10,000 to 50,000 guarded blocks of host
-/// copies lay under such writes and kept the bytes from before; runs 197
-/// and 198 opened them, 9,766 and 10,796 blocks, with nothing worse for
-/// it. Bit 2 makes texture slots due and is the one that flooded the
-/// queue in an earlier form: still asked for by name.)
+/// 4, both also for reads to plain addresses when they have finished;
+/// 8, for reads to plain addresses the textures alone (bit 2's look).
+/// Unset: bits 1, 2 and 8. `guards`: bit 1 alone (the default until
+/// 2026-11-27). `0`: nothing, counted only (the default until run 199).
+/// `1`: bits 1 and 2. `slots`: bit 2 alone. `all`: everything.
+///
+/// Only reached with `VICTORY_STREAM_NOTICE=0`: by default the runtime
+/// tells of a finished storage write as of one about to begin
+/// ([`writing`]), which opens the guards and makes every placed texture
+/// slot under it due ([`crate::descriptor::host::remapped`]). Without that
+/// notice, and with bit 1 alone, a slot the texture pass uploaded while
+/// the write was under way kept the bytes from before it for good (the
+/// black faces of the opening cutscene; fxceless e4245f3: 282 such slots
+/// under DirectStorage writes, and 55,836 plain reads "counted only").
+/// Bits 2 and 8 make due only the slots uploaded before the bytes landed
+/// (`HostHeap::texture_slots_page_written`): a slot still waiting for its
+/// first upload takes the bytes that are there by then, so the queue grows
+/// by the slots that were wrong (2,200 to 6,700 a run under Wine with bit
+/// 2, against 50,000 to 130,000 uploads, no slower a frame; 5711f26).
+/// (Bit 1: in every run 10,000 to 50,000 guarded blocks of host copies lay
+/// under such writes and kept the bytes from before; runs 197 and 198
+/// opened them, 9,766 and 10,796 blocks, with nothing worse for it.)
 pub(crate) fn page_writes() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_PAGE_WRITES").as_deref().map(str::trim) {
-        Ok("0") => 0,
-        Ok("1") => 3,
-        Ok("slots") => 2,
-        Ok("all") => 7,
-        _ => 1,
-    })
+    *MODE.get_or_init(|| page_writes_mode(std::env::var("VICTORY_PAGE_WRITES").ok().as_deref()))
+}
+
+/// [`page_writes`] for the switch's value.
+fn page_writes_mode(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("0") => 0,
+        Some("guards") => 1,
+        Some("1") => 1 | 2,
+        Some("slots") => 2,
+        Some("all") => 15,
+        _ => 1 | 2 | 8,
+    }
 }
 
 /// Since the start: writes into physical pages through the runtime's own
 /// views that landed at addresses the title has mapped (one for each run
 /// of addresses); their bytes; guarded blocks that lay under them (host
 /// copies that would otherwise keep the bytes from before); reads to
-/// plain addresses that finished.
-pub(crate) static WRITTEN: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// plain addresses that finished; of those, the ones passed to the texture
+/// pass (bit 8 or 4 of [`page_writes`]).
+pub(crate) static WRITTEN: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// The bytes of a write the guards do not see are there: title memory
 /// `[at, at + len)`. `pages`: DirectStorage wrote them into physical pages
@@ -3373,7 +3393,13 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
         WRITTEN[1].fetch_add(len as u64, Relaxed);
     } else {
         WRITTEN[3].fetch_add(1, Relaxed);
+        if mode & (4 | 8) == 0 {
+            return;
+        }
+        WRITTEN[4].fetch_add(1, Relaxed);
         if mode & 4 == 0 {
+            // Bit 8 alone: the placed textures under it, not the guards.
+            crate::descriptor::host::page_written(at, len);
             return;
         }
     }
@@ -3997,6 +4023,20 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// Unset, a finished storage write makes the texture slots under it that
+    /// were uploaded before it due again, for page destinations (bit 2) and
+    /// plain addresses (bit 8) both, besides opening the guards.
+    #[test]
+    fn page_writes_make_uploaded_texture_slots_due_by_default() {
+        assert_eq!(page_writes_mode(None), 1 | 2 | 8);
+        assert_eq!(page_writes_mode(Some("")), 1 | 2 | 8);
+        assert_eq!(page_writes_mode(Some("guards")), 1);
+        assert_eq!(page_writes_mode(Some(" 0 ")), 0);
+        assert_eq!(page_writes_mode(Some("1")), 1 | 2);
+        assert_eq!(page_writes_mode(Some("slots")), 2);
+        assert_eq!(page_writes_mode(Some("all")), 15);
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {

@@ -1218,6 +1218,15 @@ impl TextureQueue {
         self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)
     }
 
+    /// Whether slot `index`'s host copy was taken since its view was
+    /// written: out of the queue, or in it after an upload (in part, or
+    /// whole and being looked at again). Bytes that land under it now are
+    /// not in that copy; a slot still waiting for its first upload takes
+    /// them with it.
+    fn uploaded(&self, index: u32) -> bool {
+        self.slots.get(&index).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0)
+    }
+
     /// The memory slot `index`'s texture lies in was mapped, unmapped or
     /// written in `frame`: the slot is looked at from frame `due` as one
     /// written now, whatever was known of it (a pass at work on it does
@@ -2142,9 +2151,7 @@ impl HostHeap {
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
         let held = slots.len();
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        // Uploaded before: out of the queue, or in it after an upload (in
-        // part, or whole and being looked at again).
-        slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
+        slots.retain(|&slot| textures.uploaded(slot));
         PAGE_WRITES[2].fetch_add(held as u64, Relaxed);
         PAGE_WRITES[3].fetch_add(slots.len() as u64, Relaxed);
         if !due {
@@ -5717,6 +5724,49 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// A storage write that lands after the pass uploaded a texture under
+    /// it: the slot uploaded early (looked at again, or done) is due again
+    /// as a fresh write, while one still waiting for its first upload is
+    /// left to it; and the early upload, handed back with its old write
+    /// once the bytes have landed, does not take the slot out again.
+    #[test]
+    fn bytes_that_land_after_an_early_upload_make_its_slot_due_again() {
+        let mut q = TextureQueue::default();
+        // Slots 1, 2 and 3 written in frame 1; the pass takes 1 and 2.
+        for index in 1..=3 {
+            q.written(index, 1, 0, false);
+        }
+        let write = |q: &TextureQueue, index: u32| q.slots[&index].write;
+        let (w1, w2) = (write(&q, 1), write(&q, 2));
+        // Slot 1 is uploaded whole before the bytes are there (looked at
+        // again from frame 5); slot 2's upload is still under way.
+        q.recheck(1, w1, 5, (0x1000, 0x1000), 7, 0, 1);
+        assert!(q.uploaded(1));
+        assert!(!q.uploaded(3), "a slot waiting for its first upload");
+        assert!(q.uploaded(4), "a slot out of the queue is up to date");
+        // Bytes land in frame 2 under slots 1, 3 and 4: the texture pass
+        // makes due those uploaded before (`slots_written_under`).
+        let landed: Vec<u32> = [1, 3, 4].into_iter().filter(|&i| q.uploaded(i)).collect();
+        assert_eq!(landed, [1, 4]);
+        for &index in &landed {
+            q.changed(index, 2, 2 + PAGE_WRITE_AFTER);
+        }
+        // Slot 1 is due in frame 4, as a fresh write and not as a look.
+        let due = q.due(2 + PAGE_WRITE_AFTER, 100);
+        assert!(due.iter().any(|&(i, w)| i == 1 && w != w1));
+        assert!(due.iter().any(|&(i, _)| i == 4));
+        assert_eq!(q.checked(1), None, "the slot is uploaded again, not compared");
+        // Bytes land under slot 2 while its upload reads the memory, told
+        // as by the storage notice (`texture_slots_remapped` makes every
+        // slot there due); the upload is handed back with its old write.
+        q.changed(2, 2, 3);
+        q.done(2, w2);
+        assert!(q.due(3, 100).iter().any(|&(i, w)| i == 2 && w != w2));
+        // And slot 1's old look, handed back late, changes nothing.
+        q.recheck(1, w1, 400, (0x1000, 0x1000), 7, 1, 1);
+        assert!(q.due(2 + PAGE_WRITE_AFTER, 100).iter().any(|&(i, _)| i == 1));
     }
 
     /// Slots held back for lack of room on the card are not handed out
