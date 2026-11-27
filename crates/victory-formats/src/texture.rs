@@ -1293,6 +1293,8 @@ mod tests {
                 (8192, 0, 0xbf87_001b_ad72_d375)),
             (Swizzle::SW_4KB_S, Tex3d, 1, 1, [1, 1, 17], 2,
                 (8192, 0, 0xcdf4_4ee3_33e5_e03d)),
+            (Swizzle::SW_4KB_S, Tex3d, 8, 1, [33, 33, 33], 1,
+                (512000, 1, 0x922f_b35d_ffc2_925a)),
             (Swizzle::SW_64KB_S, Tex3d, 4, 1, [16, 16, 64], 4,
                 (262144, 0, 0x5d1a_a7af_c371_e8e5)),
             (Swizzle::SW_64KB_S, Tex3d, 1, 1, [8, 8, 128], 4,
