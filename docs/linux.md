@@ -293,6 +293,15 @@ its own binary before it looks at `WINESERVER`, so the script mounts the file
 over `files/bin/wineserver` inside the sandbox only. The Proton install is
 not changed. This works only with Proton's Wine.
 
+The mouse (see "Input" in `README-fxceless.md`) needs nothing of its own:
+while it is captured VIctory clips the cursor to the title's window, and
+Wine then grabs the pointer and moves the cursor by the device's relative
+motion, which also works on Xwayland, where a program cannot move the
+host pointer. Esc, or the window losing focus, takes the clip off again. The
+settings (`VICTORY_MOUSE=0`, `VICTORY_MOUSE_SPEED=2`, ...) go on the command
+line as `NAME=value` arguments, like the others; Proton started without the
+script reads them from its environment.
+
 Every command ends by waiting for the Wine server (`wineserver -w`). A
 prefix made by the first start is only written out when the server exits,
 and the end of the sandbox would otherwise cut it off.

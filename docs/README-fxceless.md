@@ -218,7 +218,7 @@ What each part does today and what it still needs:
 | Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
 | Network | Offline by design: the title cannot reach the network | – |
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
+| Input | XInput pads, keyboard, keyboard and mouse stand-in pad (mouse look) | Trigger rumble; mouse wheel |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
 | GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address (ray-tracing structures), depth written from compute, pipelines pre-built or made by worker threads and kept on disk | Lighting (surfaces are unlit) and some missing geometry; frames take 1-2 s; draws of untranslated shaders are dropped; real queries, depth bounds, HDR and scaling are missing |
@@ -268,8 +268,9 @@ limits them. This scales the displayed image; it does not change the
 console render resolution or the swap-chain buffers. With the variable
 unset, window sizing is unchanged.
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+Input: the title sees one pad. Every XInput pad, the keyboard and the mouse
+press it together, so a connected pad never turns the keyboard or the mouse
+off. The keyboard counts while the title's window has focus:
 
 | Keys | Pad |
 |------|-----|
@@ -279,6 +280,27 @@ title's window has focus:
 | Q / E, Z / C | shoulders, triggers |
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
+
+The mouse counts once captured: a left click in the title's window captures
+it (that click presses nothing), Esc releases it (and still presses Menu),
+and so does the window losing focus (Alt+Tab, a dialog, minimizing). While
+captured the cursor is hidden and kept inside the window, and:
+
+| Mouse | Pad |
+|-------|-----|
+| motion | right stick (look), faster motion tilts it further |
+| left / right button | right / left trigger |
+| middle button | right stick click |
+| back / forward side button | left / right shoulder |
+
+The wheel does nothing. Click again to look around after a release.
+
+| Variable | Effect |
+|----------|--------|
+| `VICTORY_MOUSE=0` | the mouse is never captured (keyboard and pads unchanged) |
+| `VICTORY_MOUSE_SPEED=1` | look speed; 2 turns twice as fast |
+| `VICTORY_MOUSE_DEAD_ZONE=0.265` | the stick tilt a moving mouse starts at, to step over the title's own dead zone; lower it if slow motion jumps, raise it if slow motion does nothing |
+| `VICTORY_ONE_PAD=0` | each XInput pad is a pad of its own; the keyboard and mouse pad is there only while no XInput pad is connected |
 
 ## Commands
 

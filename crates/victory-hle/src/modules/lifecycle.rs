@@ -226,6 +226,12 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
     )
 }
 
+/// A window the title made (ours sits in front of its procedure).
+pub(crate) fn is_title_window(hwnd: HWND) -> bool {
+    // SAFETY: a plain query; any window handle, or none, may be asked.
+    !hwnd.is_null() && !unsafe { wm::GetPropW(hwnd, TITLE_PROC) }.is_null()
+}
+
 /// Puts our procedure in front of the title's.
 fn hook(hwnd: HWND) {
     if hwnd.is_null() {
@@ -260,6 +266,15 @@ extern "system" fn window_proc(
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
+    }
+    // The captured mouse is mouse look (gameinput); no cursor shows then.
+    if message == wm::WM_SETCURSOR
+        && (lparam & 0xFFFF) as u32 == wm::HTCLIENT
+        && super::gameinput::mouse_captured()
+    {
+        // SAFETY: a plain call on the window's own thread.
+        unsafe { wm::SetCursor(std::ptr::null_mut()) };
+        return 1;
     }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
@@ -556,6 +571,9 @@ mod tests {
             let n = wm::GetWindowTextW(hwnd, text.as_mut_ptr(), 16);
             assert_eq!(String::from_utf16_lossy(&text[..n as usize]), "after");
             assert!(!wm::GetPropW(hwnd, TITLE_PROC).is_null());
+            assert!(is_title_window(hwnd));
+            assert!(!is_title_window(wm::GetDesktopWindow()));
+            assert!(!is_title_window(null));
             wm::DestroyWindow(hwnd);
         }
     }

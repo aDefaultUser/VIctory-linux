@@ -1,8 +1,9 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
-//! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
-//! too. A poll thread turns host state into readings (a new one per change)
-//! and runs device callbacks on connect and disconnect.
+//! (host slots 0-3); the keyboard and the mouse drive one stand-in gamepad
+//! (`FALLBACK_BUTTONS`, `MOUSE_BUTTONS`, mouse look on the right stick while
+//! the mouse is captured). The keyboard is a device of its own too. A poll
+//! thread turns host state into readings (a new one per change) and runs
+//! device callbacks on connect and disconnect.
 #![allow(non_snake_case)]
 // Title code calls these through the objects, passing pointers the real API
 // would trust.
@@ -80,6 +81,21 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (b'H', RIGHT_STICK),
 ];
 
+/// Mouse buttons, as bits of [`MouseInput::buttons`].
+const MOUSE_LEFT: u8 = 0x1;
+const MOUSE_RIGHT: u8 = 0x2;
+const MOUSE_MIDDLE: u8 = 0x4;
+const MOUSE_BACK: u8 = 0x8;
+const MOUSE_FORWARD: u8 = 0x10;
+
+/// What the mouse presses on the stand-in pad while captured; README lists
+/// it. Left and right are the right and left triggers (`mouse_pad`).
+const MOUSE_BUTTONS: [(u8, u32); 3] = [
+    (MOUSE_MIDDLE, RIGHT_STICK),
+    (MOUSE_BACK, LEFT_SHOULDER),
+    (MOUSE_FORWARD, RIGHT_SHOULDER),
+];
+
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -111,6 +127,9 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// Mouse motion since the last call and buttons held; none while the
+    /// mouse is not captured ([`Capture`]).
+    fn mouse(&mut self) -> MouseInput;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
@@ -135,6 +154,254 @@ fn fallback(keys: &[KeyState]) -> PadState {
         right_x: on(b'L') - on(b'J'),
         right_y: on(b'I') - on(b'K'),
     }
+}
+
+/// The captured mouse's part of the stand-in pad: the buttons, and `look`
+/// (from [`Look`]) on the right stick.
+fn mouse_pad(mouse: MouseInput, look: (f32, f32)) -> PadState {
+    let held = |button: u8| mouse.buttons & button != 0;
+    let pressed = |button: u8| if held(button) { 1.0 } else { 0.0 };
+    PadState {
+        buttons: MOUSE_BUTTONS
+            .iter()
+            .filter(|(button, _)| held(*button))
+            .fold(0, |all, (_, bit)| all | bit),
+        left_trigger: pressed(MOUSE_RIGHT),
+        right_trigger: pressed(MOUSE_LEFT),
+        right_x: look.0,
+        right_y: look.1,
+        ..Default::default()
+    }
+}
+
+/// The mouse in one poll: motion in screen pixels (y down), buttons held
+/// (`MOUSE_*` bits).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct MouseInput {
+    motion: (i32, i32),
+    buttons: u8,
+}
+
+/// A screen rectangle; right and bottom are outside it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Rect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+impl Rect {
+    fn contains(&self, (x, y): (i32, i32)) -> bool {
+        (self.left..self.right).contains(&x) && (self.top..self.bottom).contains(&y)
+    }
+
+    fn center(&self) -> (i32, i32) {
+        (
+            self.left + (self.right - self.left) / 2,
+            self.top + (self.bottom - self.top) / 2,
+        )
+    }
+}
+
+/// What the host sees of the mouse in one poll.
+#[derive(Clone, Copy, Debug, Default)]
+struct Seen {
+    /// The client area of the title's window while it is the foreground
+    /// window and not minimized.
+    window: Option<Rect>,
+    cursor: (i32, i32),
+    /// Held while the title's window is the foreground window, else none.
+    buttons: u8,
+    escape: bool,
+}
+
+/// Mouse capture. A left click in the title's window captures the mouse;
+/// Esc (also the pad's Menu) or the window losing the foreground releases it.
+/// While captured the host keeps the cursor hidden at the window's centre,
+/// and how far it got from there is the motion.
+#[derive(Default)]
+struct Capture {
+    /// The captured window's client area; none while released.
+    window: Option<Rect>,
+    /// Buttons count once all were up after the click that captured: that
+    /// click is no shot.
+    armed: bool,
+    /// Held at the last poll.
+    buttons: u8,
+    escape: bool,
+}
+
+impl Capture {
+    fn step(&mut self, seen: Seen) -> MouseInput {
+        let clicked = seen.buttons & !self.buttons & MOUSE_LEFT != 0;
+        let escaped = seen.escape && !self.escape;
+        self.buttons = seen.buttons;
+        self.escape = seen.escape;
+        let before = self.window;
+        self.window = match (before, seen.window) {
+            (Some(_), Some(_)) if escaped => None,
+            (Some(_), window) => window,
+            (None, Some(window)) if clicked && window.contains(seen.cursor) => {
+                self.armed = false;
+                Some(window)
+            }
+            (None, _) => None,
+        };
+        if before.is_some() != self.window.is_some() {
+            tracing::info!(captured = self.window.is_some(), "mouse");
+        }
+        let Some(window) = self.window else {
+            return MouseInput::default();
+        };
+        self.armed |= seen.buttons == 0;
+        // The first poll, or one after the window moved, has only the
+        // cursor's way to the new centre.
+        let motion = if before == Some(window) {
+            let (x, y) = window.center();
+            (seen.cursor.0 - x, seen.cursor.1 - y)
+        } else {
+            (0, 0)
+        };
+        MouseInput {
+            motion,
+            buttons: if self.armed { seen.buttons } else { 0 },
+        }
+    }
+}
+
+/// How mouse motion becomes right-stick deflection.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LookSettings {
+    /// `VICTORY_MOUSE_SPEED`: a multiplier.
+    speed: f32,
+    /// `VICTORY_MOUSE_DEAD_ZONE`: the deflection a moving mouse starts at,
+    /// over the title's own dead zone. The default is XInput's documented
+    /// right-stick dead zone (8689 of 32767).
+    dead_zone: f32,
+}
+
+impl Default for LookSettings {
+    fn default() -> LookSettings {
+        LookSettings {
+            speed: 1.0,
+            dead_zone: 0.265,
+        }
+    }
+}
+
+impl LookSettings {
+    fn parse(speed: Option<&str>, dead_zone: Option<&str>) -> LookSettings {
+        let default = LookSettings::default();
+        let number = |name: &str, value: Option<&str>, valid: fn(f32) -> bool, default: f32| {
+            let Some(value) = value else {
+                return default;
+            };
+            match value.trim().parse() {
+                Ok(n) if valid(n) => n,
+                _ => {
+                    tracing::warn!(value, "ignoring invalid {name}");
+                    default
+                }
+            }
+        };
+        LookSettings {
+            speed: number(
+                "VICTORY_MOUSE_SPEED",
+                speed,
+                |n| n.is_finite() && n > 0.0,
+                default.speed,
+            ),
+            dead_zone: number(
+                "VICTORY_MOUSE_DEAD_ZONE",
+                dead_zone,
+                |n| (0.0..0.95).contains(&n),
+                default.dead_zone,
+            ),
+        }
+    }
+
+    fn from_env() -> LookSettings {
+        let var = |name| std::env::var(name).ok();
+        LookSettings::parse(
+            var("VICTORY_MOUSE_SPEED").as_deref(),
+            var("VICTORY_MOUSE_DEAD_ZONE").as_deref(),
+        )
+    }
+}
+
+/// Whether a click in the title's window captures the mouse (on unless
+/// `VICTORY_MOUSE=0`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn mouse_enabled() -> bool {
+    std::env::var_os("VICTORY_MOUSE").is_none_or(|v| v != "0")
+}
+
+/// Mouse speed (pixels a second) that tilts the stick all the way at speed 1.
+const FULL_TILT: f32 = 2500.0;
+/// Seconds over which mouse speed is averaged. The title samples the pad
+/// once a frame, and under Wine motion arrives once a title frame (its window
+/// thread takes it in), so a stick fed from each poll's motion alone would
+/// miss most of it. An average keeps the sum: the camera turns as far as the
+/// mouse went.
+const LOOK_SMOOTHING: f32 = 0.05;
+/// Below this deflection (12.5 pixels a second at speed 1) the stick is at
+/// rest; a single pixel's move stays above it for a poll.
+const LOOK_REST: f32 = 0.005;
+
+/// Mouse look: the right stick tilts with the mouse's average speed.
+#[derive(Default)]
+struct Look {
+    settings: LookSettings,
+    /// Pixels a second, y down.
+    velocity: (f32, f32),
+    /// The last step's time (µs).
+    last: Option<u64>,
+}
+
+impl Look {
+    fn new(settings: LookSettings) -> Look {
+        Look {
+            settings,
+            ..Default::default()
+        }
+    }
+
+    /// The right stick (up positive) after `motion` up to `now` (µs).
+    fn step(&mut self, motion: (i32, i32), now: u64) -> (f32, f32) {
+        let dt = self
+            .last
+            .map_or(POLL.as_secs_f32(), |last| {
+                now.saturating_sub(last) as f32 / 1e6
+            })
+            .clamp(0.001, 0.1);
+        self.last = Some(now);
+        let blend = 1.0 - (-dt / LOOK_SMOOTHING).exp();
+        let toward = |v: f32, d: i32| v + (d as f32 / dt - v) * blend;
+        self.velocity = (
+            toward(self.velocity.0, motion.0),
+            toward(self.velocity.1, motion.1),
+        );
+        let scale = self.settings.speed / FULL_TILT;
+        let (x, y) = (self.velocity.0 * scale, -self.velocity.1 * scale);
+        let length = x.hypot(y);
+        if length < LOOK_REST {
+            self.velocity = (0.0, 0.0);
+            return (0.0, 0.0);
+        }
+        let dead_zone = self.settings.dead_zone;
+        let tilt = dead_zone + (1.0 - dead_zone) * length.min(1.0);
+        (x / length * tilt, y / length * tilt)
+    }
+}
+
+/// Set while the mouse is captured: the title's window hides the cursor.
+static CAPTURED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the mouse is captured (the cursor hidden over the title's window).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn mouse_captured() -> bool {
+    CAPTURED.load(Ordering::Relaxed)
 }
 
 /// Two pads as one: buttons of both, and of each axis and trigger the one
@@ -351,6 +618,7 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    look: Look,
 }
 
 pub struct Hub {
@@ -384,7 +652,7 @@ fn now() -> u64 {
 }
 
 impl Hub {
-    fn new(source: Box<dyn Source>, one_pad: bool) -> &'static Hub {
+    fn new(source: Box<dyn Source>, one_pad: bool, look: LookSettings) -> &'static Hub {
         let hub = Box::into_raw(Box::new(Hub {
             object: Object {
                 vtable: &INPUT,
@@ -398,6 +666,7 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                look: Look::new(look),
             }),
             returned: Condvar::new(),
         }));
@@ -413,7 +682,7 @@ impl Hub {
 
     /// A hub over the host's input, polled from now on.
     fn start(source: Box<dyn Source>) -> &'static Hub {
-        let hub = Hub::new(source, one_pad());
+        let hub = Hub::new(source, one_pad(), LookSettings::from_env());
         hub.poll();
         std::thread::spawn(move || {
             loop {
@@ -430,12 +699,14 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.mouse())
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
+        let events = self
+            .state()
+            .poll(&self.devices, self.one_pad, pads, keys, mouse);
         self.deliver(events);
     }
 
@@ -481,11 +752,15 @@ impl State {
         one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: MouseInput,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        // Every poll, so the stick comes to rest after the mouse stops.
+        let look = self.look.step(mouse.motion, now);
+        let stand_in = merged(fallback(&keys), mouse_pad(mouse, look));
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads.into_iter().flatten().fold(stand_in, merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -494,7 +769,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then_some(Value::Pad(stand_in));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -548,7 +823,7 @@ impl State {
 
 #[cfg(windows)]
 fn host() -> Box<dyn Source> {
-    Box::new(host::Host::default())
+    Box::new(host::Host::new(mouse_enabled()))
 }
 
 #[cfg(not(windows))]
@@ -560,6 +835,9 @@ fn host() -> Box<dyn Source> {
         }
         fn keys(&mut self) -> Vec<KeyState> {
             Vec::new()
+        }
+        fn mouse(&mut self) -> MouseInput {
+            MouseInput::default()
         }
         fn rumble(&mut self, _: usize, _: u16, _: u16) {}
     }
@@ -1114,14 +1392,17 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
-/// Host input: XInput pads, the keyboard while our process has focus.
+/// Host input: XInput pads, the keyboard while our process has focus, the
+/// mouse while captured in the title's window.
 #[cfg(windows)]
 mod host {
     use std::time::{Duration, Instant};
 
+    use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
+        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, VIRTUAL_KEY, VK_ESCAPE, VK_LBUTTON,
+        VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
     };
     use windows_sys::Win32::UI::Input::XboxController::{
         XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
@@ -1132,7 +1413,8 @@ mod host {
         XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
+        ClipCursor, GetClipCursor, GetCursorPos, GetForegroundWindow, GetWindowInfo,
+        GetWindowThreadProcessId, IsIconic, SetCursorPos, WINDOWINFO,
     };
 
     use super::*;
@@ -1174,9 +1456,19 @@ mod host {
         }
     }
 
-    #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// None with `VICTORY_MOUSE=0`.
+        mouse: Option<Mouse>,
+    }
+
+    impl Host {
+        pub(super) fn new(mouse: bool) -> Host {
+            Host {
+                empty_until: Default::default(),
+                mouse: mouse.then(Mouse::default),
+            }
+        }
     }
 
     impl Source for Host {
@@ -1235,6 +1527,12 @@ mod host {
                 .collect()
         }
 
+        fn mouse(&mut self) -> MouseInput {
+            self.mouse
+                .as_mut()
+                .map_or_else(MouseInput::default, Mouse::poll)
+        }
+
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
@@ -1287,13 +1585,153 @@ mod host {
             .collect()
     }
 
-    /// The foreground window is one of ours (the title's or our fallback).
-    fn focused() -> bool {
+    /// The foreground window when it is one of ours (the title's, our
+    /// fallback or a dialog).
+    fn foreground() -> Option<HWND> {
         let mut process = 0;
         // SAFETY: plain queries; a null window gives process 0.
         unsafe {
-            GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
-            process == GetCurrentProcessId()
+            let window = GetForegroundWindow();
+            GetWindowThreadProcessId(window, &mut process);
+            (process == GetCurrentProcessId()).then_some(window)
+        }
+    }
+
+    fn focused() -> bool {
+        foreground().is_some()
+    }
+
+    fn held(key: VIRTUAL_KEY) -> bool {
+        // SAFETY: a plain query.
+        unsafe { GetAsyncKeyState(i32::from(key)) < 0 }
+    }
+
+    /// The mouse in the title's window ([`Capture`]): the cursor is clipped
+    /// to the window and put back at its centre at every poll. Under Wine
+    /// the clip is also what makes the pointer's motion relative: while the
+    /// cursor is clipped, Wine grabs the pointer and moves the cursor by the
+    /// device's own motion, so an X server that cannot warp the host pointer
+    /// (Xwayland) still gives motion, and the desktop pointer stays in the
+    /// window.
+    #[derive(Default)]
+    pub(super) struct Mouse {
+        capture: Capture,
+        /// The clip we asked for, and the one the system made of it (it keeps
+        /// a clip on the screen), taken off again on release.
+        clip: Option<(Rect, Rect)>,
+    }
+
+    impl Mouse {
+        fn poll(&mut self) -> MouseInput {
+            let seen = see();
+            let input = self.capture.step(seen);
+            match self.capture.window {
+                Some(window) => self.hold(window, seen.cursor),
+                None => self.release(),
+            }
+            CAPTURED.store(self.capture.window.is_some(), Ordering::Relaxed);
+            input
+        }
+
+        fn hold(&mut self, window: Rect, cursor: (i32, i32)) {
+            // A pixel inside on every side: Wine takes a clip as large as
+            // the screen (a borderless window filling it) for no clip, and
+            // then does not grab the pointer.
+            let clip = Rect {
+                left: window.left + 1,
+                top: window.top + 1,
+                right: (window.right - 1).max(window.left + 2),
+                bottom: (window.bottom - 1).max(window.top + 2),
+            };
+            // The system takes a clip off when the foreground changes, so it
+            // is set again whenever it is not ours.
+            let ours = self
+                .clip
+                .filter(|&(asked, made)| asked == clip && current_clip() == Some(made));
+            if ours.is_none() {
+                let host = RECT {
+                    left: clip.left,
+                    top: clip.top,
+                    right: clip.right,
+                    bottom: clip.bottom,
+                };
+                // SAFETY: a valid rectangle.
+                unsafe { ClipCursor(&host) };
+                self.clip = Some((clip, current_clip().unwrap_or(clip)));
+            }
+            let (x, y) = window.center();
+            if cursor != (x, y) {
+                // SAFETY: a plain call; the point is inside the clip.
+                unsafe { SetCursorPos(x, y) };
+            }
+        }
+
+        fn release(&mut self) {
+            // Another program's clip is left alone.
+            if let Some((_, made)) = self.clip.take()
+                && current_clip() == Some(made)
+            {
+                // SAFETY: a null rectangle frees the cursor.
+                unsafe { ClipCursor(std::ptr::null()) };
+            }
+        }
+    }
+
+    fn current_clip() -> Option<Rect> {
+        let mut clip = RECT::default();
+        // SAFETY: room for the rectangle.
+        (unsafe { GetClipCursor(&mut clip) } != 0).then_some(rect(clip))
+    }
+
+    fn rect(r: RECT) -> Rect {
+        Rect {
+            left: r.left,
+            top: r.top,
+            right: r.right,
+            bottom: r.bottom,
+        }
+    }
+
+    /// The mouse as [`Capture`] sees it: nothing unless the foreground
+    /// window is a title window, so a dialog of ours never captures it.
+    fn see() -> Seen {
+        let Some(window) = foreground().filter(|&w| crate::modules::lifecycle::is_title_window(w))
+        else {
+            return Seen::default();
+        };
+        let mut info = WINDOWINFO {
+            cbSize: size_of::<WINDOWINFO>() as u32,
+            ..Default::default()
+        };
+        let mut cursor = POINT::default();
+        // SAFETY: plain queries into our own structures.
+        let (shown, known, found) = unsafe {
+            (
+                IsIconic(window) == 0,
+                GetWindowInfo(window, &mut info) != 0,
+                GetCursorPos(&mut cursor) != 0,
+            )
+        };
+        let client = info.rcClient;
+        if !shown || !known || !found || client.right <= client.left || client.bottom <= client.top
+        {
+            return Seen::default();
+        }
+        let buttons = [
+            (VK_LBUTTON, MOUSE_LEFT),
+            (VK_RBUTTON, MOUSE_RIGHT),
+            (VK_MBUTTON, MOUSE_MIDDLE),
+            (VK_XBUTTON1, MOUSE_BACK),
+            (VK_XBUTTON2, MOUSE_FORWARD),
+        ];
+        Seen {
+            window: Some(rect(client)),
+            cursor: (cursor.x, cursor.y),
+            buttons: buttons
+                .iter()
+                .filter(|(key, _)| held(*key))
+                .fold(0, |all, (_, bit)| all | bit),
+            escape: held(VK_ESCAPE),
         }
     }
 
@@ -1334,6 +1772,8 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        /// Buttons stay; motion is taken by one poll.
+        mouse: MouseInput,
         rumble: Vec<(usize, u16, u16)>,
     }
 
@@ -1346,6 +1786,13 @@ mod tests {
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
         }
+        fn mouse(&mut self) -> MouseInput {
+            let mouse = &mut self.0.lock().unwrap().mouse;
+            MouseInput {
+                motion: std::mem::take(&mut mouse.motion),
+                buttons: mouse.buttons,
+            }
+        }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
         }
@@ -1357,7 +1804,11 @@ mod tests {
 
     fn fake_with(one_pad: bool) -> (&'static Hub, Arc<Mutex<FakeHost>>) {
         let host = Arc::new(Mutex::new(FakeHost::default()));
-        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))), one_pad);
+        let hub = Hub::new(
+            Box::new(Fake(Arc::clone(&host))),
+            one_pad,
+            LookSettings::default(),
+        );
         hub.poll();
         (hub, host)
     }
@@ -1606,6 +2057,235 @@ mod tests {
         assert_eq!(pad(hub), PadState::default());
         assert_eq!(log.lock().unwrap().len(), 1);
         assert!(!hub.state().slots[2].connected);
+    }
+
+    #[test]
+    fn the_mouse_feeds_the_one_pad_beside_the_keyboard_and_host_pads() {
+        let (hub, host) = fake_with(true);
+        // As the title reads it: the current gamepad reading, any device.
+        let pad = |hub: &Hub| {
+            type Current = extern "system" fn(This, u32, *const Device, Out) -> HRESULT;
+            let mut out = std::ptr::null();
+            let hr = slot::<Current, _>(&hub.object, 0x20)(
+                &hub.object,
+                GAMEPAD_KIND,
+                std::ptr::null(),
+                &mut out,
+            );
+            let r = result(hr, out).unwrap();
+            let state = pad(r);
+            release(r);
+            state
+        };
+        // A host pad is connected: keys and the mouse still count.
+        host.lock().unwrap().pads[0] = Some(PadState {
+            left_x: -0.5,
+            ..Default::default()
+        });
+        host.lock().unwrap().keys = vec![key(b'W')];
+        host.lock().unwrap().mouse = MouseInput {
+            motion: (40, -10),
+            buttons: MOUSE_LEFT | MOUSE_RIGHT | MOUSE_MIDDLE,
+        };
+        hub.poll();
+        let p = pad(hub);
+        assert_eq!((p.left_x, p.left_y), (-0.5, 1.0));
+        assert_eq!(
+            (p.left_trigger, p.right_trigger, p.buttons),
+            (1.0, 1.0, RIGHT_STICK)
+        );
+        assert!(p.right_x > 0.265 && p.right_y > 0.0 && p.right_x > p.right_y);
+        // The mouse stops: the stick comes back to rest, exactly (each
+        // poll counts as 1 ms at least, so 400 are enough).
+        host.lock().unwrap().mouse = MouseInput::default();
+        for _ in 0..400 {
+            hub.poll();
+        }
+        let p = pad(hub);
+        assert_eq!((p.right_x, p.right_y, p.right_trigger), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn with_a_pad_of_its_own_per_host_pad_the_mouse_goes_with_the_stand_in() {
+        let (hub, host) = fake();
+        host.lock().unwrap().mouse.buttons = MOUSE_LEFT;
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(r).right_trigger, 1.0);
+        release(r);
+        host.lock().unwrap().pads[1] = Some(PadState::default());
+        hub.poll();
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
+        let r = current(hub, GAMEPAD_KIND, 1).unwrap();
+        assert_eq!(pad(r).right_trigger, 0.0);
+        release(r);
+    }
+
+    const WINDOW: Rect = Rect {
+        left: 100,
+        top: 50,
+        right: 900,
+        bottom: 650,
+    };
+
+    fn seen(cursor: (i32, i32), buttons: u8) -> Seen {
+        Seen {
+            window: Some(WINDOW),
+            cursor,
+            buttons,
+            escape: false,
+        }
+    }
+
+    #[test]
+    fn a_click_in_the_window_captures_the_mouse_and_esc_or_focus_releases_it() {
+        let center = WINDOW.center();
+        let mut capture = Capture::default();
+        // Moving and right-clicking does nothing; a left click outside the
+        // client area (the title bar) neither.
+        assert_eq!(
+            capture.step(seen((300, 300), MOUSE_RIGHT)),
+            MouseInput::default()
+        );
+        assert_eq!(capture.step(seen((300, 300), 0)), MouseInput::default());
+        assert_eq!(
+            capture.step(seen((300, 20), MOUSE_LEFT)),
+            MouseInput::default()
+        );
+        assert_eq!(capture.step(seen((300, 20), 0)), MouseInput::default());
+        assert!(capture.window.is_none());
+        // No click without the foreground: the host reports no buttons.
+        assert_eq!(capture.step(Seen::default()), MouseInput::default());
+        assert!(capture.window.is_none());
+
+        // A left click inside captures; it is no button press, and the
+        // first poll has no motion (the cursor goes to the centre).
+        assert_eq!(
+            capture.step(seen((300, 300), MOUSE_LEFT)),
+            MouseInput::default()
+        );
+        assert_eq!(capture.window, Some(WINDOW));
+        let at = |dx: i32, dy: i32| (center.0 + dx, center.1 + dy);
+        assert_eq!(capture.step(seen(at(5, -3), MOUSE_LEFT)).buttons, 0);
+        let input = capture.step(seen(at(7, 2), 0));
+        assert_eq!(
+            input,
+            MouseInput {
+                motion: (7, 2),
+                buttons: 0
+            }
+        );
+        // Buttons count from now on.
+        assert_eq!(
+            capture.step(seen(center, MOUSE_LEFT | MOUSE_BACK)).buttons,
+            MOUSE_LEFT | MOUSE_BACK
+        );
+
+        // Esc releases it.
+        let mut esc = seen(at(1, 1), 0);
+        esc.escape = true;
+        assert_eq!(capture.step(esc), MouseInput::default());
+        assert!(capture.window.is_none());
+        assert_eq!(
+            capture.step(seen(at(9, 9), MOUSE_RIGHT)),
+            MouseInput::default()
+        );
+
+        // Captured again, then the window loses the foreground.
+        capture.step(seen((300, 300), 0));
+        capture.step(seen((300, 300), MOUSE_LEFT));
+        assert!(capture.window.is_some());
+        assert_eq!(capture.step(Seen::default()), MouseInput::default());
+        assert!(capture.window.is_none());
+        // Back in the foreground the mouse stays free until a click.
+        assert_eq!(capture.step(seen(at(20, 0), 0)), MouseInput::default());
+        assert!(capture.window.is_none());
+    }
+
+    #[test]
+    fn a_moved_window_gives_no_motion_once() {
+        let mut capture = Capture::default();
+        capture.step(seen((300, 300), MOUSE_LEFT));
+        let moved = Rect {
+            left: WINDOW.left + 50,
+            right: WINDOW.right + 50,
+            ..WINDOW
+        };
+        let input = capture.step(Seen {
+            window: Some(moved),
+            cursor: WINDOW.center(),
+            buttons: 0,
+            escape: false,
+        });
+        assert_eq!(input.motion, (0, 0));
+        assert_eq!(capture.window, Some(moved));
+    }
+
+    #[test]
+    fn mouse_look_follows_the_mouse_speed_and_keeps_its_distance() {
+        let poll = POLL.as_micros() as u64;
+        let settings = LookSettings {
+            speed: 1.0,
+            dead_zone: 0.0,
+        };
+        let mut look = Look::new(settings);
+        // A steady speed settles at its deflection: 20 px in 8 ms is
+        // 2500 px/s, all the way; half of it, half way.
+        let mut stick = (0.0, 0.0);
+        for i in 1..=100 {
+            stick = look.step((10, -10), i * poll);
+        }
+        let half = 1250.0 / FULL_TILT;
+        assert!(
+            (stick.0 - half).abs() < 0.01 && (stick.1 - half).abs() < 0.01,
+            "{stick:?}"
+        );
+
+        // Motion arriving in bursts (once a title frame) turns the camera
+        // as far as the same motion spread evenly.
+        let turn = |bursts: bool| {
+            let mut look = Look::new(settings);
+            let mut sum = 0.0;
+            for i in 1..=400_u64 {
+                let motion = if i > 200 {
+                    0
+                } else if bursts {
+                    if i % 4 == 0 { 8 } else { 0 }
+                } else {
+                    2
+                };
+                sum += look.step((motion, 0), i * poll).0;
+            }
+            sum
+        };
+        let (even, bursts) = (turn(false), turn(true));
+        assert!((even - bursts).abs() / even < 0.02, "{even} {bursts}");
+
+        // A dead zone: the slightest motion clears it.
+        let mut look = Look::new(LookSettings::default());
+        let (x, y) = look.step((0, 1), poll);
+        assert!(x == 0.0 && (y + 0.265).abs() < 0.01, "{y}");
+        let (x, _) = Look::new(LookSettings::default()).step((1000, 0), poll);
+        assert_eq!(x, 1.0);
+    }
+
+    #[test]
+    fn mouse_settings_parse_with_defaults_for_bad_values() {
+        let default = LookSettings::default();
+        assert_eq!(LookSettings::parse(None, None), default);
+        assert_eq!(
+            LookSettings::parse(Some(" 2.5 "), Some("0.1")),
+            LookSettings {
+                speed: 2.5,
+                dead_zone: 0.1
+            }
+        );
+        for (speed, dead_zone) in [("0", "-0.1"), ("-1", "1"), ("fast", "inf"), ("NaN", "")] {
+            assert_eq!(LookSettings::parse(Some(speed), Some(dead_zone)), default);
+        }
     }
 
     #[test]
