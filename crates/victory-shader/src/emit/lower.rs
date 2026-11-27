@@ -8205,21 +8205,24 @@ impl<'a> Lower<'a> {
     /// The host's word for the buffer view `src` names: its stride and
     /// format kind ([`super::shader::SLOT_STRIDES`]); `tables`: of a view in
     /// a table too, not only of one picked from the heap. Either way the
-    /// slot is the one [`Self::handle`] reads the descriptor from.
+    /// slot is the one [`Self::handle`] reads the descriptor from. A view in
+    /// a table reads the word through [`super::shader::SLOT_VIEW_WORDS`], so
+    /// that the host does not take the shader for one that picks buffers
+    /// from the whole heap.
     fn slot_word(&mut self, src: &Source, tables: bool) -> Result<Option<V>, Why> {
         let Source::Loaded { load, first } = src else {
             return Ok(None);
         };
-        let heap = self
+        let root = self
             .scalar
             .get(load)
             .and_then(|a| self.x.native.layout.get(a.param))
-            .is_some_and(|p| {
-                p.root == RootType::ResourceHeap || tables && p.root == RootType::Table
-            });
-        if !heap {
-            return Ok(None);
-        }
+            .map(|p| p.root);
+        let words = match root {
+            Some(RootType::ResourceHeap) => super::shader::SLOT_STRIDES,
+            Some(RootType::Table) if tables => super::shader::SLOT_VIEW_WORDS,
+            _ => return Ok(None),
+        };
         let key = (self.cur, *load, *first);
         if let Some(&v) = self.strides.get(&key) {
             return Ok(Some(v));
@@ -8234,7 +8237,7 @@ impl<'a> Lower<'a> {
         self.s.m.tag(slot, Tag::Clamp);
         let two = self.s.m.i32(2);
         let byte = self.s.m.bin(c, Bin::Shl, slot, two);
-        let h = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
+        let h = self.s.root_srv_handle(words);
         let iu = self.s.m.undef(self.s.t.i32);
         let mask = self.s.m.i8(1);
         let align = self.s.m.i32(4);

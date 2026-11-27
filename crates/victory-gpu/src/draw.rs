@@ -1737,6 +1737,24 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_WORDS {
+                        // Ours: the same table, for the word of a view in a
+                        // table only. The heap pass is not this shader's to
+                        // run: it would spend the frame's once on a shader
+                        // that reads no buffer picked from the heap.
+                        match self.view_words(list) {
+                            // SAFETY: an open list; the list holds the table.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => once!("a shader asks the kind of a view in a table without a view heap"),
+                        }
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
@@ -2017,6 +2035,35 @@ impl State {
         true
     }
 
+    /// The view heap set (not the sampler heap).
+    fn view_heap(&self) -> Option<&crate::descriptor::Heap> {
+        self.heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())
+    }
+
+    /// For a shader that asks the word of a view in a table
+    /// (`victory_shader::emit::SLOT_VIEW_WORDS`): the GPU address of the
+    /// heap's table of strides, held by `list`, and nothing else. The words
+    /// of title slots and of a fresh table's slots are written as their
+    /// views are; the heap pass ([`Self::heap_buffers`]) is left to the
+    /// shaders that pick buffers from the heap.
+    fn view_words(&self, list: &HostList) -> Option<u64> {
+        let host = self.view_heap()?.host()?;
+        let gpu = host.strides_gpu()?;
+        // A key of its own (the table's GPU address is aligned; tagged apart
+        // from `heap_buffers`' per-heap key), so holding the table here does
+        // not count as that pass's first use in the list.
+        if list.first_use(gpu as usize | 2)
+            && let Some(buffer) = host.strides_buffer()
+        {
+            list.keep(buffer);
+        }
+        Some(gpu)
+    }
+
     /// For a shader that picks buffers from the view heap by an index it
     /// computes (SM 6.6 dynamic resources): the GPU address of the heap's
     /// table of element strides, with every buffer view of the heap given
@@ -2029,12 +2076,7 @@ impl State {
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
-        let heap = self
-            .heaps
-            .iter()
-            .filter(|&&h| h != 0)
-            .map(|&h| crate::descriptor::heap(h as This))
-            .find(|h| !h.samplers())?;
+        let heap = self.view_heap()?;
         let host = heap.host()?;
         let gpu = host.strides_gpu()?;
         // One key per list, as textures have: no title resource is there.

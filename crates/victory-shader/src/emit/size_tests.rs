@@ -374,21 +374,33 @@ fn a_tables_raw_buffer_is_read_at_its_raw_twin() {
 /// of strides for the view's kind, as one to a view picked from the heap
 /// does: through an integer format the halves are bits, not f16 (the face
 /// network's views of halves are in tables; its result was all zeros and
-/// faces stood still). Other typed accesses do not ask.
+/// faces stood still). Other typed accesses do not ask. Through a table it
+/// asks by `SLOT_VIEW_WORDS`, not `SLOT_STRIDES`: the latter tells the host
+/// to run the heap pass, once a frame, and a shader that picks no buffer
+/// from the heap ran it early, before the shaders that do (picked from the
+/// heap, the access still asks by `SLOT_STRIDES`).
 #[test]
 fn a_d16_typed_access_through_a_table_asks_the_views_kind() {
-    use super::SLOT_STRIDES;
-    let load = |op: u32| {
+    use super::{SLOT_STRIDES, SLOT_VIEW_WORDS};
+    // s_load_dwordx4 s[8:11], s[2:3], 0: the table's first view.
+    const FROM_TABLE: &[u32] = &[0xF408_0201, 0xFA00_0000];
+    // s_load_dwordx4 s[8:11], s[6:7], s12: entry 1 of the view heap.
+    const FROM_HEAP: &[u32] = &[
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xBE8C_03A0, // s_mov_b32 s12, 32
+        0xF408_0203,
+        0x1800_0000,
+    ];
+    let load = |from: &[u32], op: u32| {
         let words = [
-            0xF408_0201u32, // s_load_dwordx4 s[8:11], s[2:3], 0
-            0xFA00_0000,
-            0x7E02_0280, // v_mov_b32 v1, 0
-            op,          // buffer_load_format(_d16)_xy v2, v1, s[8:11], 0 idxen
+            0x7E02_0280u32, // v_mov_b32 v1, 0
+            op,             // buffer_load_format(_d16)_xy v2, v1, s[8:11], 0 idxen
             0x8002_0201,
             0x7E08_0502, // v_readfirstlane_b32 s4, v2
             0xBE85_0380, // s_mov_b32 s5, 0
         ];
-        build(&[TABLE, &words, STORE].concat(), (4, 0)).expect("translates")
+        build(&[TABLE, from, &words, STORE].concat(), (4, 0)).expect("translates")
     };
     let store = |op: u32| {
         let words = [
@@ -401,13 +413,16 @@ fn a_d16_typed_access_through_a_table_asks_the_views_kind() {
         ];
         build(&[TABLE, &words].concat(), (4, 0)).expect("translates")
     };
-    for (label, shader, d16) in [
-        ("load d16", load(0xE204_2000), true),
-        ("load", load(0xE004_2000), false),
-        ("store d16", store(0xE21C_2000), true),
-        ("store", store(0xE01C_2000), false),
+    // (shader, binds `SLOT_VIEW_WORDS`, binds `SLOT_STRIDES`)
+    for (label, shader, words, strides) in [
+        ("load d16", load(FROM_TABLE, 0xE204_2000), true, false),
+        ("load", load(FROM_TABLE, 0xE004_2000), false, false),
+        ("store d16", store(0xE21C_2000), true, false),
+        ("store", store(0xE01C_2000), false, false),
+        ("heap load d16", load(FROM_HEAP, 0xE204_2000), false, true),
     ] {
-        let strides = shader.root_srvs.contains(&SLOT_STRIDES);
-        assert_eq!(strides, d16, "{label}: {:?}", shader.root_srvs);
+        let srvs = &shader.root_srvs;
+        assert_eq!(srvs.contains(&SLOT_VIEW_WORDS), words, "{label}: {srvs:?}");
+        assert_eq!(srvs.contains(&SLOT_STRIDES), strides, "{label}: {srvs:?}");
     }
 }

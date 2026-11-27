@@ -20,10 +20,14 @@ stopped and pick up where they left off later.
 One machine, November 2026: CachyOS, Radeon RX 9070 XT, Ryzen 9 9950X3D,
 RADV (Mesa 26.3.1), Proton Experimental `experimental-11.0-20261112`, a
 private `wineserver` build in place of Proton's (`RUN_LINUX_WINESERVER`),
-`/dev/ntsync`, an app-local vkd3d-proton 3.2.0 build matched to that Proton,
-and a native `d3dcompiler_47.dll`. Logs, images and saves are not
-published. The tested wineserver indexes views by address using the approach
-in [Wine's memory-view change](https://github.com/wine-mirror/wine/commit/3217449b),
+`/dev/ntsync`, an app-local, patched vkd3d-proton build matched to that
+Proton, and a native `d3dcompiler_47.dll`. Logs, images and saves are not
+published. The vkd3d-proton build is upstream 2576c0b4 (Meson version 3.2.0,
+build id `v3.1-56-g2576c0b4+`) with dxil-spirv at 114e664e and a local
+backport of e084e35c, whose two fixups touch dxil-spirv's legacy structurizer,
+for the renderer's shaders. It is the one tested setup, not a requirement.
+The tested wineserver indexes views by address using the approach in
+[Wine's memory-view change](https://github.com/wine-mirror/wine/commit/3217449b),
 backported to the Wine revision in that Proton build.
 
 ### Series S at 1920x1080
@@ -141,14 +145,15 @@ The 29.9 and 30.0 FPS first-room medians above came from earlier, lighter
 tests at the checkpoint. Holding 30 FPS in the heavier shot is still an
 open goal.
 
-Faces were missing in this replay. With the d16 fix in 1430f61, which reads
-a view's kind from its table, mouths move again when faces render. Jaws can
-still look distorted, and some face meshes still go missing at times. In a
-diagnostics build in the same session, some face meshes were already
-missing with the fog workaround off and stayed missing after it was turned
-on and off again. The workaround removes the whole quarter-resolution
-radiance term, and where each of these symptoms starts is still being
-narrowed down.
+Faces were missing in this replay, so it shows nothing of how they move.
+In other replays with the d16 fix in 1430f61, which reads a view's kind
+from its table, and with face meshes visible, mouths were seen moving
+again. Jaws there can still look distorted, and some face meshes still go
+missing at times. In a diagnostics build in the same session, some face
+meshes were already missing with the fog workaround off and stayed missing
+after it was turned on and off again. The workaround removes the whole
+quarter-resolution radiance term, and where each of these symptoms starts
+is still being narrowed down.
 
 ### Earlier result, Series X
 
@@ -184,7 +189,8 @@ None of these ship with the repository. Point the script at your own copies.
   provides the DLLs.
 - **vkd3d-proton** (`VKD3D_DLLS`, a folder with `d3d12.dll` and
   `d3d12core.dll`). The default is the copy inside Proton. The tested runs
-  used a separate build matched to the Proton above.
+  used a separate, patched build matched to the Proton above (see "Tested
+  result").
 - **A native `d3dcompiler_47.dll`** (`D3DCOMPILER`; default
   `~/.cache/winetricks/d3dcompiler_47/d3dcompiler_47.dll`, where winetricks
   keeps it). VIctory compiles HLSL at run time, and every tested run used the
@@ -243,8 +249,11 @@ the sandbox, `victory.exe` sees `VICTORY_DATA_DIR=Z:\state\data` and
 `VICTORY_CACHE_DIR=Z:\state\cache\victory`, where it cannot tell whether
 they are in a checkout. So before anything is written, the script resolves
 the three folders on the host (through symbolic links too) and stops if one
-is inside a VIctory checkout, holds one, or overlaps the title's folder, a
-shader input, `victory.exe`, a DLL or Proton.
+is in a VIctory checkout (a `.victory-root` in that folder or a folder above
+it), or overlaps, by holding it or lying in it, the checkout the script runs
+from, the title's folder, a shader input, `victory.exe`, a DLL or Proton. It
+does not search a folder for other checkouts inside it: a writable folder
+that holds some other checkout passes.
 
 `shaders --list FILE` writes FILE on the host, only when the command
 succeeds: the list is made in the cache and then replaces FILE. Until then
