@@ -608,12 +608,36 @@ enum To {
     Buffer(ID3D12Resource),
 }
 
+/// Whether `between` is also left readable by shaders as a resource
+/// (`VICTORY_CARD_STEPS_SRV=1`; off by default), for an A/B on the card.
+///
+/// Why: a fill's slot is a constant buffer view of `between`, and
+/// `constant_at` makes its raw twin a raw buffer view of the same bytes.
+/// Translated shaders read the twin where a table's entry is a raw buffer,
+/// and every table's constant buffer through it with renderer port 5
+/// (`VICTORY_PORT_CBV=1`). Our list and the lists of the submission's
+/// first part go to the card in one `ExecuteCommandLists`, and a buffer
+/// decays to the common state only at the end of one: those lists find
+/// `between` in the state [`record`] left, which without this has no
+/// shader resource bit for a read through the twin.
+fn srv() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_CARD_STEPS_SRV").is_ok_and(|v| v == "1"))
+}
+
+/// The state [`record`] leaves `between` in: a copy's source and constants,
+/// and with `srv` ([`srv`]) a shader resource of every stage too.
+fn readable(srv: bool) -> D3D12_RESOURCE_STATES {
+    let constants = D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+    if srv { constants | D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE } else { constants }
+}
+
 /// Records a level of what [`stage`] describes into `list` (open): `reads`
 /// are copied into `between` (source, offset in it, offset in `between`,
 /// bytes), then `writes` out of it (destination, offset in it, offset in
-/// `between`, bytes). `between` is left readable as constants (and must be
-/// so, unless this is the `first` level), the others in the common state,
-/// as the submission's lists expect them.
+/// `between`, bytes). `between` is left [`readable`] (and must be so,
+/// unless this is the `first` level), the others in the common state, as
+/// the submission's lists expect them.
 fn record(
     first: bool,
     list: &ID3D12GraphicsCommandList,
@@ -633,7 +657,7 @@ fn record(
         }
     }
     let both = |b: &ID3D12Resource| dests.iter().any(|d| d.as_raw() == b.as_raw());
-    let constants = source | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+    let constants = readable(srv());
     let mut barriers = vec![transition(between, dest, constants)];
     barriers.extend(sources.iter().map(|b| transition(b, source, if both(b) { dest } else { common })));
     let done: Vec<D3D12_RESOURCE_BARRIER> = dests.iter().map(|b| transition(b, dest, common)).collect();
@@ -1337,6 +1361,110 @@ mod tests {
         POOL.lock().unwrap().push(own);
         let own = host.own_list().unwrap();
         own.list.close();
+    }
+
+    /// Only with `VICTORY_CARD_STEPS_SRV=1` does `between` stay readable
+    /// through a raw view, and either way as constants and a copy's source.
+    #[test]
+    fn the_buffer_between_is_a_shader_resource_only_when_asked() {
+        let all = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE.0;
+        let constants = (D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER).0;
+        assert_eq!(readable(false).0, constants);
+        assert_eq!(readable(true).0, constants | all);
+    }
+
+    /// What our list puts into `between` is read, through a raw view of it
+    /// made as `constant_at` makes a fill's twin, by a shader of a list that
+    /// follows it in the same `ExecuteCommandLists`, as a title's list of the
+    /// submission's first part does. `between` is in the state [`record`]
+    /// left: with `VICTORY_CARD_STEPS_SRV=1` one that allows the read. (The
+    /// bytes are checked either way; the layer's GPU-based validation runs
+    /// without state tracking, so it does not tell the two apart.)
+    #[test]
+    fn a_raw_view_of_the_buffer_between_reads_what_our_list_put() {
+        use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DBlob};
+        const AT: u64 = 512;
+        const LEN: u64 = 256;
+        const SOURCE: &str = "#define RS \"DescriptorTable(SRV(t0)), UAV(u0)\"\nByteAddressBuffer s : register(t0);\n\
+            RWByteAddressBuffer o : register(u0);\n[RootSignature(RS)]\n[numthreads(64, 1, 1)]\n\
+            void main(uint i : SV_DispatchThreadID) { o.Store(4 * i, s.Load(4 * i)); }\n";
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let (a, a_data) = host.shared_buffer(1 << 16).unwrap();
+        let (out, out_data) = host.shared_buffer(LEN).unwrap();
+        // SAFETY: mappings of 64 KiB and `LEN` bytes.
+        let (a_bytes, out_bytes) =
+            unsafe { (std::slice::from_raw_parts_mut(a_data, 1 << 16), std::slice::from_raw_parts_mut(out_data, LEN as usize)) };
+        for (i, x) in a_bytes.iter_mut().enumerate() {
+            *x = (i * 7 + i / 253) as u8;
+        }
+        out_bytes.fill(0xee);
+        let own = host.own_list().unwrap();
+        // A fill: what the title's list reads, from `a` into `between`.
+        record(true, &own.list.list, &own.between, &[(&a, 4000, AT, LEN)], &[]);
+        own.list.close();
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call; then the
+        // blob's own bytes, which hold the root signature too; a heap of one
+        // slot, the view inside `between`.
+        let (root, pso, heap): (ID3D12RootSignature, ID3D12PipelineState, ID3D12DescriptorHeap) = unsafe {
+            let (name, entry, target) = (windows::core::s!("between"), windows::core::s!("main"), windows::core::s!("cs_5_1"));
+            D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), name, None, None, entry, target, 0, 0, &mut code, None).unwrap();
+            let code = code.unwrap();
+            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+                    ..Default::default()
+                })
+                .unwrap();
+            let heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .unwrap();
+            let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: AT / 4,
+                        NumElements: (LEN / 4) as u32,
+                        StructureByteStride: 0,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    },
+                },
+            };
+            host.device.CreateShaderResourceView(&own.between, Some(&raw), heap.GetCPUDescriptorHandleForHeapStart());
+            (root, pso, heap)
+        };
+        // The title's list: no barrier of its own for `between`.
+        let title = host.new_list().unwrap();
+        // SAFETY: an open list; live objects, the view and `out` hold what
+        // the dispatch reads and writes.
+        unsafe {
+            title.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            title.list.SetComputeRootSignature(&root);
+            title.list.SetPipelineState(&pso);
+            title.list.SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+            title.list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            title.list.Dispatch(1, 1, 1);
+        }
+        title.close();
+        // One call, waited for.
+        host.execute(&[&own.list, &title]);
+        assert_eq!(host.log_messages(), None);
+        assert_eq!(out_bytes, &a_bytes[4000..4000 + LEN as usize], "VICTORY_CARD_STEPS_SRV={}", srv());
+        POOL.lock().unwrap().push(own);
     }
 
     /// The whole way, in a process of its own with the relay on:
