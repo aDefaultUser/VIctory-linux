@@ -63,24 +63,57 @@ The three settings are optional.
   candidates for GPU memory, within the card's buffer budget. The automatic
   minimum with a 2 GiB budget is 4 MiB.
 
-#### The brown veil in rooms
+#### Brown haze in a day room
 
-`VICTORY_FOG_INPUT=radiance` is a targeted workaround for this profile
-(Series S, a 1280x720 picture inside a 1920x1080 window). It is off by
-default and is not part of the script's defaults.
+`VICTORY_FOG_INPUT=radiance` is an opt-in workaround, measured in one scene
+on one machine.
 
 The title's fog composite reads a quarter-resolution radiance texture.
 This setting makes that one input read as zeros, only in the composite's
 own freshly made descriptor table. The title's descriptors, other programs
-and cache keys are not changed. It applies only when the program's
+and cache keys stay as they were. It applies only when the program's
 resources and views match the recorded layout, and otherwise logs why once
 and changes nothing.
 
-With a fixed camera in one room on one machine, the veil cleared with this
-setting alone, with the scattered light left on, and it stayed when only
-the scattered light was zeroed. The fog's density and the normal scattering
-are kept, but everything the radiance input adds is removed, not just the
-excess. Why that input is too bright is still under investigation.
+As a Series S with a 1280x720 internal picture shown at 1920x1080, on the
+RX 9070 XT above, the setting cleared a dense haze in a day room with a
+fixed camera and the normal scattering left on. The haze stayed when only
+the scattered light was zeroed. The setting removes one full
+quarter-resolution radiance contribution, so any correct light from that
+input is lost as well. Why that input is too bright is still under
+investigation.
+
+#### Large stray triangles
+
+A heavier shot than the first-room readings above drew large stray
+triangles in some frames. Its numbers stand apart from those readings. The
+A/B used one executable and one fixed camera at 6,915 draws per frame, with
+the script's `VICTORY_CARD_STEPS=2` and two added settings.
+`VICTORY_CARD_STEPS_GUARD=1` makes a submission wait as before when one of
+its copies needs flights landed first, and `VICTORY_CARD_STEPS_SRV=1` keeps
+the buffer between readable by shaders. The table adds at most one wait to
+those.
+
+| Wait | Frames with large triangles | Median frame time per phase |
+|---|---|---|
+| neither | 9 of 666 | 38.9–42.3 ms |
+| `VICTORY_CARD_STEPS_WAIT=1` | 0 of 340 | 48.6 ms |
+| `VICTORY_UNDER_WRITES_WAIT=1` | 0 of 733 | 57.8–61.8 ms |
+
+No captured frame showed the triangles with either wait, and the card-steps
+wait cost less. `VICTORY_CARD_STEPS=0` was also measured, with no
+triangles in 520 frames at about 20 to 21 FPS. A run with the guard, the
+shader-readable buffer and the shorter wait looks like this.
+
+```sh
+RUN_LINUX_EXE=target/x86_64-pc-windows-msvc/release/victory.exe \
+RUN_LINUX_CONSOLE=series-s \
+  scripts/run-linux.sh run "$HOME/Games/Title" Title.exe \
+  VICTORY_CARD_STEPS_GUARD=1 VICTORY_CARD_STEPS_SRV=1 VICTORY_CARD_STEPS_WAIT=1
+```
+
+All three settings are opt-in and were measured in this one shot on this
+one machine.
 
 ### Earlier result, Series X
 
