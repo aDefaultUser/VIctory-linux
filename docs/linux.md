@@ -1,282 +1,324 @@
 # Running under Wine on Linux
 
-Tested on one machine (2026-11-25): CachyOS, kernel 7.3.5, Radeon RX 9070 XT
-(RADV, Mesa 26.3.1), system Wine 11.22, and Proton Experimental
-`experimental-11.0-20261112` (Wine 11.0, vkd3d-proton 2576c0b4).
-`scripts/run-linux.sh` starts a title with the settings below.
-
-## Latest tested runs
-
-The opening cutscene and first room ran on both runtimes. In the cold runs
-at `2d0c444`, clothes and parts of the room rendered, but faces were
-missing. Replays with the graphics cache from those runs restored faces in
-the cutscene and the player's head and hair in the first room at `36f8a35`.
-The renderer was the same in both builds. Both replays accepted camera
-input and completed without a GPU fault. Some lighting and materials still
-varied between runs.
-
-| Runtime | Prior-run pipelines on the early list |
-|---|---:|
-| Proton Experimental 11.0 | 1,979 |
-| System Wine 11.22 | 1,842 |
-
-The hardware runs used a direct launcher and a private Xwayland server with
-these settings.
-
-- a vkd3d-proton build with the matching dxil-spirv backport (see "Three
-  compute pipelines vkd3d-proton cannot make")
-- `RADV_DEBUG=zerovram`
-- `VICTORY_BAKE_TEXTURES_MS=1500`
-- `VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=0 VICTORY_LATE_WAIT=0`
-- `VICTORY_HEAP_SYNC_TABLES` unset, so only table slots whose host slot does
-  not show their record are mirrored (the default)
-
-These runs cover the opening. Later scenes, native Windows behavior and
-performance with default settings remain unverified.
-
-The command below applies those settings through the script. A separate
-140-second smoke test with the Proton script warmed the cache and entered the
-prologue without a GPU fault. Set `VKD3D_DLLS` to the folder holding your
-patched build's `d3d12.dll` and `d3d12core.dll`.
+`scripts/run-linux.sh` runs the Windows build of `victory.exe` under Proton's
+Wine (or the system's) in a [bubblewrap](https://github.com/containers/bubblewrap)
+sandbox without network. It has three commands that share one set of DLLs,
+caches and settings:
 
 ```sh
-VICTORY_WARM=1 VICTORY_WINE=proton \
-VKD3D_DLLS="$HOME/vkd3d-proton-e084e35c" \
-PROTON_WINE_LIBS="$HOME/.local/share/Steam/steamapps/common/Proton - Experimental/files/lib/wine" \
-  scripts/run-linux.sh target/x86_64-pc-windows-msvc/release/victory.exe \
-  "$HOME/Games/Title" "Title.exe" \
-  VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=0 VICTORY_LATE_WAIT=0
+scripts/run-linux.sh shaders <shader archives or folders>... [--jobs N] [--list FILE]
+scripts/run-linux.sh warm --used [--jobs N]
+scripts/run-linux.sh run <title folder> <title exe>
 ```
 
-Drop `VICTORY_WINE=proton` for system Wine. Keep the same state directory
-across runs. The layer records graphics pipelines as the title uses them,
-then starts those pipelines early on the next launch. If the first run
-shows missing faces, let the opening finish, then restart with the same
-cache. The exact cause of the cold-run face loss is still open.
+`shaders` and `warm` are `victory shaders` and `victory warm` (see the
+README's "How to run it"), run ahead of time in the same sandbox. Both can be
+stopped and pick up where they left off later.
 
-Other observations from the opening:
+## Tested result
 
-- **Logo movie.** Near 30 frames per second in sampled intervals with frame
-  capture turned off, under both system Wine and Proton (earlier builds).
-- **Loading screen.** Texture preparation for the character bake still
-  causes stutter (next section).
-- **Bright frames in the intro.** Some of them are an authored title card. A
-  short bright fade of the window has not been shown to be a bug.
+One machine, November 2026: CachyOS, Radeon RX 9070 XT, Ryzen 9 9950X3D,
+RADV (Mesa 26.3.1), Proton Experimental `experimental-11.0-20261112`, a
+private `wineserver` build in place of Proton's (`RUN_LINUX_WINESERVER`),
+`/dev/ntsync`, an app-local, patched vkd3d-proton build matched to that
+Proton, and a native `d3dcompiler_47.dll`. Logs, images and saves are not
+published. The vkd3d-proton build is upstream 2576c0b4 (Meson version 3.2.0,
+build id `v3.1-56-g2576c0b4+`) with dxil-spirv at 114e664e. For the
+renderer's shaders it adds a local backport of e084e35c, whose two fixups
+touch dxil-spirv's legacy structurizer. The tested wineserver indexes views
+by address using the approach in
+[Wine's memory-view change](https://github.com/wine-mirror/wine/commit/3217449b),
+backported to the Wine revision in that Proton build.
 
-## Texture uploads before the character bake
+### Series S at 1920x1080
 
-While it loads, the title bakes its characters' skin and decorations, and
-just before each bake draw the layer uploads textures the bake may pick.
-`VICTORY_BAKE_TEXTURES_MS` is how many milliseconds of upload work that pass
-may take there. The script's default is 1500 under both system Wine and
-`VICTORY_WINE=proton`, the same as the layer's own default without the
-script. A value in the environment replaces the script's default (an empty
-value keeps 1500), and a `VICTORY_BAKE_TEXTURES_MS=...` argument after the
-executable name wins over both. `0` turns the pass off. A shorter budget such
-as `VICTORY_BAKE_TEXTURES_MS=60` still works when given explicitly.
+A plain release build of d9dfc31 (see "What it needs"), as a Series S, with
+three settings after the script's defaults:
 
-Two Proton Experimental runs on November 25, 2026 compared 60 and 1500
-with an empty early pipeline list and the same renderer. With 60, 40,000 to
-45,000 texture slots were still waiting during the cutscene, and world
-detail was missing. With 1500, more textures were uploaded during the bake,
-and the courtyard walls and ground rendered in the corresponding shot.
-Faces were missing at both budgets.
+```sh
+RUN_LINUX_EXE=target/x86_64-pc-windows-msvc/release/victory.exe \
+RUN_LINUX_CONSOLE=series-s \
+  scripts/run-linux.sh run "$HOME/Games/Title" Title.exe \
+  VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_UNDER_FUSED=0 VICTORY_PLACEHOLDER_RANGES=1
+```
 
-The earlier speed comparison still holds for what it tested: in one matched
-Proton Experimental A/B with a warmed cache and frame capture off, 60 against
-1500 raised the slowest five-second sample of the loading screen from 4.2 to
-14.9 frames per second and the median from 20 to 23, and the first room
-looked the same. The default favours complete textures over that speed, so
-the loading-screen stutter remains. In the separate Proton script smoke test,
-one loading interval still dipped to 1.6 frames per second. Under system Wine
-one run with 60 reached the first room but still dropped to 2.5 frames per
-second while loading; there is no matched comparison there.
+- **First room:** a median of 29.9 FPS across six readings after camera
+  input, and 30.0 FPS across twelve readings after stepping and turning.
+  Readings were logged about five seconds apart.
+- **Faces rendered** in that camera check. Other camera views in the
+  first room measured about 24 to 26 FPS. In some replays of the same
+  checkpoint, faces were missing in both the opening and first room.
+- The card's buffer budget was left to its automatic size, which was 2 GiB
+  on this card. `VICTORY_CARD_BUFFERS_MB` was not set.
+
+In an A/B with one diagnostics build, `VICTORY_PLACEHOLDER_RANGES=1` raised
+the median from 22.5 to 28.45 frames per second and cut the per-frame
+refresh time the diagnostics report from 25.6 to 9.6 ms.
+
+The three settings are optional.
+
+- `VICTORY_PLACEHOLDER_RANGES=1` has the runtime tell the guards which
+  memory is a placeholder, since Wine will not answer that question. It is
+  off by default.
+- `VICTORY_UNDER_FUSED=0` was used in runs that restored faces. The two
+  buffer update paths produce identical outputs in unit tests, and faces
+  can still be missing with this setting.
+- `VICTORY_CARD_BUFFERS_MIN_MB=1` makes eligible buffers of at least 1 MiB
+  candidates for GPU memory, within the card's buffer budget. The automatic
+  minimum with a 2 GiB budget is 4 MiB.
+
+#### Brown haze in a day room
+
+`VICTORY_FOG_INPUT=radiance` is an opt-in workaround, measured in one scene
+on one machine.
+
+The title's fog composite reads a quarter-resolution radiance texture.
+This setting makes that one input read as zeros, only in the composite's
+own freshly made descriptor table. It applies only when the program's
+resources and views match the recorded layout, and otherwise logs why once
+and changes nothing.
+
+As a Series S with a 1280x720 internal picture shown at 1920x1080, on the
+RX 9070 XT above, the setting cleared a dense haze in a day room with a
+fixed camera and the normal scattering left on. The haze stayed when only
+the scattered light was zeroed. The setting removes one full
+quarter-resolution radiance contribution, so any correct light from that
+input is lost as well. Why that input is too bright is still under
+investigation.
+
+#### Large stray triangles
+
+A heavier shot than the first-room readings above drew large stray
+triangles in some frames. The A/B used one executable and one fixed
+camera at 6,915 draws per frame, with the script's `VICTORY_CARD_STEPS=2`
+and two added settings.
+`VICTORY_CARD_STEPS_GUARD=1` makes a submission wait as before when one of
+its copies needs flights landed first, and `VICTORY_CARD_STEPS_SRV=1` keeps
+the buffer between readable by shaders. The table adds at most one wait to
+those.
+
+| Wait | Frames with large triangles | Median frame time per phase |
+|---|---|---|
+| neither | 9 of 666 | 38.9–42.3 ms |
+| `VICTORY_CARD_STEPS_WAIT=1` | 0 of 340 | 48.6 ms |
+| `VICTORY_UNDER_WRITES_WAIT=1` | 0 of 733 | 57.8–61.8 ms |
+
+No captured frame showed the triangles with either wait, and the card-steps
+wait cost less. `VICTORY_CARD_STEPS=0` was also measured, with no
+triangles in 520 frames at about 20 to 21 FPS. A run with the guard, the
+shader-readable buffer and the shorter wait looks like this.
+
+```sh
+RUN_LINUX_EXE=target/x86_64-pc-windows-msvc/release/victory.exe \
+RUN_LINUX_CONSOLE=series-s \
+  scripts/run-linux.sh run "$HOME/Games/Title" Title.exe \
+  VICTORY_CARD_STEPS_GUARD=1 VICTORY_CARD_STEPS_SRV=1 VICTORY_CARD_STEPS_WAIT=1
+```
+
+All three settings are opt-in and were measured in this one shot on this
+one machine.
+
+#### A scoped quality profile
+
+The fog workaround and the three card-steps settings were tested together
+as one opt-in profile, in the environment above on the one Radeon PC. A
+plain Windows release build of 6f85e21 ran as a Series S with a 1280x720
+internal picture at 1920x1080, with the ambient light and the scattering at
+their defaults. The four settings follow the three 1080p performance
+settings above.
+
+```sh
+RUN_LINUX_EXE=target/x86_64-pc-windows-msvc/release/victory.exe \
+RUN_LINUX_CONSOLE=series-s \
+  scripts/run-linux.sh run "$HOME/Games/Title" Title.exe \
+  VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_UNDER_FUSED=0 VICTORY_PLACEHOLDER_RANGES=1 \
+  VICTORY_FOG_INPUT=radiance VICTORY_CARD_STEPS_GUARD=1 VICTORY_CARD_STEPS_SRV=1 \
+  VICTORY_CARD_STEPS_WAIT=1
+```
+
+With a fixed camera, the day room stayed clear of the brown haze and none
+of 1,040 captured frames over 52 seconds showed large triangles, at 7,392
+draws per frame. The median was 19.8 FPS across 11 readings about five
+seconds apart. In the first room the median was 23.5 FPS across six
+readings after moving and turning.
+
+The 29.9 and 30.0 FPS first-room medians above came from earlier, lighter
+tests at the checkpoint. Holding 30 FPS in the heavier shot is still an
+open goal.
+
+Faces were missing in this replay, so it shows nothing of how they move.
+Mouths were seen moving again in earlier replays that had face meshes
+visible and the d16 fix in 1430f61, which reads a view's kind from its
+table. Jaws in those replays can still look distorted, and some face meshes
+still go missing at times. In a diagnostics build in the same session,
+some face meshes were already missing with the fog workaround off and
+stayed missing after it was turned on and off again. The workaround
+removes the whole quarter-resolution radiance term, and where each of these
+symptoms starts is still being narrowed down.
+
+### Earlier result, Series X
+
+The script's defaults, as a Series X: medians of 23.1 frames per second over
+14 readings in the opening and 22.3 over six readings in the first
+room, starting from a private checkpoint in a save the tester made. The
+camera responded to input, and **face textures were missing**.
 
 ## What it needs
 
-- **The executable built for Windows**, cross-built as described in the next
-  section.
-- **vkd3d-proton and DXVK's dxgi** as native DLLs beside the executable. The
-  script takes them from a Proton install.
-- **A native `d3dcompiler_47.dll`.** The layer compiles HLSL of its own at run
-  time, and Wine's compiler is reported to refuse it (fork issue #6). Not
-  checked here: every run used the native one.
-- **`RADV_DEBUG=zerovram`.** Without it the 3D world is one flat colour (white,
-  then black). The layer relies on new committed resources reading as zero,
-  which Direct3D 12 promises. On this machine vkd3d-proton and RADV hand out
-  video memory that still holds what was in it before, and the title's lighting
-  reads textures before their first write. With the switch RADV zeroes every
-  allocation. Where exactly the zeroing is lost (vkd3d-proton's
-  zero-initialisation path, RADV on this card, or the kernel) is not known.
+None of these ship with the repository. Point the script at your own copies.
 
-## Building the Windows executable
+- **bubblewrap** (`bwrap`).
+- **The Windows build of `victory.exe`.** The script looks for
+  `target/x86_64-pc-windows-msvc/diag/victory.exe` (`RUN_LINUX_EXE` names
+  another). One way to cross-build it, with clang, lld and llvm installed:
 
-A plain `cargo build --target x86_64-pc-windows-msvc` on Linux works only when
-a C compiler, librarian and linker for that target and an MSVC CRT and Windows
-SDK are already set up. [cargo-xwin](https://github.com/rust-cross/cargo-xwin)
-does that setup:
+  ```sh
+  cargo install --locked cargo-xwin
+  cargo xwin build --locked --profile diag -p victory --features diagnostics \
+    --target x86_64-pc-windows-msvc
+  ```
+
+  The first build downloads Microsoft's CRT and SDK with
+  [xwin](https://github.com/Jake-Shadle/xwin), which means accepting
+  [Microsoft's license](https://go.microsoft.com/fwlink/?LinkId=2086102).
+  `cargo xwin build --locked --release -p victory --target x86_64-pc-windows-msvc`
+  makes the plain release build in
+  `target/x86_64-pc-windows-msvc/release/victory.exe`.
+- **Proton** (`PROTON_WINE_LIBS`, its `files/lib/wine` folder). Proton's Wine
+  runs the commands, and DXVK's `dxgi.dll` comes from it. With
+  `RUN_LINUX_WINE=wine` the system's Wine runs them instead, and Proton still
+  provides the DLLs.
+- **vkd3d-proton** (`VKD3D_DLLS`, a folder with `d3d12.dll` and
+  `d3d12core.dll`). The default is the copy inside Proton. The tested runs
+  used a separate, patched build matched to the Proton above (see "Tested
+  result").
+- **A native `d3dcompiler_47.dll`** (`D3DCOMPILER`; default
+  `~/.cache/winetricks/d3dcompiler_47/d3dcompiler_47.dll`, where winetricks
+  keeps it). VIctory compiles HLSL at run time, and every tested run used the
+  native compiler.
+- **The `ntsync` kernel module** (`modprobe ntsync`). Without
+  `/dev/ntsync`, every wait and signal goes through the one `wineserver`
+  process. The script says so when the device is missing.
+- **Your own dump of the title**, read-only. The script binds only the
+  folder you name.
+
+## Settings
+
+The sandbox starts from an empty environment. Its `VICTORY_*` settings are
+those of `scripts/play.ps1` without `-Safe`, plus:
+
+| Setting | Value | Why |
+|---|---|---|
+| `VICTORY_PORT_DESCRIPTORS`, `VICTORY_PORT_CBV`, `VICTORY_PORT_GUARD`, `VICTORY_PORT_JOURNAL` | `1` | renderer ports of the tested runs |
+| `VICTORY_PORT_CONSTANTS` | `0` | with `1`, one region opened but the picture was black |
+| `VICTORY_PIPELINE_BOOK` | `1` | runs record their pipelines for `warm --used` |
+| `VICTORY_OUTPUT` | `1920x1080` | the tested output size |
+| `RADV_DEBUG` | `zerovram` | earlier runs drew the 3D world in one flat colour without it |
+
+Change any of them with `NAME=value` arguments after the command's own
+arguments, for example
+`scripts/run-linux.sh run <folder> <exe> VICTORY_OUTPUT=2560x1440`. Arguments
+can set any variable (`VKD3D_CONFIG=...` too). The last one for a name wins,
+and an empty value removes the name from the sandbox (`VICTORY_THIN=`). A
+`RADV_DEBUG` in your environment replaces the script's default. Any other
+`VICTORY_*` variable in your environment is not passed on, and the script
+says which ones it left out. Title arguments go after `--`.
+
+Give `shaders` and `warm` the same arguments as `run`. Each `VICTORY_*` the
+translator reads is part of the shader cache's key (`VICTORY_PORT_CBV=1` is
+one), and `warm` remembers what it made per translator and driver. If a
+setting or DLL differs, the run makes its own translations and pipelines
+again rather than using the warm-up's.
+
+`run` asks for a Series X (`--console series-x`). `RUN_LINUX_CONSOLE=series-s`
+changes that (see "Tested result").
+
+## Where things are kept
+
+Everything the commands write stays outside the repository and outside the
+title's folder:
+
+| Variable | Default | Holds |
+|---|---|---|
+| `RUN_LINUX_STATE` | `${XDG_DATA_HOME:-~/.local/share}/victory/linux` | the two below, unless they are set |
+| `RUN_LINUX_PREFIX` | `$RUN_LINUX_STATE/prefix-proton` (`prefix` for system Wine) | the Wine prefix |
+| `RUN_LINUX_DATA` | `$RUN_LINUX_STATE/data` | VIctory's data folder: title storage and saves |
+| `RUN_LINUX_CACHE` | `${XDG_CACHE_HOME:-~/.cache}/victory/linux` | `victory/` (shader cache, pipeline book), `vkd3d/`, `mesa/` |
+
+The title's folder, `victory.exe` and the DLLs are bound read-only. Inside
+the sandbox, `victory.exe` sees `VICTORY_DATA_DIR=Z:\state\data` and
+`VICTORY_CACHE_DIR=Z:\state\cache\victory`, where it cannot tell whether
+they are in a checkout. So before anything is written, the script resolves
+the three folders on the host (through symbolic links too). It stops if one
+is in a VIctory checkout, which it finds by a `.victory-root` in that folder
+or a folder above it. It also stops if one holds or lies in the checkout the
+script runs from, the title's folder, a shader input, `victory.exe`, a DLL or
+Proton. A writable folder can contain a separate checkout.
+
+`shaders --list FILE` writes FILE on the host, only when the command
+succeeds: the list is made in the cache and then replaces FILE. Until then
+an existing FILE is left as it is. The script refuses a FILE that is a
+symbolic link or not a plain file, is in a checkout, or is or lies in one of
+the shader inputs.
+
+`scripts/check-run-linux.sh` checks these rules with a stand-in `bwrap`,
+without Wine or a title.
+
+### Existing saves
+
+Saves live in `<data>/<title id>/saves`, the same layout as on Windows
+(`%LOCALAPPDATA%\victory\data` there). To use saves you already have, copy
+that `<title id>` folder into a data folder of its own and point
+`RUN_LINUX_DATA` at it:
 
 ```sh
-# clang (clang-cl), lld (lld-link) and llvm (llvm-lib) from the distribution,
-# for example on Arch: sudo pacman -S clang lld llvm
-cargo install --locked cargo-xwin
-cargo xwin build --release -p victory --target x86_64-pc-windows-msvc
+RUN_LINUX_DATA="$HOME/victory-saves-copy" scripts/run-linux.sh run ...
 ```
 
-The first build downloads the CRT and SDK with
-[xwin](https://github.com/Jake-Shadle/xwin) into cargo-xwin's cache
-(`XWIN_CACHE_DIR` moves it), which means accepting
-[Microsoft's license](https://go.microsoft.com/fwlink/?LinkId=2086102). The
-Windows target comes with the toolchain that `rust-toolchain.toml` pins. The
-executable lands in `target/x86_64-pc-windows-msvc/release/victory.exe`.
+The run writes to that folder, so work on a copy and keep the original
+somewhere else.
 
-The builds on the machine above were made by hand from the same pieces: a
-CRT and SDK fetched with xwin, `CC_x86_64_pc_windows_msvc=clang-cl`,
-`AR_x86_64_pc_windows_msvc=llvm-lib`, and `CFLAGS_x86_64_pc_windows_msvc`
-giving clang-cl `/vctoolsdir` and `/winsdkdir` for the CRT and SDK folders.
-The cargo-xwin route has not been run on that machine yet.
+## Wine, Proton and the Wine server
 
-## Wine or Proton's Wine
+`RUN_LINUX_WINE=proton` (the default) uses Proton's own Wine
+(`PROTON_WINE_LIBS/../../bin/wine`). It draws through X11 (Xwayland), so the
+script binds the X11 socket of `DISPLAY` and `XAUTHORITY` if set, and shares
+the host's IPC namespace for X11 shared-memory images. `RUN_LINUX_WINE=wine`
+uses the system's `wine` with an IPC namespace of its own and a separate
+prefix.
 
-Proton Experimental's own Wine (11.0, with fsync, through Xwayland) needs the
-sandbox to share the host's IPC namespace (X11 shared-memory images) and a
-prefix of its own. `VICTORY_WINE=proton` has the script use it that way
-(`prefix-proton`, the X11 socket of `DISPLAY`).
+`RUN_LINUX_WINESERVER=/path/to/wineserver` runs another `wineserver`, built
+for that Proton's Wine, in place of Proton's. Wine starts the server beside
+its own binary before it looks at `WINESERVER`, so the script mounts the file
+over `files/bin/wineserver` inside the sandbox only. The Proton install is
+not changed. This works only with Proton's Wine.
 
-Earlier runs on the same machine on November 25, 2026.
+Every command ends by waiting for the Wine server (`wineserver -w`). A
+prefix made by the first start is only written out when the server exits,
+and the end of the sandbox would otherwise cut it off.
 
-- System Wine 11.22 entered the opening story (the prologue).
-- Proton Experimental, started outside the script with its own
-  `proton runinprefix`, entered the prologue too.
-- `VICTORY_WINE=proton VICTORY_WARM=1` through the script, with `DISPLAY` set
-  to a private Xwayland server, ran the warm-up and then the title; the intro
-  movie played at 30 frames per second in the three intervals measured.
+## Example
 
-These runs still showed missing or wrong rendering, and some of them reset
-the GPU. The script's Proton run with the warm-up is the only one of these
-started by `scripts/run-linux.sh`. An earlier run with Proton's Wine crashed
-after three and a half minutes with a write to address 0 in the title's own
-code; that crash has not been looked into since.
+```sh
+export PROTON_WINE_LIBS="$HOME/.local/share/Steam/steamapps/common/Proton - Experimental/files/lib/wine"
+export VKD3D_DLLS="$HOME/vkd3d-proton-build"           # optional
+export RUN_LINUX_WINESERVER="$HOME/wine-build/server/wineserver"  # optional
 
-## Three compute pipelines vkd3d-proton cannot make
+scripts/run-linux.sh shaders "$HOME/Games/Title/<shader archive>" --jobs 8
+scripts/run-linux.sh run "$HOME/Games/Title" Title.exe   # records the pipelines it draws with
+scripts/run-linux.sh warm --used --jobs 8                # makes them ahead of the next run
+scripts/run-linux.sh run "$HOME/Games/Title" Title.exe
+```
 
-`CreateComputePipelineState` does not return for three of the title's compute
-programs: dxil-spirv recurses until the worker's stack is gone
-([dxil-spirv #376](https://github.com/HansKristian-Work/dxil-spirv/issues/376)).
-The layer stops waiting for such a worker after 15 seconds
-(`pipeline/make.rs`). The tested DLLs use vkd3d-proton `2576c0b4` and
-dxil-spirv `114e664e` with a backport of upstream commit `e084e35c` from
-`legacy-struct-remove`. The patched build made all three pipelines in under
-200 ms in offline tests.
+The first `warm --used` has nothing to make until a run has recorded
+pipelines.
 
-## Known problems
+## Known gaps
 
-- **Missing or wrong rendering.** Faces can be missing when graphics
-  pipelines are cold. First-room lighting and other materials can still
-  vary with a warm cache. Testing covers the opening.
-- **GPU resets.** Some earlier builds reset the GPU. The latest opening
-  replays at the settings above completed without a GPU fault.
-- **Loading-screen stutter.** The default 1500 ms bake budget stalls the
-  loading screen. 60 ms stalls less but left world textures missing in a later
-  cutscene. See [Texture uploads before the character bake](#texture-uploads-before-the-character-bake).
-- **Black frames (earlier builds).** Not seen in later samples. Earlier runs
-  showed every second or third frame of the 3D world black. In those runs the
-  scene's brightness before tone mapping swung by a factor of about 100 from
-  frame to frame (large, small, zero), and the black frames were the ones
-  where it reached zero. The title measures the picture's brightness on the
-  card, reads it back and sets later frames' exposure from it, so a
-  measurement paired with the wrong frame is one possible cause. It has not
-  been confirmed. On those builds `VICTORY_LATE_WAIT=0 VICTORY_RELAY=0`
-  (everything waited for) was too slow to tell: 6.5 s a frame.
-- **A fresh shader cache takes minutes.** The first launch translates about
-  3,260 shaders and vkd3d-proton compiles each pipeline; hundreds of draws a
-  frame are dropped meanwhile. Every change to the translator (a new build,
-  a switch it reads) keys the cache anew, so the next launch starts cold
-  again. The warm-up below does that work before the launch.
-
-## Warm-up before the launch
-
-`VICTORY_WARM=1` runs `victory warm` in the same sandbox, with the same DLLs,
-caches and `VICTORY_*` settings, before the title starts; `VICTORY_WARM=only`
-runs it alone and starts no title. Off by default. It works the same with
-`VICTORY_WINE=proton`; Proton's Wine gets the X11 display there too (without
-one, its `explorer.exe` restarts over and over in a prefix made earlier and
-Vulkan start-up waits for it), though the warm-up opens no window.
-
-- **Translations (DXIL).** Each shader container is translated into the shader
-  cache. The cache key holds the host facts the device hands the translator
-  (widest wave, view heap size), so the warm-up makes the host device as a
-  run does; its log shows the same `host wave lanes` and `host view heaps`
-  lines as a run's.
-- **Compute pipelines** (`--pipelines`, in the default `VICTORY_WARM_ARGS`).
-  Made as a run's first dispatch makes them: into the pipeline library and
-  vkd3d-proton's and Mesa's caches. Graphics pipelines need the title's
-  graphics state and are not made here; a run starts the ones it drew with
-  before at their creation (`early-pipelines.txt`), as it did already.
-- **Where the containers come from.** A run started with `VICTORY_WARM` keeps
-  every container it translates in the cache's `shader-sources` folder
-  (`VICTORY_SHADER_SOURCES=1`). The title's own files hold few of them as
-  plain containers. `victory warm <folder>` also takes `VICTORY_SHADER_SAVE`
-  folders; `--only <file>` limits it to the hashes a file names (a run's log
-  will do). With no sources it says so and the launch goes on.
-- **Bounds.** `VICTORY_WARM_SECONDS` (default 600) stops new work; the
-  sandbox is ended a minute later if a driver call never returns. A pipeline
-  not back within `--pipeline-seconds` (default 30) is left to its worker,
-  which takes no more work; after four are left behind no more pipelines are
-  started. Each pipeline is noted before and after it is asked for, by its
-  name in the pipeline library (a hash of the translated code and root
-  signature), in `cache/pipelines/warm-pipelines-<driver>.txt` (a hash of the
-  loaded `d3d12core.dll` and of `VKD3D_CONFIG`, `VKD3D_DISABLE_EXTENSIONS`,
-  `VKD3D_FEATURE_LEVEL`, `VKD3D_SHADER_MODEL`, `RADV_DEBUG`, `RADV_PERFTEST`
-  and `ACO_DEBUG` when set). The next warm-up with that driver and those
-  settings skips the ones that never came back or were refused, until a
-  change to the translator, its switches or the host changes what the driver
-  is handed. A warm-up that fails does not stop the
-  launch. The Wine server is waited for at the end, so that a prefix the
-  warm-up made is written out before the sandbox ends.
-
-The patched vkd3d-proton build and the shader fixes in `7e789a1` translated
-all 3,264 saved containers in 50.2 s on a cold Proton cache with four
-translation workers. Two workers compiled 1,137 compute pipelines in
-76.1 s. System Wine reused those shader translations in 0.8 s and the
-compute pipelines in 0.9 s. The test card supports both 32- and 64-lane
-waves. An offline run forced to the 32-lane host setting still refused
-one different shader.
-
-A cold-cache comparison of 512 loose shader files under Proton took 34.1 s
-with `--jobs 1` and 8.4 s with `--jobs 4`. Both runs produced byte-identical
-cached translations.
-
-Earlier warm-up measurements configured four translation workers and two
-pipeline workers. That version processed loose shader files one at a time.
-
-| case | result |
-|---|---|
-| cold shader cache, 3,235 containers | 2,839 + 395 translated in 140 s + 20 s (a 20 s limit, then a second warm-up that went on from there) |
-| shader cache of an earlier run, same translator | 3,233 of 3,235 found in the cache (the key matched the run's), 3 s |
-| compute pipelines, empty driver caches, stock vkd3d-proton 2576c0b4 | 1,133 made in 111 s; the three dxil-spirv #376 programs did not come back within 20 s and were left behind |
-| the same again | 1,133 loaded from the library in 1 to 2 s; the three skipped |
-| `VKD3D_DLLS` with the dxil-spirv e084e35c backport | 1,136 made in 6.5 s (driver caches of the runs before), the three included |
-| Proton Experimental's Wine, new and reused prefix | as with system Wine: same host facts, same driver, 3 to 13 s |
-
-What it does not change: textures, descriptors and streaming. Texture bytes
-come from the title at run time and are uploaded as it asks for them, so a
-warm cache does not fix missing or late textures in the world or on
-characters. Switching `VKD3D_DLLS` between a warm-up and a run makes the run
-reject the warm-up's pipeline library (each vkd3d-proton build refuses
-another's), which the script avoids by using the same DLLs for both.
-
-## Finding out what a frame does
-
-A build with the `diagnostics` feature writes presented frames and traces
-(`crates/victory-gpu/src/capture.rs`):
-
-- `VICTORY_CAPTURE=<folder>` saves frames; `VICTORY_CAPTURE_WORLD=1` with
-  `VICTORY_CAPTURE_WORLD_ALSO=100,101` adds frames counted from the world's
-  first one, each with a file of its operations in recording order, its clears
-  and the order its lists reach the card in.
-- `VICTORY_DUMP_TARGETS=1` saves every texture those frames write, and logs
-  each one's value range and its texels that are not numbers.
-
-These files are derived from the title. They stay outside the repository
-(`docs/asset-policy.md`).
+- Only the opening and the first room of one title have been tested, on one
+  machine.
+- A Series S at 1280x720 crashed in the same test.
+- As a Series X, face textures were missing in the earlier runs.
+- Cold runs can behave differently from the measured ones.
+- System Wine and the stock vkd3d-proton inside Proton were not part of the
+  tested result.

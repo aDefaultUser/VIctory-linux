@@ -53,8 +53,18 @@ pub fn registry() -> &'static [HleModule] {
     &REGISTRY
 }
 
+/// Ours for the title's `dll!name`, if any: the modules', then a call past
+/// `xmem` that only some hosts' DLLs have (`modules::xmem::bypass_lookup`).
 pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
-    registry()
+    let found = lookup_in(registry(), dll, name);
+    #[cfg(windows)]
+    let found = found.or_else(|| modules::xmem::bypass_lookup(dll, name));
+    found
+}
+
+/// [`lookup`] among `modules`.
+pub(crate) fn lookup_in(modules: &[HleModule], dll: &str, name: &str) -> Option<usize> {
+    modules
         .iter()
         .filter(|m| m.serves(dll))
         .flat_map(|m| m.exports.iter())

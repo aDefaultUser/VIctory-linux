@@ -19,6 +19,7 @@ extern "system" fn create_device(
 ) -> HRESULT {
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
+    victory_gpu::resource::use_many_page_mapper(super::xmem::map_aliases);
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)
@@ -30,17 +31,47 @@ extern "system" fn create_device(
 fn host_gpu_failed(what: &str) -> ! {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
     victory_loader::log_crash(&format!("VIctory: host GPU failure: {what}"));
+    victory_gpu::pipeline::known::flush_on_gpu_failure();
     const DXGI_ERROR_DEVICE_REMOVED: u32 = 0x887A_0005;
     // SAFETY: ends our own process.
     unsafe { TerminateProcess(GetCurrentProcess(), DXGI_ERROR_DEVICE_REMOVED) };
     unreachable!("the process has ended")
 }
 
-/// The offline warm-up: see `victory_gpu::shader_cache::warm`.
+/// Translates `container` into the cache ([`use_shader_cache`]) ahead of
+/// any run: whether it was there already, or why it does not translate.
+pub fn precompile(container: &[u8]) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::precompile(container)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = container;
+        Err("no host".into())
+    }
+}
+
+/// Of the cached translations met since the start: those an earlier build
+/// of the translator made, those translated again, and those that came out
+/// different (`victory_gpu::shader_cache`).
+pub fn stale_shaders() -> (u64, u64, u64) {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::stale_counts()
+    }
+    #[cfg(not(windows))]
+    {
+        (0, 0, 0)
+    }
+}
+
+/// The fork's offline warm-up (`victory translate --warm`), by
+/// [`precompile`]: whether it was translated now.
 pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
     #[cfg(windows)]
     {
-        victory_gpu::shader_cache::warm(container)
+        victory_gpu::shader_cache::precompile(container).map(|was_there| !was_there)
     }
     #[cfg(not(windows))]
     {
@@ -49,51 +80,20 @@ pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
     }
 }
 
-/// The warm-up's host: see `victory_gpu::pipeline::use_host_device`.
-pub fn warm_host() -> bool {
+/// Keeps the host's translations of the title's shaders in `dir` (a
+/// folder of the cache) across runs, and its compiled pipelines beside it
+/// (`pipelines`).
+pub fn use_shader_cache(dir: std::path::PathBuf) {
+    let pipelines = outside_repo(dir.with_file_name("pipelines"), "pipelines");
     #[cfg(windows)]
     {
-        victory_gpu::pipeline::use_host_device()
+        if let Some(pipelines) = pipelines {
+            victory_gpu::pipeline::use_pipeline_cache(pipelines);
+        }
+        victory_gpu::shader_cache::use_shader_cache(dir);
     }
     #[cfg(not(windows))]
-    false
-}
-
-/// The warm-up's compute pipelines: see `victory_gpu::pipeline::warm_compute`.
-/// `gate` is handed the pipeline's name in the pipeline library just
-/// before the host is asked for it, and decides whether it is.
-pub fn warm_compute(container: &[u8], gate: Box<dyn FnMut(&str) -> bool>) -> Option<bool> {
-    #[cfg(windows)]
-    {
-        victory_gpu::pipeline::warm_compute(container, gate)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (container, gate);
-        None
-    }
-}
-
-/// See `victory_gpu::pipeline::host_driver_id`.
-pub fn host_driver_id() -> Option<String> {
-    #[cfg(windows)]
-    {
-        victory_gpu::pipeline::host_driver_id()
-    }
-    #[cfg(not(windows))]
-    None
-}
-
-/// Writes the pipeline library now if pipelines were added.
-pub fn save_pipeline_cache() {
-    #[cfg(windows)]
-    victory_gpu::pipeline::save_pipeline_cache();
-}
-
-/// The folder the title's shader containers are kept in, beside the
-/// shader cache folder `shaders` (`VICTORY_SHADER_SOURCES=1`).
-pub fn shader_sources_dir(shaders: &std::path::Path) -> std::path::PathBuf {
-    shaders.with_file_name("shader-sources")
+    let _ = (dir, pipelines);
 }
 
 /// `dir` if game-derived data may be written there. A folder beside the
@@ -108,31 +108,6 @@ fn outside_repo(dir: std::path::PathBuf, what: &str) -> Option<std::path::PathBu
             None
         }
     }
-}
-
-/// Keeps the host's translations of the title's shaders in `dir` (a
-/// folder of the cache) across runs, and its compiled pipelines beside it
-/// (`pipelines`). With `VICTORY_SHADER_SOURCES=1` (the Linux launcher's
-/// warm-up sets it) the containers translated are kept too
-/// (`shader-sources`), for `victory warm` before a later launch.
-pub fn use_shader_cache(dir: std::path::PathBuf) {
-    let sources = std::env::var_os("VICTORY_SHADER_SOURCES")
-        .is_some_and(|v| v == "1")
-        .then(|| outside_repo(shader_sources_dir(&dir), "shader sources"))
-        .flatten();
-    let pipelines = outside_repo(dir.with_file_name("pipelines"), "pipelines");
-    #[cfg(windows)]
-    {
-        if let Some(sources) = sources {
-            victory_gpu::shader_sources::keep_sources(sources);
-        }
-        if let Some(pipelines) = pipelines {
-            victory_gpu::pipeline::use_pipeline_cache(pipelines);
-        }
-        victory_gpu::shader_cache::use_shader_cache(dir);
-    }
-    #[cfg(not(windows))]
-    let _ = (dir, sources, pipelines);
 }
 
 pub(crate) fn module() -> HleModule {
@@ -193,8 +168,8 @@ mod tests {
     }
 
     /// The shader cache folder is checked where the configuration makes
-    /// it; the folders beside it are checked themselves. A link in place of
-    /// one that leads into a source tree (here: a folder holding the
+    /// it; the pipelines folder beside it is checked itself. A link in its
+    /// place that leads into a source tree (here: a folder holding the
     /// repository's marker) is refused, without failing the run.
     #[test]
     fn a_folder_beside_the_shader_cache_that_leads_into_a_source_tree_is_refused() {
@@ -205,23 +180,16 @@ mod tests {
         std::fs::create_dir(&shaders).unwrap();
         victory_core::ensure_outside_repo(&shaders).unwrap();
 
-        let sources = shader_sources_dir(&shaders);
-        assert_eq!(
-            outside_repo(sources.clone(), "shader sources"),
-            Some(sources.clone())
-        );
+        let pipelines = shaders.with_file_name("pipelines");
+        assert_eq!(outside_repo(pipelines.clone(), "pipelines"), Some(pipelines.clone()));
         #[cfg(unix)]
-        let linked = std::os::unix::fs::symlink(tree.path(), &sources);
+        let linked = std::os::unix::fs::symlink(tree.path(), &pipelines);
         #[cfg(windows)]
-        let linked = std::os::windows::fs::symlink_dir(tree.path(), &sources);
+        let linked = std::os::windows::fs::symlink_dir(tree.path(), &pipelines);
         if let Err(e) = linked {
             eprintln!("no link could be made here ({e}): not run");
             return;
         }
-        assert_eq!(outside_repo(sources, "shader sources"), None);
-        assert_eq!(
-            outside_repo(shaders.with_file_name("pipelines"), "pipelines"),
-            Some(shaders.with_file_name("pipelines"))
-        );
+        assert_eq!(outside_repo(pipelines, "pipelines"), None);
     }
 }

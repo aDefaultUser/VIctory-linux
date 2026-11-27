@@ -27,8 +27,9 @@ it from history.
 - New or risky behaviour goes behind a `VICTORY_*` environment switch, off by
   default, described in a comment where it is read. Code that approximates
   what the console does carries a `shortcut:` comment.
-- Any change to the shader translator, or to a switch it reads, changes the
-  shader cache key, so the next run translates everything again.
+- The shader cache is keyed by `victory_shader::TRANSLATOR_VERSION` and the
+  switches the translator reads. Bump the version with any change that
+  changes the translation of a shader that already translated.
 - Keep the README short. Linux setup, measurements and known problems belong
   in `docs/linux.md`, ray tracing in `docs/fork-ray-tracing.md`.
 - Commit subjects state the behaviour change as a plain sentence.
@@ -47,9 +48,10 @@ repository read their paths from environment variables (for example
 ## Runs on real hardware
 
 - A run of the title uses the tester's own game files and private state: the
-  Wine prefix, shader and pipeline caches, saves, captures and logs live under
-  `VICTORY_STATE` or the data and cache folders, outside the repository, and
-  stay with the tester.
+  Wine prefix, shader and pipeline caches, saves, captures and logs live in
+  the launcher's state, data and cache folders (`RUN_LINUX_STATE`,
+  `RUN_LINUX_DATA`, `RUN_LINUX_CACHE`), outside the repository, and stay with
+  the tester.
 - Claims about rendering or speed come from runs of the title on real
   hardware, not from unit tests or warm-ups. Note the date, machine, GPU
   driver, Wine or Proton build and the `VICTORY_*` settings, and measure frame
