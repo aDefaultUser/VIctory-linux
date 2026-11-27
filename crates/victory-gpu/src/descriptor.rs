@@ -1917,6 +1917,66 @@ mod tests {
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 
+    /// The table of strides tells shaders that pick a slot by index what its
+    /// host slot shows, as the slot changes: nothing while a constant buffer
+    /// waits for a draw to make it, 0 once one has (from its host copy), and
+    /// nothing if it could not; nothing to read once the title clears the
+    /// slot. Slots never written, and those past the title's (made per
+    /// draw), have nothing to read. (Needs a host GPU; the words of each
+    /// view: `host::tests::slot_words_say_what_a_view_shows`.)
+    #[cfg(windows)]
+    #[test]
+    fn the_stride_table_follows_what_a_slot_shows() {
+        use victory_shader::emit::{SLOT_IMAGE, SLOT_NONE};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // Title memory outside any buffer object, as titles keep constants.
+        // SAFETY: a fresh allocation.
+        let constants = unsafe {
+            VirtualAlloc(std::ptr::null(), crate::watch::PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        assert!(!constants.is_null());
+        let cbv = |offset: u64| {
+            let address = constants as u64 + offset;
+            [address as u32, (address >> 32) as u32, 256, 0]
+        };
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 8,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let mut h: This = std::ptr::null();
+        let placement = Placement { address: 0, size: 0 };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            let null = std::ptr::null();
+            let slot2 = heap(h).start + 2 * 32;
+            assert_eq!(host.stride_word(2), SLOT_NONE, "never written");
+            assert_eq!(host.stride_word(8), SLOT_NONE, "past the title's slots");
+            // A view of no resource: a null view, or one of no texture.
+            create_srv(null, null, std::ptr::null(), slot2);
+            assert!(matches!(host.stride_word(2), SLOT_NONE | SLOT_IMAGE));
+            create_cbv(null, &cbv(0x100), slot2);
+            assert!(!host.made(2), "constant buffers are made for draws");
+            assert_eq!(host.stride_word(2), SLOT_NONE, "a constant buffer not made yet");
+            host.mirror(2, slot2, true);
+            let made = if host.made(2) { 0 } else { SLOT_NONE };
+            assert_eq!(host.stride_word(2), made, "a constant buffer a draw made, or could not");
+            create_srv(null, null, std::ptr::null(), slot2);
+            assert!(matches!(host.stride_word(2), SLOT_NONE | SLOT_IMAGE));
+            // The title clears the slot: no view there.
+            // SAFETY: a slot of the heap's memory.
+            unsafe { std::ptr::write_bytes(slot2 as *mut u8, 0, 32) };
+            host.mirror(2, slot2, false);
+            assert_eq!(host.stride_word(2), SLOT_NONE, "cleared");
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        // SAFETY: this allocation belongs to the test.
+        unsafe { VirtualFree(constants, 0, MEM_RELEASE) };
+    }
+
     #[test]
     fn views_survive_copies() {
         let null = std::ptr::null();

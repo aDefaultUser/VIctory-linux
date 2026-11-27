@@ -121,7 +121,7 @@ pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_VIEW_WORDS,
+    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_IMAGE, SLOT_MEMORY, SLOT_NONE, SLOT_STRIDES, SLOT_VIEW_WORDS,
     SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
@@ -3211,5 +3211,354 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+}
+
+#[cfg(test)]
+mod heap_pick_tests {
+    use super::*;
+    use crate::native::{ComputeIo, RootParam, StageIo};
+
+    /// Words of the host's table by heap slot: a raw buffer view, a
+    /// structured one, typed ones of an unsigned and a signed integer format
+    /// (their kind bits above the stride), a constant buffer, a texture,
+    /// nothing, and a dynamic slot's (nothing, under its view's kind).
+    const RAW: u32 = 1;
+    const STRUCTURED: u32 = 16;
+    const R16_UINT: u32 = VIEW_INTEGER | 2;
+    const R32_SINT: u32 = VIEW_INTEGER | VIEW_SIGNED | 4;
+    const CONSTANTS: u32 = 0;
+    const DYNAMIC_UINT: u32 = SLOT_NONE | VIEW_INTEGER;
+    const DYNAMIC_SINT: u32 = SLOT_NONE | VIEW_INTEGER | VIEW_SIGNED;
+    const BUFFER_VIEWS: [u32; 4] = [RAW, STRUCTURED, R16_UINT, R32_SINT];
+    const NO_BUFFER: [u32; 4] = [SLOT_IMAGE, SLOT_NONE, DYNAMIC_UINT, DYNAMIC_SINT];
+
+    /// A compute program of `words`: a root constant (s0, the heap slot to
+    /// pick) and the view heap (s[2:3]), 32 lanes.
+    fn lowered(words: &[u32], vgprs: u16) -> lower::Lowered {
+        let param = |root, user_data, slot| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs,
+            layout: vec![param(RootType::Constants, 0, 0), param(RootType::ResourceHeap, 2, 1)],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 3 << 1,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let l = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        // The accesses go by the table of strides.
+        assert_eq!(l.root_srvs, [SLOT_STRIDES]);
+        l
+    }
+
+    /// Whether the accesses of kind `what` ([`lower::Lowered::picked_guards`])
+    /// run on a slot whose word is `word`: the same for all of them.
+    fn runs(l: &lower::Lowered, what: &str, word: u32) -> bool {
+        let ran: Vec<bool> = l
+            .picked_guards
+            .iter()
+            .filter(|g| g.0 == what)
+            .map(|&(_, g)| {
+                let x = l.exprs.value(g, word);
+                x.unwrap_or_else(|| panic!("{what}: not an integer condition")) & 1 != 0
+            })
+            .collect();
+        assert!(!ran.is_empty(), "no {what} access");
+        assert!(ran.iter().all(|&r| r == ran[0]), "{what} accesses disagree on {word:#x}");
+        ran[0]
+    }
+
+    /// Runs `l` once for each heap slot in `slots` over `views`, with
+    /// `strides` as the host's table by slot: each UAV's contents per run.
+    /// `None` without an SM 6.6 device.
+    #[cfg(windows)]
+    fn run_picking(
+        l: lower::Lowered,
+        views: &[host::View],
+        strides: &[u32],
+        slots: &[u32],
+    ) -> Option<Vec<Vec<Vec<u32>>>> {
+        let mut dxil = l.dxil;
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut dxil).unwrap();
+        }
+        let Ok(host) = host::Host::new(false) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return None;
+        };
+        let cs = HostShader {
+            stage: HwStage::Cs,
+            dxil,
+            user_data: l.user_data,
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            root_indexed_views: Vec::new(),
+        };
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let (root, pso) = host.compute_pipeline(&cs).unwrap();
+        let runs = slots.iter().map(|&slot| {
+            let mut ud = vec![0u32; cs.user_data_dwords().max(1) as usize];
+            for u in cs.user_data.iter().filter(|u| u.root == RootType::Constants) {
+                ud[u.index as usize] = slot;
+            }
+            let roots = vec![
+                (0, host::Root::Constants(ud)),
+                (1, host::Root::View { srv: true, data: strides.to_vec() }),
+            ];
+            host.dispatch(&root, &pso, &host::Dispatch { roots, views, samplers: &[], groups: [1, 1, 1] })
+                .unwrap_or_else(|e| panic!("slot {slot}: {e}"))
+        });
+        Some(runs.collect())
+    }
+
+    /// A program that picks a view from the heap at an index it computes (a
+    /// root constant) reads its first dword with `s_buffer_load_dword`, as
+    /// the title's meshlet culls read their records, and stores it for every
+    /// lane through a raw UAV it picks from the heap too. The load runs as a
+    /// buffer's on a buffer view's slot (an integer format's kind bits do
+    /// not hide its stride), as a constant buffer's on a constant buffer's,
+    /// and not at all on a texture's, an empty one or a dynamic one: a
+    /// texture's descriptor read as a constant buffer's is no address (the
+    /// scalar cache faulted at 0 on an RX 9070 XT under Proton). It reads
+    /// zeros there.
+    #[test]
+    fn a_heap_slot_picked_for_a_scalar_load_is_read_as_what_it_shows() {
+        let words: [u32; 13] = [
+            0x8F04_8500, // s_lshl_b32 s4, s0, 5
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0201,
+            0x0800_0000, // s_load_dwordx4 s[8:11], s[2:3], s4
+            0xF408_0401,
+            0xFA00_0060, // s_load_dwordx4 s[16:19], s[2:3], 0x60
+            0xF420_0304,
+            0xFA00_0000, // s_buffer_load_dword s12, s[8:11], 0x0
+            0x7E02_020C, // v_mov_b32 v1, s12
+            0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+            0xE070_1000,
+            0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let l = lowered(&words, 3);
+        assert!(l.root_cbvs.is_empty());
+        for word in BUFFER_VIEWS {
+            assert!(runs(&l, "scalar buffer", word), "{word:#x}");
+            assert!(!runs(&l, "scalar constants", word), "{word:#x}");
+        }
+        assert!(!runs(&l, "scalar buffer", CONSTANTS));
+        assert!(runs(&l, "scalar constants", CONSTANTS));
+        for word in NO_BUFFER {
+            assert!(!runs(&l, "scalar buffer", word), "{word:#x}");
+            assert!(!runs(&l, "scalar constants", word), "{word:#x}");
+        }
+        #[cfg(windows)]
+        {
+            let texel = [[1.0f32, 2.0, 3.0, 4.0]];
+            let constants = [0xC0_FFEE; 64];
+            let buffer = [0xB0_FFEE; 4];
+            // Heap: a texture, a constant buffer, a raw buffer, the UAV, a
+            // texture in a slot with nothing to read.
+            let views = [
+                host::View::Texture(1, 1, &texel),
+                host::View::Cbv(&constants),
+                host::View::Buffer { data: &buffer, stride: host::Stride::Raw },
+                host::View::RawUav(32),
+                host::View::Texture(1, 1, &texel),
+            ];
+            let strides = [SLOT_IMAGE, CONSTANTS, RAW, RAW, SLOT_NONE];
+            let Some(runs) = run_picking(l, &views, &strides, &[0, 1, 2, 4]) else {
+                return;
+            };
+            for (run, want) in runs.iter().zip([0, 0xC0_FFEE, 0xB0_FFEE, 0]) {
+                assert_eq!(run[0], vec![want; 32]);
+            }
+        }
+    }
+
+    /// Vector loads (`buffer_load_dword`, by element and by byte) and the
+    /// stores of what they read, through views the program picks from the
+    /// heap, run only on a buffer view's slot: a texture's descriptor read as
+    /// a buffer's names no memory of the buffer's, and a raw load through a
+    /// constant buffer's is through a handle of the wrong type. They read
+    /// zeros and write nothing elsewhere.
+    #[test]
+    fn a_heap_slot_picked_for_a_vector_load_is_read_only_if_it_holds_a_buffer_view() {
+        let words: [u32; 16] = [
+            0x8F04_8500, // s_lshl_b32 s4, s0, 5
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0201,
+            0x0800_0000, // s_load_dwordx4 s[8:11], s[2:3], s4
+            0xF408_0401,
+            0xFA00_0060, // s_load_dwordx4 s[16:19], s[2:3], 0x60
+            0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            0xE030_1000,
+            0x8002_0302, // buffer_load_dword v3, v2, s[8:11], 0 offen
+            0xE070_1000,
+            0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen
+            0xE070_1080,
+            0x8004_0302, // buffer_store_dword v3, v2, s[16:19], 0 offen offset:128
+            0xBF81_0000, // s_endpgm
+        ];
+        let l = lowered(&words, 4);
+        for word in BUFFER_VIEWS {
+            assert!(runs(&l, "vector", word), "{word:#x}");
+        }
+        for word in [CONSTANTS].into_iter().chain(NO_BUFFER) {
+            assert!(!runs(&l, "vector", word), "{word:#x}");
+        }
+        #[cfg(windows)]
+        {
+            let texel = [[1.0f32, 2.0, 3.0, 4.0]];
+            let data: Vec<u32> = (0..48).map(|i| 0xB000 + i).collect();
+            let constants = [0xC0_FFEE; 64];
+            // Heap: a texture, a buffer of 8-byte elements (made raw, as the
+            // host makes buffer views), a texture in a slot with nothing to
+            // read, the UAV the lanes write, a constant buffer.
+            let views = [
+                host::View::Texture(1, 1, &texel),
+                host::View::Buffer { data: &data, stride: host::Stride::Raw },
+                host::View::Texture(1, 1, &texel),
+                host::View::RawUav(64),
+                host::View::Cbv(&constants),
+            ];
+            let strides = [SLOT_IMAGE, 8, SLOT_NONE, RAW, CONSTANTS];
+            let Some(runs) = run_picking(l, &views, &strides, &[0, 1, 2, 4]) else {
+                return;
+            };
+            assert_eq!(runs[0][0], vec![0; 64], "a texture's slot");
+            assert_eq!(runs[2][0], vec![0; 64], "a slot with nothing to read");
+            assert_eq!(runs[3][0], vec![0; 64], "a constant buffer's slot");
+            // Element `lane` at byte 8 * lane: past the 48 dwords from lane
+            // 24 on.
+            let by_element = (0..32).map(|lane| if lane < 24 { 0xB000 + 2 * lane } else { 0 });
+            let by_byte = (0..32).map(|lane| 0xB000 + lane);
+            let want: Vec<u32> = by_element.chain(by_byte).collect();
+            assert_eq!(runs[1][0], want, "a buffer's slot");
+        }
+    }
+
+    /// A store and a returning atomic (`buffer_store_dword`,
+    /// `buffer_atomic_add ... glc`) through a view the program picks from the
+    /// heap write a buffer view as before, and write nothing on a slot the
+    /// table says shows a texture, a constant buffer or nothing; the atomic
+    /// returns 0 there.
+    #[test]
+    fn a_heap_slot_picked_for_a_vector_write_is_written_only_if_it_holds_a_buffer_view() {
+        let words: [u32; 16] = [
+            0x8F04_8500, // s_lshl_b32 s4, s0, 5
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0201,
+            0x0800_0000, // s_load_dwordx4 s[8:11], s[2:3], s4
+            0xF408_0401,
+            0xFA00_0040, // s_load_dwordx4 s[16:19], s[2:3], 0x40
+            0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+            0x4A08_0081, // v_add_nc_u32 v4, 1, v0
+            0x7E0A_0281, // v_mov_b32 v5, 1
+            0xE070_1000,
+            0x8002_0402, // buffer_store_dword v4, v2, s[8:11], 0 offen
+            0xE0C8_5000,
+            0x8002_0502, // buffer_atomic_add v5, v2, s[8:11], 0 offen glc
+            0xE070_1000,
+            0x8004_0502, // buffer_store_dword v5, v2, s[16:19], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let l = lowered(&words, 6);
+        for word in BUFFER_VIEWS {
+            assert!(runs(&l, "vector", word), "{word:#x}");
+        }
+        for word in [CONSTANTS].into_iter().chain(NO_BUFFER) {
+            assert!(!runs(&l, "vector", word), "{word:#x}");
+        }
+        #[cfg(windows)]
+        {
+            let constants = [0xC0_FFEE; 64];
+            // Heap: a texture UAV, a raw UAV, the UAV the lanes write, a
+            // texture UAV in a slot with nothing to read, a constant buffer.
+            let views = [
+                host::View::TextureUav(32, 1),
+                host::View::RawUav(32),
+                host::View::RawUav(32),
+                host::View::TextureUav(32, 1),
+                host::View::Cbv(&constants),
+            ];
+            let strides = [SLOT_IMAGE, RAW, RAW, SLOT_NONE, CONSTANTS];
+            let Some(runs) = run_picking(l, &views, &strides, &[0, 1, 3, 4]) else {
+                return;
+            };
+            for (k, run) in [0, 2, 3].into_iter().map(|k| (k, &runs[k])) {
+                assert_eq!(run[2], vec![0; 32], "run {k}: the atomic's result where nothing is written");
+                for (uav, written) in run.iter().enumerate().filter(|&(uav, _)| uav != 2) {
+                    assert!(written.iter().all(|&x| x == 0), "run {k}: UAV {uav} written");
+                }
+            }
+            let stored: Vec<u32> = (0..32).map(|lane| lane + 2).collect();
+            let old: Vec<u32> = (0..32).map(|lane| lane + 1).collect();
+            assert_eq!(runs[1][1], stored, "a buffer's slot");
+            assert_eq!(runs[1][2], old, "the atomic's result on a buffer's slot");
+        }
+    }
+
+    /// A 16-bit typed load (`_d16`) through a view the program picks from the
+    /// heap runs on a buffer view's slot and still asks the slot's whole word
+    /// whether its format is an integer one: the guard that keeps it off
+    /// other slots must not leave the kind bits behind (the face network's
+    /// halves are bits through `UINT` views, not f16).
+    #[test]
+    fn a_guarded_d16_load_through_a_picked_view_keeps_the_views_kind() {
+        let words: [u32; 12] = [
+            0x8F04_8500, // s_lshl_b32 s4, s0, 5
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0201,
+            0x0800_0000, // s_load_dwordx4 s[8:11], s[2:3], s4
+            0xF408_0401,
+            0xFA00_0060, // s_load_dwordx4 s[16:19], s[2:3], 0x60
+            0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+            0xE204_2000,
+            0x8002_0100, // buffer_load_format_d16_xy v1, v0, s[8:11], 0 idxen
+            0xE070_1000,
+            0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let l = lowered(&words, 3);
+        for word in [R16_UINT, R32_SINT] {
+            assert!(runs(&l, "vector", word), "{word:#x}");
+            assert!(runs(&l, "integer", word), "{word:#x}");
+        }
+        for word in [RAW, STRUCTURED] {
+            assert!(!runs(&l, "integer", word), "{word:#x}");
+        }
+        for word in [CONSTANTS].into_iter().chain(NO_BUFFER) {
+            assert!(!runs(&l, "vector", word), "{word:#x}");
+        }
     }
 }

@@ -193,6 +193,9 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// The word of each title slot in `strides`, as last written (that table
+    /// is upload memory, slow to read back).
+    words: Vec<std::sync::atomic::AtomicU32>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -1319,10 +1322,38 @@ fn view_kind(view: &View) -> u32 {
     }
 }
 
-/// The word of the table of strides for a slot holding `view`: its stride
-/// and kind; 0 for a constant buffer, a texture or no view.
+/// The word of the table of strides (`victory_shader::emit::SLOT_STRIDES`)
+/// for a host slot made from `view`: a buffer view's bytes per element and
+/// kind, 0 for a constant buffer, `SLOT_IMAGE` for a view of a texture,
+/// `SLOT_NONE` for anything else (no view, a buffer view without an element
+/// size, an acceleration structure). A shader that picks the slot reads it
+/// as a buffer, as a constant buffer, or not at all (zeros): a texture's
+/// descriptor read as a constant buffer's faulted at 0 on AMD. The two
+/// words for no buffer are strides no view has, under the kind bits.
 fn slot_word(view: Option<&View>) -> u32 {
-    view.and_then(view_stride).unwrap_or(0) | view.map_or(0, view_kind)
+    use victory_shader::emit::{SLOT_IMAGE, SLOT_NONE};
+    const BUFFER: u32 = 1;
+    let Some(view) = view else {
+        return SLOT_NONE;
+    };
+    let texture = |r: usize| crate::resource::buffer_bytes(r as crate::object::This).is_none();
+    match view_stride(view) {
+        Some(stride) if stride != 0 && stride < SLOT_NONE => stride | view_kind(view),
+        Some(_) => SLOT_NONE,
+        None => match view {
+            View::Constant(..) => 0,
+            View::Placed(_, resource, _) if resource[0] != BUFFER => SLOT_IMAGE,
+            View::Shader(r, _) | View::Unordered(r, _, _) if texture(*r) => SLOT_IMAGE,
+            _ => SLOT_NONE,
+        },
+    }
+}
+
+/// Whether a shader that picks a slot whose word is `word` reads it (as a
+/// buffer view or a constant buffer).
+fn word_reads(word: u32) -> bool {
+    use victory_shader::emit::{SLOT_NONE, VIEW_STRIDE_BITS};
+    word & VIEW_STRIDE_BITS < SLOT_NONE
 }
 
 /// A buffer view's structure stride, whether it is raw, and its format;
@@ -1734,9 +1765,17 @@ impl HostHeap {
                 // (`victory_shader::emit::VIEW_ADDRESSES`).
                 let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_BYTES);
                 let (buffer, data) = host.upload_buffer(bytes)?;
-                // SAFETY: the buffer's whole mapping; a live buffer.
+                // Every slot starts with nothing to pick: the title's until
+                // `HostHeap::mirror` makes them, and the dynamic ones past
+                // them for good (tables made per draw; a title index there
+                // is no slot of the title's). Their views' kinds go under it
+                // (`HostHeap::dynamic_word`).
+                let words = victory_shader::emit::SLOT_STRIDES_COUNT as usize;
+                // SAFETY: the buffer's whole mapping (dwords, page-aligned);
+                // a live buffer.
                 let gpu = unsafe {
                     std::ptr::write_bytes(data, 0, bytes as usize);
+                    std::slice::from_raw_parts_mut(data.cast::<u32>(), words).fill(victory_shader::emit::SLOT_NONE);
                     buffer.GetGPUVirtualAddress()
                 };
                 crate::host::name(&buffer, || "element strides by view heap slot".to_owned());
@@ -1769,6 +1808,9 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            words: (0..if sampler { 0 } else { count })
+                .map(|_| std::sync::atomic::AtomicU32::new(victory_shader::emit::SLOT_NONE))
+                .collect(),
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
             textures: Mutex::new(TextureQueue { queued: queued.clone(), ..Default::default() }),
@@ -1937,19 +1979,73 @@ impl HostHeap {
     }
 
     /// Writes the word of the table of element strides for the dynamic slot
-    /// `index`, which holds `view` of a table made afresh (0 for a constant
-    /// buffer or none): shaders ask it whether a typed view in a table is of
-    /// an integer format (`victory_shader::emit::VIEW_INTEGER`), as they ask
-    /// it of a title slot. After avatarmanz/VIctory-7900XTX#114.
+    /// `index`, which holds `view` of a table made afresh: shaders ask it
+    /// whether a typed view in a table is of an integer format
+    /// (`victory_shader::emit::VIEW_INTEGER`), as they ask it of a title
+    /// slot. After avatarmanz/VIctory-7900XTX#114. Its stride stays
+    /// `SLOT_NONE`: no title index picks a dynamic slot, and one computed
+    /// from data that falls there reads nothing, whatever the slot shows
+    /// (or is being made to show) then.
     pub(crate) fn dynamic_word(&self, index: u32, view: Option<&View>) {
         if let Some((_, _, data)) = &self.strides
             && index >= self.count
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
+            let word = victory_shader::emit::SLOT_NONE | view.map_or(0, view_kind);
             // SAFETY: inside the mapping; the slot is this caller's until its
             // list has run and gives it back.
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(slot_word(view)) };
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
         }
+    }
+
+    /// Writes title slot `index`'s word in the table of strides
+    /// ([`slot_word`]). Shaders read it while we write: a dword, either value
+    /// is one the slot had.
+    fn set_word(&self, index: u32, word: u32) {
+        use std::sync::atomic::{Ordering, fence};
+        let Some(shown) = self.words.get(index as usize) else {
+            return;
+        };
+        if shown.swap(word, Ordering::Relaxed) == word {
+            return;
+        }
+        if let Some((_, _, data)) = &self.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // The table (an upload heap) and the descriptor heap can be
+            // write-combined memory, whose stores x86 keeps in order only
+            // across a full fence: the word lands after the slot's change
+            // before it, and before the one after it.
+            fence(Ordering::SeqCst);
+            // SAFETY: inside the mapping.
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
+            fence(Ordering::SeqCst);
+        }
+    }
+
+    /// Before host slot `index` changes to show a view whose word is `word`:
+    /// a word that reads nothing is written now, one that lets shaders that
+    /// pick the slot read it only once the slot shows that view
+    /// ([`HostHeap::mirror`]); meanwhile, if the slot showed another kind,
+    /// it reads nothing. Published first, a buffer's or a constant buffer's
+    /// word let them read the texture's descriptor still there as one.
+    fn word_before(&self, index: u32, word: u32) {
+        let shown = self.words.get(index as usize);
+        if !word_reads(word) {
+            self.set_word(index, word);
+        } else if shown.is_some_and(|w| w.load(std::sync::atomic::Ordering::Relaxed) != word) {
+            self.set_word(index, victory_shader::emit::SLOT_NONE);
+        }
+    }
+
+    /// The table of strides' word for heap slot `index` (tests).
+    #[cfg(test)]
+    pub(crate) fn stride_word(&self, index: u32) -> u32 {
+        let Some((_, _, data)) = &self.strides else {
+            return victory_shader::emit::SLOT_NONE;
+        };
+        // SAFETY: inside the mapping for a slot of the heap.
+        unsafe { (*data as *const u32).add(index as usize).read_volatile() }
     }
 
     /// The GPU address of the table of element strides by title slot (view
@@ -2563,6 +2659,7 @@ impl HostHeap {
         if key == 0 {
             return;
         }
+        self.set_word(index, victory_shader::emit::SLOT_NONE);
         match view_at(key as u32, (key >> 32) as u32) {
             Some(view) => null_for(&view, self.at(index)),
             None => null_view(self.at(index)),
@@ -2781,12 +2878,10 @@ impl HostHeap {
             }
         }
         let stride = view.and_then(view_stride);
+        self.word_before(index, slot_word(view));
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
-            // SAFETY: inside the mapping; shaders read it while we write (a
-            // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(slot_word(view)) };
             write_view_address(*data, index, view);
         }
         let was = if stride.is_some() {
@@ -3333,6 +3428,7 @@ impl HostHeap {
             if shown != 0 {
                 self.quick_is(index, 0);
                 self.made.set(index, 0);
+                self.set_word(index, victory_shader::emit::SLOT_NONE);
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
@@ -3446,7 +3542,14 @@ impl HostHeap {
                 self.put(index);
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
+            // What shaders that pick the slot find there: the view's word
+            // once it is made, nothing for a null slot.
+            let word = match kept {
+                Some(_) => slot_word(Some(&view)),
+                None => victory_shader::emit::SLOT_NONE,
+            };
             self.keep(index, kept.flatten());
+            self.set_word(index, word);
             self.quick_is(index, if later { 0 } else { key });
             drop(held);
             self.unmake_stale(index, stale);
@@ -5342,7 +5445,7 @@ mod tests {
     /// strides; float, normalized, raw and structured ones are not.
     #[test]
     fn integer_typed_buffer_views_are_marked_in_the_table_of_strides() {
-        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+        use victory_shader::emit::{SLOT_NONE, VIEW_INTEGER, VIEW_SIGNED};
         // Format, dimension (buffer), first element, count, stride, counter, flags.
         let uav = |format, stride, flags| View::Unordered(0, 0, Some([format, 1, 0, 0, 64, stride, 0, 0, flags, 0]));
         assert_eq!(view_kind(&uav(12, 0, 0)), VIEW_INTEGER, "R16G16B16A16_UINT");
@@ -5356,30 +5459,62 @@ mod tests {
         assert_eq!(slot_word(Some(&uav(57, 0, 0))), VIEW_INTEGER | 2, "R16_UINT");
         assert_eq!(slot_word(Some(&uav(54, 0, 0))), 2, "R16_FLOAT");
         assert_eq!(slot_word(Some(&View::Constant(0x1000, 256))), 0, "a constant buffer");
-        assert_eq!(slot_word(None), 0, "no view");
+        assert_eq!(slot_word(None), SLOT_NONE, "no view");
     }
 
-    /// A dynamic slot of a table made afresh has its word in the table of
-    /// strides, as a title slot has; the next view made in it replaces it
-    /// (a reused slot keeps nothing of its last table's), and title slots
+    /// What a shader that picks a slot by index finds in the table of strides
+    /// for the views a host slot is made from: a buffer view's stride (with
+    /// its kind), 0 for a constant buffer, words that read nothing for a
+    /// texture, for no view, and for a stride the stride bits cannot hold.
+    /// The kind bits never make a word that reads nothing read.
+    #[test]
+    fn slot_words_say_what_a_view_shows() {
+        use victory_shader::emit::{SLOT_IMAGE, SLOT_NONE, VIEW_INTEGER, VIEW_SIGNED};
+        // Resource dimensions: 1 a buffer, 3 a 2D texture.
+        let (mut texture, mut buffer) = ([0u32; 14], [0u32; 14]);
+        texture[0] = 3;
+        buffer[0] = 1;
+        assert_eq!(slot_word(Some(&View::Placed(false, texture, [0; 16]))), SLOT_IMAGE, "a texture");
+        assert_eq!(slot_word(Some(&View::Placed(true, texture, [0; 16]))), SLOT_IMAGE, "a texture UAV");
+        // A structured buffer view (dimension buffer, 16-byte elements).
+        let mut structured = [0u32; 16];
+        structured[1] = 1;
+        structured[7] = 16;
+        assert_eq!(slot_word(Some(&View::Placed(false, buffer, structured))), 16, "structured");
+        let uav = |stride| View::Unordered(0, 0, Some([0, 1, 0, 0, 64, stride, 0, 0, 0, 0]));
+        assert_eq!(slot_word(Some(&uav(SLOT_NONE))), SLOT_NONE, "a stride past the stride bits'");
+        for (word, reads) in [
+            (16, true),
+            (0, true),
+            (VIEW_INTEGER | VIEW_SIGNED | 4, true),
+            (SLOT_IMAGE, false),
+            (SLOT_NONE, false),
+            (SLOT_NONE | VIEW_INTEGER | VIEW_SIGNED, false),
+        ] {
+            assert_eq!(word_reads(word), reads, "{word:#x}");
+        }
+    }
+
+    /// A dynamic slot of a table made afresh has its view's kind in the
+    /// table of strides, as a title slot has, under a stride that reads
+    /// nothing (no title index picks it); the next view made in it replaces
+    /// it (a reused slot keeps nothing of its last table's), and title slots
     /// are not the caller's to write. (Needs a host GPU.)
     #[test]
     fn dynamic_slots_have_their_views_word() {
-        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+        use victory_shader::emit::{SLOT_NONE, VIEW_INTEGER, VIEW_SIGNED};
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        let data = heap.strides.as_ref().unwrap().2 as *const u32;
-        // SAFETY: inside the mapping.
-        let word = |index: u32| unsafe { data.add(index as usize).read_volatile() };
         let uav = |format| View::Unordered(0, 0, Some([format, 1, 0, 0, 64, 0, 0, 0, 0, 0]));
         let index = heap.dynamic(1).unwrap();
+        assert_eq!(heap.stride_word(index), SLOT_NONE, "never written");
         heap.dynamic_word(index, Some(&uav(59)));
-        assert_eq!(word(index), VIEW_INTEGER | VIEW_SIGNED | 2, "R16_SINT");
+        assert_eq!(heap.stride_word(index), SLOT_NONE | VIEW_INTEGER | VIEW_SIGNED, "R16_SINT");
         heap.dynamic_word(index, Some(&View::Constant(0x1000, 256)));
-        assert_eq!(word(index), 0, "a constant buffer since");
+        assert_eq!(heap.stride_word(index), SLOT_NONE, "a constant buffer since");
         heap.dynamic_word(0, Some(&uav(57)));
-        assert_eq!(word(0), 0, "a title slot");
+        assert_eq!(heap.stride_word(0), SLOT_NONE, "a title slot");
     }
 
     /// What may stand for a texture that is not there yet: one of its kind in

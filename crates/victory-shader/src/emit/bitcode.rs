@@ -1052,6 +1052,82 @@ impl Writer {
     }
 }
 
+/// The instructions and constants of a module, kept for tests to work out
+/// a condition the lowering made ([`Exprs::value`]).
+#[cfg(test)]
+pub(crate) struct Exprs {
+    insts: Vec<Inst>,
+    consts: Vec<(Ty, Const)>,
+}
+
+#[cfg(test)]
+impl Module {
+    pub(crate) fn exprs(&self) -> Exprs {
+        Exprs { insts: self.insts.clone(), consts: self.consts.clone() }
+    }
+}
+
+#[cfg(test)]
+impl Exprs {
+    /// The 32 bits of `v` (a comparison: 0 or 1), every instruction other
+    /// than integer arithmetic, an integer comparison or a select taken to
+    /// give `leaf`. `None` for a float comparison, which an integer one must
+    /// not be (3461e96: the driver's compiler dropped an `ult` on integers).
+    pub(crate) fn value(&self, v: V, leaf: u32) -> Option<u32> {
+        match v {
+            V::Const(i) => match self.consts[i as usize].1 {
+                Const::Int(x) => Some(x as u32),
+                _ => None,
+            },
+            V::Inst(i) => match self.insts[i as usize].op {
+                Op::Bin(op, a, b) => {
+                    let (a, b) = (self.value(a, leaf)?, self.value(b, leaf)?);
+                    Some(match op {
+                        Bin::Add => a.wrapping_add(b),
+                        Bin::Sub => a.wrapping_sub(b),
+                        Bin::Mul => a.wrapping_mul(b),
+                        Bin::UDiv => a.checked_div(b)?,
+                        Bin::SDiv => (a as i32).checked_div(b as i32)? as u32,
+                        Bin::URem => a.checked_rem(b)?,
+                        Bin::Shl => a.wrapping_shl(b),
+                        Bin::LShr => a.wrapping_shr(b),
+                        Bin::AShr => (a as i32).wrapping_shr(b) as u32,
+                        Bin::And => a & b,
+                        Bin::Or => a | b,
+                        Bin::Xor => a ^ b,
+                    })
+                }
+                Op::Cmp(p, a, b) => {
+                    let (a, b) = (self.value(a, leaf)?, self.value(b, leaf)?);
+                    let (sa, sb) = (a as i32, b as i32);
+                    Some(u32::from(match p {
+                        pred::EQ => a == b,
+                        pred::NE => a != b,
+                        pred::IUGT => a > b,
+                        pred::IUGE => a >= b,
+                        pred::IULT => a < b,
+                        pred::IULE => a <= b,
+                        pred::SGT => sa > sb,
+                        pred::SGE => sa >= sb,
+                        pred::SLT => sa < sb,
+                        pred::SLE => sa <= sb,
+                        _ => return None,
+                    }))
+                }
+                Op::Select(c, t, f) => {
+                    if self.value(c, leaf)? != 0 {
+                        self.value(t, leaf)
+                    } else {
+                        self.value(f, leaf)
+                    }
+                }
+                _ => Some(leaf),
+            },
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

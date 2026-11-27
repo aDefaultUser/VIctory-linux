@@ -65,6 +65,13 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// The conditions accesses through a view picked from the heap run under
+    /// ([`Lower::picked_guards`]), and the module's arithmetic to work them
+    /// out with.
+    #[cfg(test)]
+    pub picked_guards: Vec<(&'static str, V)>,
+    #[cfg(test)]
+    pub exprs: super::bitcode::Exprs,
 }
 
 pub(crate) struct Parts<'a> {
@@ -304,6 +311,12 @@ struct Lower<'a> {
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
+    /// What each access through a view picked from the heap runs under (a
+    /// scalar load as a buffer, as a constant buffer; a vector access), and
+    /// whether a typed view is taken for one of an integer format, as
+    /// functions of the slot's word (tests).
+    #[cfg(test)]
+    picked_guards: Vec<(&'static str, V)>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -2098,6 +2111,8 @@ impl<'a> Lower<'a> {
             coherent: HashSet::new(),
             root_copy: None,
             page_there: None,
+            #[cfg(test)]
+            picked_guards: Vec::new(),
             ordered: if x.native.stage == HwStage::Ps {
                 ordered_section(p)
             } else {
@@ -2914,6 +2929,10 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            picked_guards: std::mem::take(&mut self.picked_guards),
+            #[cfg(test)]
+            exprs: self.s.m.exprs(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -6821,16 +6840,23 @@ impl<'a> Lower<'a> {
         // BatchCullPreSkinnedMeshlets, BatchCullBatchCSMeshlets) reads its
         // batch records, mesh headers and instance transforms this way, so
         // it passed no meshlet and every indirect mesh draw ran empty.
-        // The host's table of strides by heap slot tells a buffer view
-        // (not 0) from anything else, which is still read as a constant
-        // buffer; only the load that fits the slot runs.
+        // The host's table by heap slot tells a buffer view (a stride) and
+        // a constant buffer (0) from a slot with neither (`SLOT_NONE` and
+        // up: a texture, nothing); only the load that fits the slot runs,
+        // and none for the others: a heap index computed from data can fall
+        // on a texture (the meshlet culls, RX 9070 XT under Proton: scalar
+        // cache faults at 0), whose descriptor read as a constant buffer's
+        // is no address. Such a load gives zeros. (`slot_stride` leaves out
+        // the kind bits, so a typed view of an integer format is a stride.)
         let picked = match kind {
             None => self.slot_stride(src)?,
             Some(_) => None,
         };
         if let Some(stride) = picked {
             let zero = self.s.m.i32(0);
-            let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+            let is_buffer = self.picks_buffer_view(stride);
+            #[cfg(test)]
+            self.picked_guards.push(("scalar buffer", is_buffer));
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
@@ -6859,6 +6885,8 @@ impl<'a> Lower<'a> {
             }
             let raw = self.end_guarded(at, &raw);
             let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
+            #[cfg(test)]
+            self.picked_guards.push(("scalar constants", other));
             let at = self.begin_guarded(Some(other));
             // (Renderer port 5: the twin of a constant buffer's slot is a
             // raw view of its bytes, read as one.)
@@ -8227,10 +8255,24 @@ impl<'a> Lower<'a> {
         Ok(phi)
     }
 
+    /// Whether a slot whose masked word is `stride` ([`Self::slot_stride`])
+    /// shows a buffer view: neither a constant buffer (0) nor a slot with no
+    /// buffer to read ([`super::shader::SLOT_NONE`] and up). An integer
+    /// comparison (3461e96: a float `ult` on integers was dropped by the
+    /// driver's compiler).
+    fn picks_buffer_view(&mut self, stride: V) -> V {
+        let c = self.cur;
+        let (zero, none) = (self.s.m.i32(0), self.s.m.i32(super::shader::SLOT_NONE));
+        let not_constant = self.s.m.cmp(c, pred::NE, stride, zero);
+        let below_none = self.s.m.cmp(c, pred::IULT, stride, none);
+        self.s.m.bin(c, Bin::And, not_constant, below_none)
+    }
+
     /// The bytes per element of the buffer view `src` names, if the program
     /// picks it from the view heap at an index it computes (root type
     /// `ResourceHeap`): read from the host's table by heap slot in the
-    /// current block.
+    /// current block, without the kind bits (`SLOT_IMAGE`, `SLOT_NONE`: no
+    /// buffer view there).
     fn slot_stride(&mut self, src: &Source) -> Result<Option<V>, Why> {
         let word = self.slot_word(src, false)?;
         Ok(word.map(|word| {
@@ -8255,6 +8297,8 @@ impl<'a> Lower<'a> {
             let x = self.s.m.bin(c, Bin::And, word, bit);
             self.s.m.cmp(c, pred::NE, x, zero)
         });
+        #[cfg(test)]
+        self.picked_guards.push(("integer", int));
         Ok(Some((int, signed)))
     }
 
@@ -12298,7 +12342,75 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// A buffer access (`buffer_*`, `tbuffer_*`). Through a descriptor the
+    /// program picks from the view heap at an index it computes, it runs only
+    /// where the host's table by heap slot says the slot shows a buffer view
+    /// ([`Self::picks_buffer_view`]). A texture's descriptor read as a
+    /// buffer's names no memory of the buffer's, as the scalar loads found
+    /// (scalar cache faults at 0, RX 9070 XT under Proton), and a vector
+    /// access through it is the texture cache's fault; a constant buffer's is
+    /// a handle of the wrong type. Loads give zeros there, stores and atomics
+    /// write nothing. Lanes the access's own guard leaves keep their
+    /// registers.
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        let src = self.descriptors.get(&((b, i), false)).copied();
+        let (Some(&Source::Loaded { load, first }), Some(stride)) = (src, match src {
+            Some(src) => self.slot_stride(src)?,
+            None => None,
+        }) else {
+            return self.buffer_access(inst, b, i);
+        };
+        let head = self.cur;
+        // The whole word, kind bits too: the access inside reads it again
+        // (`integer_view`, for d16 typed accesses).
+        let word = self.strides[&(head, load, first)];
+        let lanes = self.memory_guard(b, i)?;
+        let zero = self.s.m.i32(0);
+        let mut outside = Vec::new();
+        for &(reg, new) in &inst.writes {
+            let x = match (lanes, reg) {
+                (Some(g), Reg::V(_)) => {
+                    let old = match inst.read(reg).map(|o| self.i32_of(o)) {
+                        Some(Ok(o)) => o,
+                        _ => zero,
+                    };
+                    self.s.m.select(head, g, zero, old)
+                }
+                _ => zero,
+            };
+            outside.push((new, x));
+        }
+        let fits = self.picks_buffer_view(stride);
+        #[cfg(test)]
+        self.picked_guards.push(("vector", fits));
+        let at = self.begin_guarded(Some(fits));
+        self.strides.insert((self.cur, load, first), word);
+        let r = self.buffer_access(inst, b, i);
+        let mut merged = Vec::new();
+        let mut values = Vec::new();
+        if r.is_ok() {
+            for &(new, x) in &outside {
+                match self.vals.get(&new) {
+                    Some(&Val::I32(inside)) => {
+                        merged.push(new);
+                        values.push((inside, x));
+                    }
+                    _ => {
+                        self.vals.insert(new, Val::Missing("a buffer result"));
+                    }
+                }
+            }
+        }
+        let values = self.end_guarded(at, &values);
+        for (new, x) in merged.into_iter().zip(values) {
+            self.vals.insert(new, Val::I32(x));
+        }
+        // (What the access found of a root view is the guarded block's.)
+        self.root_copy = None;
+        r
+    }
+
+    fn buffer_access(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         self.root_copy = None;
         let Fields::Buffer {
             data,
@@ -12412,7 +12524,8 @@ impl<'a> Lower<'a> {
         // computes: no used-resource entry gives its stride, the host's
         // table by heap slot does; the access becomes a raw one at the
         // element's byte. (Also tells the host this shader reads such
-        // buffers.)
+        // buffers.) A slot with no buffer view (a constant buffer, `SLOT_NONE`
+        // and up) does not get here ([`Self::buffer`]).
         let mut index = index;
         if let Some(stride) = self.slot_stride(src)?
             && let Some(element) = index

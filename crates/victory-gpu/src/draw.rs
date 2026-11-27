@@ -847,15 +847,23 @@ pub(crate) fn dispatched() -> u64 {
 /// texture, and [`crate::descriptor::RtvRecord::key`].
 type TargetKey = (usize, (usize, [u32; 7]));
 
+/// The most bytes a constant buffer holds, and so what a shader may read
+/// through a root CBV.
+const CBV_BYTES: u64 = 1 << 16;
+
 /// The host address of a root view: its buffer's host copy, or for a
-/// constant buffer not 256-byte aligned there (the console needs 16) a
-/// copy in upload memory.
+/// constant buffer not 256-byte aligned there (the console needs 16), or
+/// with less than 64 KiB of the host buffer from its address on, a copy in
+/// upload memory ([`constants_copy`]).
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB
 /// (cut at their buffer's end), other views as all that is left of their
 /// buffer. (They were taken as 1 MiB: 1,452 of the 2,021 mesh vertex
 /// streams of a cutscene frame reach further, and what lay past the first
 /// megabyte was never brought up to date - meshes without bodies, exploded
 /// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
+/// shortcut: the copy is of title memory, as the copy for a constant buffer
+/// not aligned always was: what shaders of the same list (or of one not
+/// yet copied back) wrote into the host copy there is not in it.
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
@@ -865,17 +873,47 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .map_or(u64::MAX, |mb| mb << 20)
     });
     let shadow = crate::shadow::find(address, 1)?;
-    let len = shadow
-        .left(address)
-        .min(if srv { limit } else { 1 << 16 });
     let gpu = shadow.gpu(address);
-    if srv || gpu % 256 == 0 {
+    if srv {
+        let len = shadow.left(address).min(limit);
         shadow.refresh(list, address, len);
         #[cfg(feature = "diagnostics")]
         crate::book::root(gpu, len);
         return Some(gpu);
     }
-    list.fill_scratch(address as *const u8, len)
+    let len = shadow.left(address).min(CBV_BYTES);
+    // vkd3d-proton hands root CBVs to shaders as raw addresses on AMD:
+    // nothing bounds a read to the host buffer, and past its end the GPU
+    // faults.
+    let room = room(&shadow.buffer, gpu);
+    if gpu % 256 == 0 && room >= CBV_BYTES {
+        shadow.refresh(list, address, len);
+        #[cfg(feature = "diagnostics")]
+        crate::book::root(gpu, len);
+        return Some(gpu);
+    }
+    if room < CBV_BYTES {
+        SHORT_ROOT_CBVS.fetch_add(1, Ordering::Relaxed);
+    }
+    constants_copy(list, address, len)
+}
+
+/// Root CBVs whose host buffer ends within 64 KiB of their address, bound
+/// as copies in upload memory ([`root_view`]), since the start.
+pub(crate) static SHORT_ROOT_CBVS: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes of `buffer` from the host address `gpu` on.
+fn room(buffer: &ID3D12Resource, gpu: u64) -> u64 {
+    // SAFETY: a live buffer.
+    let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+    (base + width).saturating_sub(gpu)
+}
+
+/// 64 KiB of upload memory for a root CBV until the list is reset: the
+/// `len` bytes of title memory at `address` (zeros for what cannot be
+/// read), then zeros. Its host address.
+fn constants_copy(list: &HostList, address: u64, len: u64) -> Option<u64> {
+    list.fill_scratch(address as *const u8, len.min(CBV_BYTES), CBV_BYTES)
 }
 
 macro_rules! once {
@@ -891,6 +929,101 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
         roots.resize(slot + 1, Root::None);
     }
     roots[slot] = root;
+}
+
+/// Root views bound in place of one [`root_view`] could not give, since
+/// the start: copies of title memory in upload memory, constant buffers of
+/// zeros, and draws dropped as nothing safe could be bound.
+pub(crate) static UNBOUND_ROOT_VIEWS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Binds a root CBV (or a root SRV, with `VICTORY_ROOT_SRV_DIRECT=1`) the
+/// title did not set (`address` none) or [`root_view`] could not give.
+/// Left unset, the parameter is not empty: vkd3d-proton hands root views
+/// to shaders as raw addresses (on AMD all of them), and a parameter not
+/// set since the list began reads at 0, or at whatever the list last set
+/// at that index under another root signature. A constant buffer gets a
+/// copy of the 64 KiB at `address` in upload memory (zeros for what cannot
+/// be read), else 64 KiB of zeros: the most a constant buffer holds. A
+/// root SRV has no size, so nothing bounds what is read past such a copy:
+/// false, and the draw is dropped.
+fn set_unbound_view(
+    list: &HostList,
+    address: Option<u64>,
+    param: u32,
+    compute: bool,
+    srv: bool,
+) -> bool {
+    let copied = || constants_copy(list, address.filter(|&a| a != 0)?, CBV_BYTES);
+    let gpu = if srv {
+        None
+    } else if let Some(gpu) = copied() {
+        once!(
+            address = format_args!("{:#x}", address.unwrap_or(0)),
+            "a root CBV without a host copy reads a copy of title memory"
+        );
+        UNBOUND_ROOT_VIEWS[0].fetch_add(1, Ordering::Relaxed);
+        Some(gpu)
+    } else {
+        let zeros = zero_constants();
+        if zeros.is_some() {
+            UNBOUND_ROOT_VIEWS[1].fetch_add(1, Ordering::Relaxed);
+        }
+        zeros
+    };
+    let Some(gpu) = gpu else {
+        UNBOUND_ROOT_VIEWS[2].fetch_add(1, Ordering::Relaxed);
+        match address {
+            Some(a) => once!(
+                address = format_args!("{a:#x}"),
+                srv,
+                "a root view without a host copy: the draw is dropped"
+            ),
+            None => once!(srv, "a root view the title did not set and nothing to bind in its place: the draw is dropped"),
+        }
+        return false;
+    };
+    // SAFETY: an open list; upload memory that outlives the list's run.
+    unsafe {
+        if compute {
+            list.list.SetComputeRootConstantBufferView(param, gpu);
+        } else {
+            list.list.SetGraphicsRootConstantBufferView(param, gpu);
+        }
+    }
+    true
+}
+
+/// 64 KiB of zeros in upload memory, kept for the life of the process:
+/// lists bind it without holding it.
+struct Zeros {
+    _buffer: ID3D12Resource,
+    gpu: u64,
+}
+
+// SAFETY: D3D12 resources are free-threaded; nothing writes the buffer
+// after it is made.
+unsafe impl Send for Zeros {}
+// SAFETY: as above.
+unsafe impl Sync for Zeros {}
+
+/// The host address of [`Zeros`], made on first use. A failure to make it
+/// is not kept: the next call tries again.
+fn zero_constants() -> Option<u64> {
+    static ZEROS: std::sync::OnceLock<Zeros> = std::sync::OnceLock::new();
+    if let Some(zeros) = ZEROS.get() {
+        return Some(zeros.gpu);
+    }
+    let Some((buffer, data)) = crate::host::host().and_then(|h| h.upload_buffer(CBV_BYTES)) else {
+        once!("no upload memory for a constant buffer of zeros (tried again at the next use)");
+        return None;
+    };
+    crate::host::name(&buffer, || "zero constants".to_string());
+    // SAFETY: the buffer's mapped 64 KiB.
+    unsafe { std::ptr::write_bytes(data, 0, CBV_BYTES as usize) };
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    // Two threads may both make one: the one not kept is released here.
+    Some(ZEROS.get_or_init(|| Zeros { _buffer: buffer, gpu }).gpu)
 }
 
 /// The pass over the buffer views of `heap` that shaders pick by index
@@ -1747,15 +1880,20 @@ impl State {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
-                        if let Some(m) = &memory {
-                            // SAFETY: an open list; the directory lives as
-                            // long as the process and the list holds it.
-                            unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, m.directory);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, m.directory);
-                                }
+                        // (Set whenever the stage has the slot: `memory` is
+                        // asked for by the same list of slots.)
+                        let Some(m) = &memory else {
+                            once!("a shader reads title memory by address without a directory of it: the draw is dropped");
+                            UNBOUND_ROOT_VIEWS[2].fetch_add(1, Ordering::Relaxed);
+                            return false;
+                        };
+                        // SAFETY: an open list; the directory lives as long
+                        // as the process and the list holds it.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootShaderResourceView(param, m.directory);
+                            } else {
+                                l.SetGraphicsRootShaderResourceView(param, m.directory);
                             }
                         }
                         continue;
@@ -1773,7 +1911,11 @@ impl State {
                                     l.SetGraphicsRootShaderResourceView(param, gpu);
                                 }
                             },
-                            None => once!("a shader picks buffers from a view heap that is not set"),
+                            None => {
+                                once!("a shader picks buffers from a view heap that is not set: the draw is dropped");
+                                UNBOUND_ROOT_VIEWS[2].fetch_add(1, Ordering::Relaxed);
+                                return false;
+                            }
                         }
                         continue;
                     }
@@ -1791,7 +1933,11 @@ impl State {
                                     l.SetGraphicsRootShaderResourceView(param, gpu);
                                 }
                             },
-                            None => once!("a shader asks the kind of a view in a table without a view heap"),
+                            None => {
+                                once!("a shader asks the kind of a view in a table without a view heap: the draw is dropped");
+                                UNBOUND_ROOT_VIEWS[2].fetch_add(1, Ordering::Relaxed);
+                                return false;
+                            }
                         }
                         continue;
                     }
@@ -1800,7 +1946,11 @@ impl State {
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         // A table left unset is undefined: a null view.
-                        if tabled && !self.root_srv_table(list, None, param, compute, false) {
+                        if tabled {
+                            if !self.root_srv_table(list, None, param, compute, false) {
+                                return false;
+                            }
+                        } else if !set_unbound_view(list, None, param, compute, srv) {
                             return false;
                         }
                         continue;
@@ -1818,6 +1968,9 @@ impl State {
                         continue;
                     }
                     let Some(mut gpu) = root_view(list, address, srv) else {
+                        if !set_unbound_view(list, Some(address), param, compute, srv) {
+                            return false;
+                        }
                         continue;
                     };
                     if biased {
@@ -1843,15 +1996,18 @@ impl State {
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
-                    if let Some(m) = &memory {
-                        // SAFETY: an open list; the buffer lives as long as
-                        // the process and the list holds it.
-                        unsafe {
-                            if compute {
-                                l.SetComputeRootUnorderedAccessView(param, m.faults);
-                            } else {
-                                l.SetGraphicsRootUnorderedAccessView(param, m.faults);
-                            }
+                    let Some(m) = &memory else {
+                        once!("a shader notes empty pages without a directory of title memory: the draw is dropped");
+                        UNBOUND_ROOT_VIEWS[2].fetch_add(1, Ordering::Relaxed);
+                        return false;
+                    };
+                    // SAFETY: an open list; the buffer lives as long as the
+                    // process and the list holds it.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootUnorderedAccessView(param, m.faults);
+                        } else {
+                            l.SetGraphicsRootUnorderedAccessView(param, m.faults);
                         }
                     }
                     continue;
@@ -4976,5 +5132,167 @@ mod recheck_tests {
         // A fingerprint of other memory is not used.
         let elsewhere = Some((at + 4096, len, 1));
         assert_eq!(upload_print(elsewhere, at, len), fingerprint(at, len));
+    }
+}
+
+#[cfg(test)]
+mod unbound_root_view_tests {
+    use super::{CBV_BYTES, UNBOUND_ROOT_VIEWS, room, root_view, set_unbound_view};
+    use crate::host::{Host, HostList};
+    use std::sync::atomic::Ordering;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::s;
+
+    /// Reads the first and the last 16 bytes a constant buffer can hold
+    /// through a root CBV at b0, and stores them through a root UAV.
+    const SOURCE: &str = "#define RS \"CBV(b0), UAV(u0)\"\n\
+        cbuffer C : register(b0) { uint4 head; uint4 middle[4094]; uint4 tail; };\n\
+        RWByteAddressBuffer o : register(u0);\n\
+        [RootSignature(RS)]\n[numthreads(1, 1, 1)]\n\
+        void main() { o.Store4(0, head); o.Store4(16, tail); }\n";
+
+    /// [`SOURCE`] ready to run: [`Reader::run`] binds the root CBV with
+    /// `bind` (false if it bound nothing) and gives the head and the tail
+    /// the shader read.
+    struct Reader {
+        root: ID3D12RootSignature,
+        pso: ID3D12PipelineState,
+        out: ID3D12Resource,
+        out_data: *mut u8,
+    }
+
+    impl Reader {
+        fn new(host: &Host) -> Reader {
+            let code = crate::host::compile(SOURCE, s!("main"), s!("cs_5_1")).expect("the test shader compiles");
+            // SAFETY: the compiled bytes hold the root signature; plain creation.
+            let (root, pso) = unsafe {
+                let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).unwrap();
+                let pso: ID3D12PipelineState = host
+                    .device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: code.as_ptr().cast(),
+                            BytecodeLength: code.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                (root, pso)
+            };
+            let (out, out_data) = host.shared_buffer(256).unwrap();
+            Reader { root, pso, out, out_data }
+        }
+
+        fn run(&self, host: &Host, bind: impl FnOnce(&HostList) -> bool) -> [u32; 8] {
+            // SAFETY: the buffer's mapped 256 bytes.
+            unsafe { std::ptr::write_bytes(self.out_data, 0xAA, 256) };
+            let list = host.new_list().unwrap();
+            // SAFETY: an open list; live root signature and pipeline.
+            unsafe {
+                list.list.SetComputeRootSignature(&self.root);
+                list.list.SetPipelineState(&self.pso);
+            }
+            assert!(bind(&list), "a root CBV is bound");
+            // SAFETY: an open list; a live buffer.
+            unsafe {
+                list.list.SetComputeRootUnorderedAccessView(1, self.out.GetGPUVirtualAddress());
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: `execute` waited for the GPU; the buffer holds 256 bytes.
+            unsafe { self.out_data.cast::<[u32; 8]>().read_volatile() }
+        }
+    }
+
+    /// A root CBV `bind` could not give a host copy of reads the 64 KiB of
+    /// title memory at its address, one the title did not set reads zeros,
+    /// and a root SRV with neither drops the draw. Before, the parameter
+    /// was left unset: on vkd3d-proton (AMD) a raw address of 0 or of an
+    /// older binding, and the GPU faulted.
+    #[test]
+    fn an_unbound_root_cbv_reads_title_memory_or_zeros() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let reader = Reader::new(host);
+        let title: Vec<u32> = (0..1 << 14).map(|i| i * 3 + 1).collect();
+        let bind = |address: Option<u64>| move |list: &HostList| set_unbound_view(list, address, 0, true, false);
+
+        let copied = UNBOUND_ROOT_VIEWS[0].load(Ordering::Relaxed);
+        let read = reader.run(host, bind(Some(title.as_ptr() as u64)));
+        let expected: Vec<u32> = title[..4].iter().chain(&title[title.len() - 4..]).copied().collect();
+        assert_eq!(read.as_slice(), expected, "the copy holds the 64 KiB at the address");
+        assert!(UNBOUND_ROOT_VIEWS[0].load(Ordering::Relaxed) > copied);
+
+        let zeros = UNBOUND_ROOT_VIEWS[1].load(Ordering::Relaxed);
+        assert_eq!(reader.run(host, bind(None)), [0; 8], "a root CBV the title did not set reads zeros");
+        assert!(UNBOUND_ROOT_VIEWS[1].load(Ordering::Relaxed) > zeros);
+
+        let dropped = UNBOUND_ROOT_VIEWS[2].load(Ordering::Relaxed);
+        let list = host.new_list().unwrap();
+        assert!(!set_unbound_view(&list, Some(title.as_ptr() as u64), 0, true, true));
+        assert!(!set_unbound_view(&list, None, 0, true, true));
+        list.close();
+        assert!(UNBOUND_ROOT_VIEWS[2].load(Ordering::Relaxed) >= dropped + 2);
+    }
+
+    /// A root CBV whose host buffer ends within 64 KiB of its address, 256-
+    /// byte aligned or not, reads the title's bytes and then zeros from a
+    /// copy of its own; one with 64 KiB of host buffer left is bound in the
+    /// buffer as before. Before, the aligned one was bound in the buffer and
+    /// the other in a copy only as long as the title's bytes: a shader that
+    /// reads the whole constant buffer read past either's end, which on
+    /// vkd3d-proton (AMD, raw addresses) can fault.
+    #[test]
+    fn a_root_cbv_near_its_host_buffer_end_reads_a_bounded_copy() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let reader = Reader::new(host);
+        // 96 KiB: a host copy of 128 KiB, 32 KiB of it past the title's.
+        const LEN: u64 = 0x18000;
+        let title: Vec<u32> = (0..LEN as u32 / 4).map(|i| i * 3 + 1).collect();
+        let start = title.as_ptr() as u64;
+        let resource = title.as_ptr() as usize ^ 0x7E57;
+        crate::shadow::register(resource, start, LEN);
+        let shadow = crate::shadow::find(start, 1).expect("a host copy of the title buffer");
+        let words = |offset: u64| -> Vec<u32> {
+            let at = offset as usize / 4;
+            title[at..at + 4].to_vec()
+        };
+        let cbv = |address: u64| {
+            move |list: &HostList| {
+                let Some(gpu) = root_view(list, address, false) else {
+                    return false;
+                };
+                // SAFETY: an open list; upload memory or the live host copy.
+                unsafe { list.list.SetComputeRootConstantBufferView(0, gpu) };
+                true
+            }
+        };
+
+        for offset in [0x17F00, 0x17F10] {
+            let address = start + offset;
+            assert!(room(&shadow.buffer, shadow.gpu(address)) < CBV_BYTES);
+            let list = host.new_list().unwrap();
+            let bound = root_view(&list, address, false).unwrap();
+            list.close();
+            assert_ne!(bound, shadow.gpu(address), "offset {offset:#x}: not bound in the short host copy");
+            let read = reader.run(host, cbv(address));
+            let expected: Vec<u32> = words(offset).into_iter().chain([0; 4]).collect();
+            assert_eq!(read.as_slice(), expected, "offset {offset:#x}: the title's bytes, then zeros");
+        }
+
+        // 64 KiB of host copy left, 32 KiB of title buffer: the host copy.
+        let address = start + 0x10000;
+        assert!(room(&shadow.buffer, shadow.gpu(address)) >= CBV_BYTES);
+        let list = host.new_list().unwrap();
+        assert_eq!(root_view(&list, address, false), Some(shadow.gpu(address)));
+        list.close();
+        assert_eq!(reader.run(host, cbv(address))[..4], words(0x10000)[..]);
+
+        crate::shadow::unregister(resource, start);
     }
 }

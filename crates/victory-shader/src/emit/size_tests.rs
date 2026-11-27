@@ -302,7 +302,8 @@ fn a_buffer_loaded_past_the_cache_is_coherent() {
 
 /// A buffer picked from the view heap and read as raw bytes is read at the
 /// host's raw twin of its slot, when the host keeps some; an index past the
-/// title's slots reads the last twin, not a slot of something else.
+/// title's slots reads nothing (its word in the host's table by slot says
+/// so), not a slot of something else.
 #[test]
 fn a_picked_buffer_is_read_at_its_raw_twin() {
     let program = |at: u32| {
@@ -336,7 +337,7 @@ fn a_picked_buffer_is_read_at_its_raw_twin() {
             raw(&last),
         ]
     };
-    for (first, at, expected) in [(0, 32, 2), (4, 32, 6), (4, 32 * 1000, 10)] {
+    for (first, at, expected) in [(0, 32, 2), (4, 32, 6), (4, 32 * 1000, 0)] {
         super::shader::RAW_VIEWS_HERE.set(Some(first));
         let shader = build(&program(at), (8, 0)).expect("translates");
         super::shader::RAW_VIEWS_HERE.set(None);

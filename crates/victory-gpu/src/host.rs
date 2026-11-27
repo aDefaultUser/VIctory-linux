@@ -2440,8 +2440,8 @@ struct Deferred {
     /// change nothing.
     gpu_written: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     /// Scratch memory [`HostList::fill_scratch`] fills since the list last
-    /// wrote title memory (source, bytes): its host address.
-    filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
+    /// wrote title memory (source, bytes, bytes in all): its host address.
+    filled: std::collections::HashMap<(usize, usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -7233,16 +7233,20 @@ impl HostList {
             .push(Step::Fill(dst as usize, src as usize, len, None));
     }
 
-    /// The host address of `len` bytes of scratch memory that hold the title
-    /// memory at `src` as of the list's submission: one fill for every ask
-    /// until the list next writes title memory.
-    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
-        let key = (src as usize, len as usize);
+    /// The host address of `room` bytes of scratch memory that hold the
+    /// `len` bytes of title memory at `src` as of the list's submission, then
+    /// zeros: one fill for every ask until the list next writes title memory.
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64, room: u64) -> Option<u64> {
+        let room = room.max(len);
+        let key = (src as usize, len as usize, room as usize);
         let known = self.deferred().filled.get(&key).copied();
         if known.is_some() {
             return known;
         }
-        let (gpu, to) = self.scratch(len)?;
+        let (gpu, to) = self.scratch(room)?;
+        // SAFETY: the `room` bytes just taken, which the list has not run
+        // with yet.
+        unsafe { std::ptr::write_bytes(to.add(len as usize), 0, (room - len) as usize) };
         self.defer_fill(to, src, len as usize);
         self.deferred().filled.insert(key, gpu);
         Some(gpu)
@@ -9446,6 +9450,14 @@ impl Meter {
                 COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
             });
             let dropped = crate::draw::take_dropped() as f64 / frames;
+            let [unbound_copied, unbound_zeros, unbound_dropped] =
+                crate::draw::UNBOUND_ROOT_VIEWS.each_ref().map(|n| n.load(Ordering::Relaxed));
+            let short = crate::draw::SHORT_ROOT_CBVS.load(Ordering::Relaxed);
+            if unbound_copied + unbound_zeros + unbound_dropped + short > 0 {
+                tracing::info!(
+                    "root views unset or without a host copy, so far: {unbound_copied} bound as copies of title memory, {unbound_zeros} as zeros, {unbound_dropped} draws dropped; {short} root CBVs copied as their host buffer ends within 64 KiB"
+                );
+            }
             let indirect = crate::list::take_indirect() as f64 / frames;
             let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
             let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;

@@ -16,8 +16,11 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
 /// index it computes (SM 6.6 dynamic resources): a raw buffer of
-/// [`SLOT_STRIDES_COUNT`] dwords the host keeps, dword `i` the bytes per
-/// element of the buffer view at heap slot `i` (0: none or not a buffer).
+/// [`SLOT_STRIDES_COUNT`] dwords the host keeps, dword `i` what host slot
+/// `i` shows: in [`VIEW_STRIDE_BITS`], the bytes per element of a buffer
+/// view, 0 for a constant buffer, [`SLOT_IMAGE`] for a view of a texture,
+/// [`SLOT_NONE`] for nothing to read; above them a view's kind
+/// ([`VIEW_INTEGER`], [`VIEW_SIGNED`]).
 /// The console's descriptor holds that stride and its hardware multiplies
 /// the element index by it; the program's code does not say it, and the
 /// used-resource list only names what tables hold. A shader that has this
@@ -32,6 +35,17 @@ pub const SLOT_STRIDES: u8 = 255;
 pub const SLOT_VIEW_WORDS: u8 = 252;
 /// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+/// In a [`SLOT_STRIDES`] dword's [`VIEW_STRIDE_BITS`]: the slot shows a view
+/// of a texture. Its descriptor read as a buffer's or a constant buffer's is
+/// no address: on AMD the scalar cache faulted at 0 (RADV) or near it. A
+/// stride no buffer view has; the kind bits above it are clear.
+pub const SLOT_IMAGE: u32 = VIEW_STRIDE_BITS;
+/// In a [`SLOT_STRIDES`] dword's [`VIEW_STRIDE_BITS`]: nothing to read at the
+/// slot (null, not made yet, or no slot of the title's). Strides from it up
+/// name no buffer: a shader that picks the slot reads zeros and writes
+/// nothing there. A dynamic slot keeps it under its view's kind bits, which
+/// only a view in a table asks for ([`SLOT_VIEW_WORDS`]).
+pub const SLOT_NONE: u32 = VIEW_STRIDE_BITS - 1;
 /// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format
 /// (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
 /// (After VIctory 4243a96a.)

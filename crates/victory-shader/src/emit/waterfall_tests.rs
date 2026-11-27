@@ -97,6 +97,28 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
 /// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
 /// hardware GPU and on WARP (each skipped without a device) and returns,
 /// per one that ran, the UAV's 32 dwords.
+/// The host's table by heap slot (`SLOT_STRIDES`) for `views`, as the host
+/// writes it: what each view is, and nothing to read past them (no slot of
+/// the title's). All of it, so that any slot a shader picks is in it.
+pub(super) fn strides_of(views: &[View]) -> Vec<u32> {
+    use super::{SLOT_IMAGE, SLOT_NONE, SLOT_STRIDES_COUNT};
+    let mut table = vec![SLOT_NONE; SLOT_STRIDES_COUNT as usize];
+    for (word, view) in table.iter_mut().zip(views) {
+        *word = match view {
+            View::Texture(..) | View::Cube(..) | View::TextureUav(..) | View::UintTextureUav(..) => SLOT_IMAGE,
+            View::RawUav(_) => 1,
+            View::HalfUav(_) => 8,
+            View::Cbv(_) => 0,
+            View::Buffer { stride, .. } => match *stride {
+                Stride::Raw => 1,
+                Stride::Typed => 16,
+                Stride::Structured(bytes) | Stride::Format(_, bytes) => bytes,
+            },
+        };
+    }
+    table
+}
+
 pub(super) fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
@@ -132,12 +154,19 @@ pub(super) fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec
             assert_eq!(u.root, RootType::Table, "{u:?}");
             ud[u.index as usize] = 0;
         }
+        let mut roots = vec![(0, Root::Constants(ud))];
+        // A shader that picks views from the heap reads what each is from
+        // the host's table by slot (the only root view of these programs).
+        if shader.root_srvs.contains(&super::SLOT_STRIDES) {
+            assert_eq!(shader.root_srvs.len() + shader.root_cbvs.len() + shader.root_uavs.len(), 1);
+            roots.push((1, Root::View { srv: true, data: strides_of(views) }));
+        }
         let words = host
             .dispatch(
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
+                    roots,
                     views,
                     samplers: &samplers,
                     groups: [1, 1, 1],
