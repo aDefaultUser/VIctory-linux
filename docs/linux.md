@@ -70,8 +70,7 @@ on one machine.
 
 The title's fog composite reads a quarter-resolution radiance texture.
 This setting makes that one input read as zeros, only in the composite's
-own freshly made descriptor table. The title's descriptors, other programs
-and cache keys stay as they were. It applies only when the program's
+own freshly made descriptor table. It applies only when the program's
 resources and views match the recorded layout, and otherwise logs why once
 and changes nothing.
 
@@ -86,9 +85,8 @@ investigation.
 #### Large stray triangles
 
 A heavier shot than the first-room readings above drew large stray
-triangles in some frames. Its numbers stand apart from those readings. The
-A/B used one executable and one fixed camera at 6,915 draws per frame, with
-the script's `VICTORY_CARD_STEPS=2` and two added settings.
+triangles in some frames. The A/B used one executable and one fixed camera
+at 6,915 draws per frame, with the script's `VICTORY_CARD_STEPS=2` and two added settings.
 `VICTORY_CARD_STEPS_GUARD=1` makes a submission wait as before when one of
 its copies needs flights landed first, and `VICTORY_CARD_STEPS_SRV=1` keeps
 the buffer between readable by shaders. The table adds at most one wait to
@@ -114,6 +112,33 @@ RUN_LINUX_CONSOLE=series-s \
 
 All three settings are opt-in and were measured in this one shot on this
 one machine.
+
+#### A scoped quality profile
+
+The fog workaround and the three card-steps settings were tested together
+as one opt-in profile. A plain Windows release build ran as a Series S
+with a 1280x720 internal picture at 1920x1080, with the ambient light and
+the scattering at their defaults. The four settings follow the three
+1080p performance settings above.
+
+```sh
+RUN_LINUX_EXE=target/x86_64-pc-windows-msvc/release/victory.exe \
+RUN_LINUX_CONSOLE=series-s \
+  scripts/run-linux.sh run "$HOME/Games/Title" Title.exe \
+  VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_UNDER_FUSED=0 VICTORY_PLACEHOLDER_RANGES=1 \
+  VICTORY_FOG_INPUT=radiance VICTORY_CARD_STEPS_GUARD=1 VICTORY_CARD_STEPS_SRV=1 \
+  VICTORY_CARD_STEPS_WAIT=1
+```
+
+- **Day room, fixed camera:** clear, with no large triangles in 1,040
+  captured frames over 52 seconds at 7,392 draws per frame. A median of
+  19.8 FPS across 11 readings about five seconds apart.
+- **First room:** a median of 23.5 FPS across six readings after moving
+  and turning.
+- **Faces were missing** in this replay.
+
+These readings stand apart from the 29.9 and 30.0 FPS first-room medians
+above. Trace revisits are ongoing.
 
 ### Earlier result, Series X
 
