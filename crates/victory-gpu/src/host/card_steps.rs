@@ -83,6 +83,83 @@ pub(super) fn stage() -> u32 {
     })
 }
 
+/// What is done when the steps of a submission could all be taken but one of
+/// its copies at their place ([`place`]) needs flights landed before the CPU
+/// prepares it (`VICTORY_CARD_STEPS_GUARD`; off by default): `1` the steps
+/// are refused and the submission waits as without this stage, `2` the case
+/// is only counted and named ([`guard_seen`]), the steps are still taken.
+///
+/// Why: [`plan`] sees such a copy only for the order of what it takes. Taking
+/// the steps skips the submission's wait for flights ([`late_blocked`]),
+/// which [`blocked_by`] asks for two more reasons there: the copy's source
+/// is taken into upload memory on the CPU while a flight may still write it
+/// ([`place::Waits::Yes`]), or a step left on the CPU reads its destination,
+/// which title memory is given only when the flights land
+/// ([`place::read_by`]). Either reads bytes from before the flights.
+fn guard() -> Guard {
+    static GUARD: OnceLock<Guard> = OnceLock::new();
+    *GUARD.get_or_init(|| match std::env::var("VICTORY_CARD_STEPS_GUARD").ok().as_deref() {
+        Some("1") => Guard::Refuse,
+        Some("2") => Guard::Count,
+        _ => Guard::Off,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Guard {
+    Off,
+    Refuse,
+    Count,
+}
+
+/// Why [`guarded`] refuses, by [`place::CpuWait`].
+const GUARD_SOURCE: &str = "a copy at its place takes on the CPU a source flights write (VICTORY_CARD_STEPS_GUARD)";
+const GUARD_READERS: &str = "a step on the CPU reads what a copy at its place writes behind flights (VICTORY_CARD_STEPS_GUARD)";
+
+/// Whether steps that could all be taken are, with `wait` what a copy at its
+/// place waits for flights for.
+fn guarded(guard: Guard, wait: Option<&place::CpuWait>) -> Result<(), &'static str> {
+    match (guard, wait) {
+        (Guard::Refuse, Some(place::CpuWait::Source(..))) => Err(GUARD_SOURCE),
+        (Guard::Refuse, Some(place::CpuWait::Readers)) => Err(GUARD_READERS),
+        _ => Ok(()),
+    }
+}
+
+/// Since the last frame-rate line, with [`guard`] on: submissions whose
+/// steps could all be taken although a copy at its place takes a source
+/// flights write, or has its destination read on the CPU; and how many of
+/// them were refused.
+static GUARDED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The first of those cases named one by one in the log; all of them, since
+/// the start.
+const GUARD_NAMED: u64 = 16;
+static GUARD_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Counts `wait` for [`log`], and names it while few have been.
+fn guard_seen(wait: &place::CpuWait, refused: bool, steps: usize) {
+    GUARDED[usize::from(matches!(wait, place::CpuWait::Readers))].fetch_add(1, Ordering::Relaxed);
+    if refused {
+        GUARDED[2].fetch_add(1, Ordering::Relaxed);
+    }
+    let n = GUARD_SEEN.fetch_add(1, Ordering::Relaxed);
+    if n >= GUARD_NAMED {
+        return;
+    }
+    let what = match *wait {
+        place::CpuWait::Source(dst, src, len) => {
+            format!("a copy at its place of {len:#x} bytes from {src:#x} to {dst:#x} takes its source on the CPU under flights' writes")
+        }
+        place::CpuWait::Readers => "a step on the CPU reads what a copy at its place writes, under flights' writes".to_owned(),
+    };
+    tracing::warn!(
+        "steps on the card ({} of the first {GUARD_NAMED}): {what}; {steps} steps could be taken, {}",
+        n + 1,
+        if refused { "refused: the submission waits for the flights" } else { "taken anyway (VICTORY_CARD_STEPS_GUARD=2)" },
+    );
+}
+
 /// Whether a copy at its place in a list ([`place`]) is only in the way of
 /// what is done on the card in front of the lists if that stands behind it in
 /// them (`VICTORY_PLACED_ORDER=1`; off: wherever it stands), and a
@@ -777,6 +854,17 @@ impl Host {
                 to,
             });
         }
+        // Before anything is recorded or a slot pointed elsewhere: refused,
+        // the submission is prepared as if this stage were off.
+        if guard() != Guard::Off {
+            spent.next("steps on the card: copies at their place");
+            let wait = place::cpu_wait(runs, written);
+            let verdict = guarded(guard(), wait.as_ref());
+            if let Some(wait) = &wait {
+                guard_seen(wait, verdict.is_err(), chosen.len());
+            }
+            verdict?;
+        }
         spent.next("steps on the card: the list");
         let Some(own) = self.own_list() else {
             return Err("no host list or buffer for it");
@@ -910,6 +998,18 @@ pub(super) fn log(frames: f64) {
         d[2] / 1024.0,
         d[3],
     );
+    if guard() != Guard::Off {
+        let g: Vec<f64> = GUARDED.iter().map(|g| g.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "steps that could all be taken while a copy at its place needs flights landed, per frame \
+             (VICTORY_CARD_STEPS_GUARD={}): {:.2} by its source, {:.2} by a reader of its destination; {:.2} refused; {} since the start",
+            if guard() == Guard::Refuse { "1, refused" } else { "2, counted only" },
+            g[0],
+            g[1],
+            g[2],
+            GUARD_SEEN.load(Ordering::Relaxed),
+        );
+    }
     #[cfg(feature = "diagnostics")]
     {
         let r: Vec<f64> = place::READERS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -1146,6 +1246,26 @@ mod tests {
         assert!(plan(&[fill(1000, 4, true), copy(1000, 5000, 100, false)], 1, true, &mut None).is_err());
     }
 
+    /// A copy at its place is seen by the plan only for the order: beside a
+    /// fill that reads what flights write it is in nobody's way, and the fill
+    /// is taken whether the copy takes its source on the CPU there too or a
+    /// step on the CPU reads its destination behind it. The guard refuses
+    /// those (`=1`) and only those; counting alone (`=2`) and off take them.
+    #[test]
+    fn copies_at_their_place_that_wait_for_flights_are_left_to_the_guard() {
+        let placed = Does::Placed { dst: 9000, src: 1100, len: 64 };
+        assert_eq!(planned(&[fill(1000, 64, true), placed]), [(0, 0)]);
+        assert_eq!(planned(&[fill(1000, 64, true), placed, Does::Read { from: 9000, to: 9064, asked: false }]), [(0, 0)]);
+        let source = place::CpuWait::Source(9000, 1100, 64);
+        assert_eq!(guarded(Guard::Refuse, Some(&source)), Err(GUARD_SOURCE));
+        assert_eq!(guarded(Guard::Refuse, Some(&place::CpuWait::Readers)), Err(GUARD_READERS));
+        assert_eq!(guarded(Guard::Refuse, None), Ok(()));
+        for guard in [Guard::Off, Guard::Count] {
+            assert_eq!(guarded(guard, Some(&source)), Ok(()));
+            assert_eq!(guarded(guard, Some(&place::CpuWait::Readers)), Ok(()));
+        }
+    }
+
     #[test]
     fn a_refresh_of_another_host_copy_is_seen() {
         let does = [Does::Refresh { shadow: 7, from: 100, to: 200 }];
@@ -1339,5 +1459,121 @@ mod tests {
         eprintln!("{done} of 48 copies were done on the card, {} submissions waited", DONE[3].load(Ordering::Relaxed));
         eprintln!("settles for title memory under shader writes: {}", LATE_STATS[WHY_STALE].load(Ordering::Relaxed));
         assert!(done >= 20, "only {done} copies were done on the card");
+    }
+
+    /// The guard the whole way, in a process of its own:
+    /// `VICTORY_RELAY=2 VICTORY_CARD_STEPS=2 VICTORY_CARD_STEPS_GUARD=1 cargo
+    /// test -p victory-gpu --lib card_steps -- --ignored --test-threads=1
+    /// a_copy_at_its_place`. A flight writes what a fill of the next
+    /// submission reads, so the fill can be done on the card; a copy at its
+    /// place in the same list takes its source, which the flight writes too,
+    /// into upload memory on the CPU. Refused, the submission waits and the
+    /// copy finds what the flight wrote; without the guard it takes the
+    /// bytes from before the flight. Then a copy at its place of memory no
+    /// flight writes beside the same fill: the fill is still taken.
+    #[test]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_CARD_STEPS=2 VICTORY_CARD_STEPS_GUARD=1 and a process of its own"]
+    fn a_copy_at_its_place_behind_a_flight_waits_for_it() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const PART: usize = 1 << 20;
+        let Some(host) = host() else {
+            return;
+        };
+        assert!(relay_exact() && stage() == 2, "set VICTORY_RELAY=2 VICTORY_CARD_STEPS=2");
+        // SAFETY: memory of our own, never freed.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 3 * PART, MEM_RESERVE | MEM_COMMIT | 0x20_0000, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!base.is_null());
+        // SAFETY: just committed.
+        let title = unsafe { std::slice::from_raw_parts_mut(base, 3 * PART) };
+        let start = base as usize;
+        // What the flights write, where the copies go, what nothing writes.
+        let (written, to, apart) = (start, start + PART, start + 2 * PART);
+        for (i, at) in [written, to, apart].into_iter().enumerate() {
+            crate::shadow::register(0x5550 + i, at as u64, PART as u64);
+        }
+        let shaders = crate::shadow::find(written as u64, 64).unwrap();
+        assert!(crate::shadow::find(to as u64, 64).is_some() && crate::shadow::find(apart as u64, 64).is_some());
+        let slow = (host.uav_buffer(64 << 20).unwrap(), host.uav_buffer(64 << 20).unwrap());
+        // The flight: 1 KiB at +0x1000 of the first buffer, behind some work.
+        let wrote = |round: u8, i: usize| (round ^ (i * 7) as u8) | 0x80;
+        let flight = |round: u8| {
+            let (upload, data) = host.upload_buffer(4096).unwrap();
+            for i in 0..1024 {
+                // SAFETY: inside the mapping.
+                unsafe { data.add(i).write(wrote(round, i)) };
+            }
+            let a = host.new_list().unwrap();
+            shaders.refresh(&a, written as u64, PART as u64);
+            shaders.gpu_writes(&a, written as u64, PART as u64);
+            // SAFETY: an open list; live buffers.
+            unsafe {
+                for _ in 0..24 {
+                    a.list.CopyBufferRegion(&slow.1, 0, &slow.0, 0, 64 << 20);
+                }
+                a.list.CopyBufferRegion(&shaders.buffer, shaders.offset((written + 0x1000) as u64), &upload, 0, 1024);
+                a.list
+                    .ResourceBarrier(&[transition(&shaders.buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+            }
+            a.close();
+            a.keep(&upload);
+            a
+        };
+        for (i, b) in title[..0x2000].iter_mut().enumerate() {
+            *b = 0x11 ^ i as u8;
+        }
+        for (i, b) in title[2 * PART..2 * PART + 0x100].iter_mut().enumerate() {
+            *b = 0x22 ^ i as u8;
+        }
+        let (fills, waited, refused) =
+            (DONE[0].load(Ordering::Relaxed), DONE[3].load(Ordering::Relaxed), GUARDED[2].load(Ordering::Relaxed));
+        // Recorded while no shader has written the first buffer: the copy
+        // takes its source on the CPU.
+        let b = host.new_list().unwrap();
+        let (staging, staged) = b.upload(host, 4096).unwrap();
+        b.defer_fill_buffer(&staging, staged, (written + 0x1200) as *const u8, 512);
+        assert!(b.place_copy(to + 0x100, written + 0x1000, 256), "a copy at its place");
+        b.close();
+        let a = flight(1);
+        host.execute_own(&a);
+        let number = host.execute_own(&b);
+        settle_now(WHY_SYNC);
+        assert!(FINISHED.load(Ordering::Acquire) >= number);
+        // SAFETY: the mapping, which the submission's fill wrote.
+        let staged = unsafe { std::slice::from_raw_parts(staged, 512) };
+        assert!(staged.iter().enumerate().all(|(i, &x)| x == wrote(1, 0x200 + i)), "the fill");
+        match guard() {
+            Guard::Refuse => {
+                assert_eq!(GUARDED[2].load(Ordering::Relaxed), refused + 1, "the guard refused it");
+                assert_eq!(DONE[3].load(Ordering::Relaxed), waited + 1, "and the submission waited");
+                assert_eq!(DONE[0].load(Ordering::Relaxed), fills, "the fill was done on the CPU");
+            }
+            _ => assert_eq!(DONE[0].load(Ordering::Relaxed), fills + 1, "the fill was done on the card"),
+        }
+        let copied = &title[PART + 0x100..PART + 0x200];
+        assert!(
+            copied.iter().enumerate().all(|(i, &x)| x == wrote(1, i)),
+            "the copy at its place holds the bytes from before the flight (VICTORY_CARD_STEPS_GUARD=1 refuses this): {:x?}",
+            &copied[..8]
+        );
+        // Beside a copy no flight is in the way of.
+        let refused = GUARDED[2].load(Ordering::Relaxed);
+        let (fills, waited) = (DONE[0].load(Ordering::Relaxed), DONE[3].load(Ordering::Relaxed));
+        let c = host.new_list().unwrap();
+        let (staging, staged) = c.upload(host, 4096).unwrap();
+        c.defer_fill_buffer(&staging, staged, (written + 0x1200) as *const u8, 512);
+        assert!(c.place_copy(to + 0x400, apart, 256), "a copy at its place");
+        c.close();
+        let a2 = flight(2);
+        host.execute_own(&a2);
+        let number = host.execute_own(&c);
+        settle_now(WHY_SYNC);
+        assert!(FINISHED.load(Ordering::Acquire) >= number);
+        // SAFETY: as above.
+        let staged = unsafe { std::slice::from_raw_parts(staged, 512) };
+        assert!(staged.iter().enumerate().all(|(i, &x)| x == wrote(2, 0x200 + i)), "the fill beside it");
+        assert_eq!(DONE[0].load(Ordering::Relaxed), fills + 1, "the fill beside it was done on the card");
+        assert_eq!((DONE[3].load(Ordering::Relaxed), GUARDED[2].load(Ordering::Relaxed)), (waited, refused), "nothing refused");
+        assert!(title[PART + 0x400..PART + 0x500].iter().enumerate().all(|(i, &x)| x == 0x22 ^ i as u8), "the copy beside it");
+        assert_eq!(host.log_messages(), None);
     }
 }

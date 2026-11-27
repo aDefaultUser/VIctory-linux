@@ -158,6 +158,32 @@ pub(super) fn read_by(runs: &[&HostList], written: &[(usize, usize)]) -> bool {
     })
 }
 
+/// Why a copy at its place in `runs` makes [`blocked_by`] wait for flights
+/// that write `written`, if one does: the same two cases, by the same tests.
+pub(super) enum CpuWait {
+    /// [`Waits::Yes`]: its source is taken on the CPU (dst, src, bytes).
+    Source(usize, usize, usize),
+    /// [`Waits::ForReaders`], and [`read_by`]: a step reads its destination
+    /// on the CPU behind it.
+    Readers,
+}
+
+pub(super) fn cpu_wait(runs: &[&HostList], written: &[(usize, usize)]) -> Option<CpuWait> {
+    let mut readers = false;
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::Placed(p) = step {
+                match p.waits(written) {
+                    Waits::Yes => return Some(CpuWait::Source(p.dst, p.src, p.len)),
+                    Waits::ForReaders => readers = true,
+                    Waits::No => {}
+                }
+            }
+        }
+    }
+    (readers && read_by(runs, written)).then_some(CpuWait::Readers)
+}
+
 /// Diagnostics: the steps found reading what a copy at its place writes
 /// ([`read_by`]) since the last frame line: another such copy, a buffer copy,
 /// a fill, a texture, a step of ours.
