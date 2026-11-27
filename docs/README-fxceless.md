@@ -283,11 +283,13 @@ off. The keyboard counts while the title's window has focus:
 
 The mouse counts once captured: a left click in the title's window captures
 it (that click presses nothing) and Esc releases it (Esc still presses
-Menu). The capture also ends when Windows no longer reports the title's
-window as the foreground window, and when the cursor clip VIctory set is
-taken off or replaced by anything else; VIctory then leaves the cursor free
-and does not set the clip again until the next click. Under Wine a switch to
-a program outside Wine can go unnoticed (see `linux.md`); Esc in the
+Menu). The capture also ends when the title's window is told it lost
+activation (`WM_CANCELMODE`, `WM_ACTIVATE` inactive, `WM_ACTIVATEAPP`
+false), when Windows no longer reports it as the foreground window, and when
+the cursor clip VIctory set is taken off or replaced by anything else;
+VIctory then leaves the cursor free and does not set the clip again until
+the next click. Under Wine on an X server without a window manager a switch
+to a program outside Wine goes unnoticed (see `linux.md`); Esc in the
 title's window still releases it. While captured the cursor is hidden and
 kept inside the window, and:
 

@@ -219,7 +219,8 @@ struct Seen {
 }
 
 /// Mouse capture. A left click in the title's window captures the mouse;
-/// Esc (also the pad's Menu) or the window losing the foreground releases it.
+/// Esc (also the pad's Menu), the window losing the foreground or being told
+/// it lost activation ([`focus_lost`]) releases it.
 /// While captured the host keeps the cursor hidden at the window's centre,
 /// and how far it got from there is the motion.
 #[derive(Default)]
@@ -295,6 +296,9 @@ trait Pointer {
     /// The clip in effect (the whole screen while there is none).
     fn clip(&mut self) -> Option<Rect>;
     fn move_to(&mut self, at: (i32, i32));
+    /// Whether the title's window was told it lost activation since the
+    /// last call ([`focus_lost`]).
+    fn focus_lost(&mut self) -> bool;
 }
 
 /// The mouse in the title's window ([`Capture`]): while captured the cursor
@@ -317,6 +321,11 @@ struct Mouse {
 impl Mouse {
     fn poll(&mut self, pointer: &mut impl Pointer) -> MouseInput {
         let seen = pointer.see();
+        // Before the clip is held or the cursor centred: only a new click
+        // captures again.
+        if pointer.focus_lost() {
+            self.capture.lose("the title's window lost activation");
+        }
         let mut input = self.capture.step(seen);
         if let Some(window) = self.capture.window {
             match self.hold(window, pointer) {
@@ -519,6 +528,19 @@ impl Look {
         *self = Look::new(self.settings);
         (0.0, 0.0)
     }
+}
+
+/// Set by [`focus_lost`], taken by the next poll.
+static FOCUS_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The title's window was told it lost activation (WM_CANCELMODE,
+/// WM_ACTIVATE inactive, WM_ACTIVATEAPP false): the next poll ends the
+/// capture. Under Wine with a window manager, an X11 window outside Wine that
+/// takes the keyboard focus can leave the title's window the foreground
+/// window with our clip in place, and WM_CANCELMODE is then the only sign.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn focus_lost() {
+    FOCUS_LOST.store(true, Ordering::Relaxed);
 }
 
 /// Set while the mouse is captured: the title's window hides the cursor.
@@ -1771,6 +1793,10 @@ mod host {
             // SAFETY: a plain call; the point is inside our clip.
             unsafe { SetCursorPos(x, y) };
         }
+
+        fn focus_lost(&mut self) -> bool {
+            FOCUS_LOST.swap(false, Ordering::Relaxed)
+        }
     }
 
     fn rect(r: RECT) -> Rect {
@@ -2347,6 +2373,8 @@ mod tests {
         /// `set_clip` fails.
         refuse: bool,
         moves: Vec<(i32, i32)>,
+        /// Taken by the next poll.
+        focus_lost: bool,
     }
 
     const SCREEN: Rect = Rect {
@@ -2363,6 +2391,7 @@ mod tests {
                 clip: SCREEN,
                 refuse: false,
                 moves: Vec::new(),
+                focus_lost: false,
             }
         }
     }
@@ -2383,6 +2412,9 @@ mod tests {
         }
         fn move_to(&mut self, at: (i32, i32)) {
             self.moves.push(at);
+        }
+        fn focus_lost(&mut self) -> bool {
+            std::mem::take(&mut self.focus_lost)
         }
     }
 
@@ -2479,6 +2511,49 @@ mod tests {
             assert!(mouse.poll(&mut pointer).captured);
             assert_eq!(pointer.clip, CLIPPED);
         }
+    }
+
+    #[test]
+    fn lost_activation_ends_the_capture_though_the_window_and_clip_stay() {
+        // Wine with a window manager, an X11 window outside Wine taking the
+        // keyboard: the title's window is still the foreground window, our
+        // clip is still in place, and the cursor is dragged away.
+        let mut pointer = FakePointer::new();
+        let mut mouse = captured_mouse(&mut pointer);
+        let moves = pointer.moves.len();
+        pointer.focus_lost = true;
+        pointer.seen.cursor = (200, 190);
+        assert_eq!(mouse.poll(&mut pointer), MouseInput::default());
+        assert!(mouse.capture.window.is_none());
+        assert_eq!(pointer.clip, SCREEN);
+        assert_eq!(pointer.moves.len(), moves);
+        // The window still the foreground window and no new click: it stays
+        // released.
+        mouse.poll(&mut pointer);
+        assert_eq!(pointer.clip, SCREEN);
+        // A loss told while released is not held against the next click.
+        pointer.focus_lost = true;
+        mouse.poll(&mut pointer);
+        pointer.seen.buttons = MOUSE_LEFT;
+        assert!(mouse.poll(&mut pointer).captured);
+        assert_eq!(pointer.clip, CLIPPED);
+    }
+
+    #[test]
+    fn a_click_held_through_lost_activation_does_not_capture_again() {
+        let mut pointer = FakePointer::new();
+        let mut mouse = captured_mouse(&mut pointer);
+        pointer.seen.buttons = MOUSE_LEFT;
+        assert!(mouse.poll(&mut pointer).captured);
+        pointer.focus_lost = true;
+        assert_eq!(mouse.poll(&mut pointer), MouseInput::default());
+        // Still held: no new click.
+        assert_eq!(mouse.poll(&mut pointer), MouseInput::default());
+        assert_eq!(pointer.clip, SCREEN);
+        pointer.seen.buttons = 0;
+        mouse.poll(&mut pointer);
+        pointer.seen.buttons = MOUSE_LEFT;
+        assert!(mouse.poll(&mut pointer).captured);
     }
 
     #[test]

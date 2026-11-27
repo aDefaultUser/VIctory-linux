@@ -301,13 +301,17 @@ host pointer. This was seen working on Xwayland: mouse look both ways, the
 buttons, the capturing click and the release by Esc. Esc takes the clip off
 again.
 
-A switch to a window outside Wine is not always seen. In one test an X11
-window of another program took the keyboard focus for 2 seconds while the
-mouse was captured, and Wine still reported the title's window as the
-foreground window, so VIctory kept the capture. VIctory ends the capture
-when Wine takes its clip off or something replaces it, and does not set it
-again; whether Wine does that on such a switch has not been checked. Esc
-releases the mouse once the title's window has the keyboard again. The
+When an X11 window outside Wine takes the keyboard focus while the mouse is
+captured, Wine (Proton Experimental, Wine 11) may still report the title's
+window as the foreground window and keep VIctory's clip. With a window
+manager running, Wine still sends the title's window `WM_CANCELMODE` on the
+X11 focus loss, and VIctory ends the capture on it. This was seen with small
+test window managers, among them one that advertises `_NET_ACTIVE_WINDOW`
+(as KWin and Mutter do) but does not follow such a switch, where nothing
+else changed; KWin and Mutter themselves were not tried. On an X server
+without a window manager, as in a bare private Xwayland, Wine sends nothing:
+the X11 focus there follows the pointer, Wine ignores those focus events, and
+the capture holds until Esc reaches the title's window again. The
 settings (`VICTORY_MOUSE=0`, `VICTORY_MOUSE_SPEED=2`, ...) go on the command
 line as `NAME=value` arguments, like the others; Proton started without the
 script reads them from its environment.

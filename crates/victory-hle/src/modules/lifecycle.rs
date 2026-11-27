@@ -267,6 +267,17 @@ extern "system" fn window_proc(
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
     }
+    // The window lost activation: the captured mouse is let go (gameinput).
+    // The title still sees the message.
+    let deactivated = match message {
+        wm::WM_CANCELMODE => true,
+        wm::WM_ACTIVATE => wparam & 0xFFFF == wm::WA_INACTIVE as usize,
+        wm::WM_ACTIVATEAPP => wparam == 0,
+        _ => false,
+    };
+    if deactivated {
+        super::gameinput::focus_lost();
+    }
     // The captured mouse is mouse look (gameinput); no cursor shows then.
     if message == wm::WM_SETCURSOR
         && (lparam & 0xFFFF) as u32 == wm::HTCLIENT
