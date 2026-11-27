@@ -27,13 +27,22 @@ Use `RUN_LINUX_WINE=wine` to keep running with system Wine.
 
 Run `shaders` and `warm --used` as separate commands for the old
 launch-time warm-up. Put settings such as `VICTORY_BAKE_TEXTURES_MS=1500`
-after the title executable name. After updating, the renderer translates
-shaders under a new cache key.
+after the title executable name. The translator now uses cache version 5.
+It compiles older cached shaders again when they are needed.
 
 With `VICTORY_STREAM_NOTICE=0`, the default `VICTORY_PAGE_WRITES` setting
 also queues early-uploaded textures again when a plain storage read
 finishes. `VICTORY_HEAP_RECHECK_EVERY` enables further checks for late
 texture changes and is off by default.
+
+DirectStorage holds known page destinations from the title's submit until
+the request completes. Texture uploads and card fetches use the Linux
+release's queue and fetch paths.
+
+On hosts that cap indirect dispatch width, a single record without a count
+buffer can run in two parts for shaders that read only the X group ID. The
+two parts cover up to 131,070 groups in X. Counted and multi-record
+dispatches on those hosts are limited to 65,535 groups in X per record.
 
 ## Tested result
 
@@ -191,6 +200,12 @@ look and buttons, click-to-capture and Esc release. A menu replay of
 On the same Radeon RX 9070 XT, `e145f70` passed seven synthetic device
 checks for heap descriptors and root constant buffers, plus a CPU check for
 the d16 kind decision.
+
+The DirectStorage tests at `a2eee18` passed under headless Wine. They cover
+page lists changed or freed after submit and queues filled before submit.
+The Radeon tests at `9c824dc` and `b7d0a0a` covered native wide dispatches,
+group IDs and a 67,440-group dispatch with the cap forced on. Each group
+ran once under its own ID in both the standalone and batched cases.
 
 The scene and frame-rate results above belong to their stated builds. A
 full gameplay replay of the combined update is pending. Jaw alignment,
