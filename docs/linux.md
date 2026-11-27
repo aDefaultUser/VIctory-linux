@@ -23,10 +23,10 @@ private `wineserver` build in place of Proton's (`RUN_LINUX_WINESERVER`),
 `/dev/ntsync`, an app-local, patched vkd3d-proton build matched to that
 Proton, and a native `d3dcompiler_47.dll`. Logs, images and saves are not
 published. The vkd3d-proton build is upstream 2576c0b4 (Meson version 3.2.0,
-build id `v3.1-56-g2576c0b4+`) with dxil-spirv at 114e664e and a local
-backport of e084e35c, whose two fixups touch dxil-spirv's legacy structurizer,
-for the renderer's shaders. It is the one tested setup, not a requirement.
-The tested wineserver indexes views by address using the approach in
+build id `v3.1-56-g2576c0b4+`) with dxil-spirv at 114e664e. For the
+renderer's shaders it adds a local backport of e084e35c, whose two fixups
+touch dxil-spirv's legacy structurizer. The tested wineserver indexes views
+by address using the approach in
 [Wine's memory-view change](https://github.com/wine-mirror/wine/commit/3217449b),
 backported to the Wine revision in that Proton build.
 
@@ -89,8 +89,9 @@ investigation.
 #### Large stray triangles
 
 A heavier shot than the first-room readings above drew large stray
-triangles in some frames. The A/B used one executable and one fixed camera
-at 6,915 draws per frame, with the script's `VICTORY_CARD_STEPS=2` and two added settings.
+triangles in some frames. The A/B used one executable and one fixed
+camera at 6,915 draws per frame, with the script's `VICTORY_CARD_STEPS=2`
+and two added settings.
 `VICTORY_CARD_STEPS_GUARD=1` makes a submission wait as before when one of
 its copies needs flights landed first, and `VICTORY_CARD_STEPS_SRV=1` keeps
 the buffer between readable by shaders. The table adds at most one wait to
@@ -146,14 +147,14 @@ tests at the checkpoint. Holding 30 FPS in the heavier shot is still an
 open goal.
 
 Faces were missing in this replay, so it shows nothing of how they move.
-In other replays with the d16 fix in 1430f61, which reads a view's kind
-from its table, and with face meshes visible, mouths were seen moving
-again. Jaws there can still look distorted, and some face meshes still go
-missing at times. In a diagnostics build in the same session, some face
-meshes were already missing with the fog workaround off and stayed missing
-after it was turned on and off again. The workaround removes the whole
-quarter-resolution radiance term, and where each of these symptoms starts
-is still being narrowed down.
+Mouths were seen moving again in earlier replays that had face meshes
+visible and the d16 fix in 1430f61, which reads a view's kind from its
+table. Jaws in those replays can still look distorted, and some face meshes
+still go missing at times. In a diagnostics build in the same session,
+some face meshes were already missing with the fog workaround off and
+stayed missing after it was turned on and off again. The workaround
+removes the whole quarter-resolution radiance term, and where each of these
+symptoms starts is still being narrowed down.
 
 ### Earlier result, Series X
 
@@ -248,12 +249,11 @@ The title's folder, `victory.exe` and the DLLs are bound read-only. Inside
 the sandbox, `victory.exe` sees `VICTORY_DATA_DIR=Z:\state\data` and
 `VICTORY_CACHE_DIR=Z:\state\cache\victory`, where it cannot tell whether
 they are in a checkout. So before anything is written, the script resolves
-the three folders on the host (through symbolic links too) and stops if one
-is in a VIctory checkout (a `.victory-root` in that folder or a folder above
-it), or overlaps, by holding it or lying in it, the checkout the script runs
-from, the title's folder, a shader input, `victory.exe`, a DLL or Proton. It
-does not search a folder for other checkouts inside it: a writable folder
-that holds some other checkout passes.
+the three folders on the host (through symbolic links too). It stops if one
+is in a VIctory checkout, which it finds by a `.victory-root` in that folder
+or a folder above it. It also stops if one holds or lies in the checkout the
+script runs from, the title's folder, a shader input, `victory.exe`, a DLL or
+Proton. A writable folder can contain a separate checkout.
 
 `shaders --list FILE` writes FILE on the host, only when the command
 succeeds: the list is made in the cache and then replaces FILE. Until then
