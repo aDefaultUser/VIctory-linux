@@ -28,6 +28,12 @@ pub(crate) const SOURCES: usize = 4;
 /// The most executions charged by one job: the most a record costs (2^26)
 /// as often still fits 32 bits.
 pub(crate) const TIMES: u32 = 31;
+/// The kind of a job of one dispatch record clamped into
+/// [`super::SPLIT`] records [`super::PART_BYTES`] apart, as
+/// [`super::bound_split`] makes them (not a PC argument kind: those are 0,
+/// 1, 2 and 10).
+pub(crate) const DISPATCH_IN_PARTS: u32 = 3;
+const _: () = assert!(super::SPLIT as u64 * super::PART_BYTES <= SLOT as u64, "the parts fit a record's place");
 
 pub(crate) const SOURCE: &str = r#"
 #define RS "SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), UAV(u0), UAV(u1)"
@@ -36,8 +42,10 @@ ByteAddressBuffer src1 : register(t1);
 ByteAddressBuffer src2 : register(t2);
 ByteAddressBuffer src3 : register(t3);
 // The count, 12 bytes of nothing, then per job: source (bits 0-1), kind
-// (4-7), words (8-11) and the executions that read it (16-31); the
-// record's offset in the source; its place in the scratch buffer; nothing.
+// (4-7; 3: a dispatch written as SPLIT records of at most 65,535 groups in
+// x, `DISPATCH_IN_PARTS`), words (8-11) and the executions that read it
+// (16-31); the record's offset in the source; its place in the scratch
+// buffer; nothing.
 ByteAddressBuffer jobs : register(t4);
 RWByteAddressBuffer dst_args : register(u0);
 RWByteAddressBuffer budget : register(u1);
@@ -83,9 +91,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             }
             record[1] = min(record[1], (1u << 26) / max(record[0], 1u));
             cost = record[0] * record[1];
-        } else if (kind == 2) {
+        } else if (kind == 2 || kind == 3) {
             uint3 g = uint3(record[0], record[1], record[2]);
-            g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+            uint widest = kind == 3 ? max(WIDEST, SPLIT * 65535u) : WIDEST;
+            g = min(g, uint3(g.x <= widest ? widest : 65535u, 65535u, 65535u));
             if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
                 g = uint3(0, 0, 0);
             }
@@ -108,7 +117,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     }
     costs[gi] = cost;
     GroupMemoryBarrierWithGroupSync();
-    if (active && kind > 2) {
+    if (active && kind > 3) {
         uint was;
         InterlockedMax(largest_asked, asked, was);
         InterlockedAdd(all_asked, min(asked, 1u << 24), was);
@@ -173,14 +182,24 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             record[2] = 0;
         }
     }
+    if (kind == 3) {
+        for (uint part = 0; part < SPLIT; part++) {
+            uint before = part * 65535u;
+            uint x = record[0] > before ? min(record[0] - before, 65535u) : 0u;
+            dst_args.Store3(job.z + part * 12u, uint3(x, record[1], record[2]));
+        }
+        return;
+    }
     for (uint s = 0; s < words; s++) {
         dst_args.Store(job.z + s * 4, record[s]);
     }
 }
 "#;
 
-/// The words of a record of `kind` (PC argument numbering).
+/// The words of a record of `kind` (PC argument numbering, or
+/// [`DISPATCH_IN_PARTS`]) read from its source.
 pub(crate) fn words(kind: u32) -> Option<u32> {
+    let kind = if kind == DISPATCH_IN_PARTS { 2 } else { kind };
     super::min_stride(kind).map(|bytes| bytes / 4)
 }
 

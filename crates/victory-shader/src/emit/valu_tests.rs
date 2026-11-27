@@ -95,6 +95,60 @@ const fn vgpr(n: u8) -> u16 {
     256 + n as u16
 }
 
+/// The first group's number the host gives the programs that ask for it
+/// ([`super::USER_GROUP_BASE`]): the second part of a dispatch of more
+/// groups than the host runs.
+const GROUP_BASE: u32 = 65_535;
+
+/// A 1-thread program of [`build_cs`]'s layout with the group's number in x
+/// (and with `y` the one in y) enabled; it stores the number in x, or with
+/// `read_y` the number in y.
+fn group_number_program(y: bool, read_y: bool) -> HostShader {
+    // The group's numbers follow the 5 user SGPRs: s5 (x) and s6 (y),
+    // copied to s12 and s13 before s5 is reused.
+    let mut words = vec![s_mov_b32(12, 5)];
+    if read_y {
+        words.push(s_mov_b32(13, 6));
+    }
+    words.push(s_mov_b32(5, 0x80)); // inline constant 0
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.push(vop1(0x001, 0, sgpr(if read_y { 13 } else { 12 }))); // v_mov_b32 v0
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+    const X: u32 = 1 << 7;
+    const Y: u32 = 1 << 8;
+    lower_words(words, 1, 0, if y { X | Y } else { X })
+}
+
+/// Whether `shader` asks the host for the number of its first group.
+fn asks_group_base(shader: &HostShader) -> bool {
+    shader.user_data.iter().any(|u| u.root == RootType::Other(super::USER_GROUP_BASE))
+}
+
+/// A compute program that reads its group's number in x alone asks the
+/// host for the number of its first group (a dispatch of more groups than
+/// the host runs comes in parts); one that reads the number in y does not.
+/// The lowering alone: no device needed.
+#[test]
+fn only_programs_of_one_dimension_ask_for_their_first_group() {
+    assert!(asks_group_base(&group_number_program(false, false)));
+    assert!(asks_group_base(&group_number_program(true, false)), "y enabled but not read");
+    assert!(!asks_group_base(&group_number_program(true, true)));
+    // No group number read: nothing asked.
+    assert!(!asks_group_base(&build_valu_cs(&[])));
+}
+
+/// The group's number in x counts from the host's first group: the group
+/// 0 of the second part of a dispatch is the console's group 65,535. The
+/// number in y is the host's.
+#[test]
+fn a_group_number_in_x_counts_from_the_hosts_first_group() {
+    for (y, read_y, expected) in [(false, false, GROUP_BASE), (true, false, GROUP_BASE), (true, true, 0)] {
+        let shader = group_number_program(y, read_y);
+        run_cases(&shader, &[[1, 2, 3, 4]], |label, _, _, out| assert_eq!(out, expected, "{label}"));
+    }
+}
+
 /// Builds and lowers a 1-thread synthetic RDNA2 compute shader that receives
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
@@ -117,7 +171,12 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
+    lower_words(words, threads, lds_bytes, 0)
+}
 
+/// Lowers a whole program of [`build_cs`]'s layout; `rsrc2`: more bits of
+/// that register.
+fn lower_words(words: Vec<u32>, threads: u32, lds_bytes: u32, rsrc2: u32) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -152,7 +211,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: (5 << 1) | ((lds_bytes / 512) << 15), // 5 user SGPRs: s0..s4
+            rsrc2: rsrc2 | (5 << 1) | ((lds_bytes / 512) << 15), // 5 user SGPRs: s0..s4
             threads: [threads, 1, 1],
         }),
         code,
@@ -240,6 +299,7 @@ fn run_cases_on(
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Constants, 0) => inputs[u.dword as usize],
                     (RootType::Table, 1) => 0,
+                    (RootType::Other(super::USER_GROUP_BASE), _) => GROUP_BASE,
                     other => panic!("unexpected user data {other:?}"),
                 };
             }

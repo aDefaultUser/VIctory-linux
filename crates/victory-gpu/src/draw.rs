@@ -1497,8 +1497,9 @@ impl State {
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
-        // All of every group, unless the dispatch says otherwise.
-        if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
+        // All of every group, unless the dispatch says otherwise; the first
+        // group, unless it runs in parts (`dispatch_in_parts`).
+        if kind == victory_shader::emit::USER_DISPATCH_THREADS_X || kind == victory_shader::emit::USER_GROUP_BASE {
             return 0;
         }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
@@ -3124,8 +3125,18 @@ impl State {
         if fog {
             self.fog_input(p, &fresh_before);
         }
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        // More groups in x than the host runs in one dispatch, of a program
+        // told its first group: in parts.
+        let group_base = (x > crate::indirect::PART)
+            .then(|| compute_word(p, victory_shader::emit::USER_GROUP_BASE))
+            .flatten();
+        match group_base {
+            // SAFETY: an open list with everything set; the parameter and
+            // word are the pipeline's.
+            Some(base) => unsafe { dispatch_in_parts(list, base, [x, y, z]) },
+            // SAFETY: an open list with everything set.
+            _ => unsafe { list.list.Dispatch(x, y, z) },
+        }
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -4264,7 +4275,7 @@ impl State {
             self.batch = None;
         }
         // A draw after dispatches waits for them.
-        if kind != DISPATCH {
+        if kind != DISPATCH && kind != crate::indirect::batch::DISPATCH_IN_PARTS {
             self.synced();
         }
         let (id, offset) = (args.id(), args.offset(arguments));
@@ -4373,10 +4384,29 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // A dispatch by a program told its first group, where the host's
+        // clamp holds x to 65,535: one record without a count runs in parts
+        // (`crate::indirect::bound_split`); with more records or a count
+        // they are clamped, as before.
+        let group_base = (kind == DISPATCH && crate::indirect::in_parts())
+            .then(|| compute_word(p, victory_shader::emit::USER_GROUP_BASE))
+            .flatten();
+        let parts = group_base
+            .filter(|_| max == 1 && count.is_none())
+            .zip(host_signature(DISPATCH, crate::indirect::PART_BYTES as u32));
+        if group_base.is_some() && parts.is_none() {
+            once!(
+                pipeline = p.name,
+                max,
+                count = count.is_some(),
+                "an indirect dispatch not made in parts: its records run at most 65,535 groups in x"
+            );
+        }
         // One record without a count: clamped in a batch (`batches`).
         let batch = if batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
-            self.batched(list, &args, arguments, kind)
+            let job = if parts.is_some() { crate::indirect::batch::DISPATCH_IN_PARTS } else { kind };
+            self.batched(list, &args, arguments, job)
         } else {
             None
         };
@@ -4440,7 +4470,9 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
+                let bounded = if parts.is_some() {
+                    crate::indirect::bound_split(list, (&args.buffer, offset))
+                } else if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
@@ -4484,16 +4516,26 @@ impl State {
             self.mesh_scissor(list, true);
         }
         // SAFETY: an open list with everything set; the scratch buffer and
-        // host copies are kept alive by the list, and the signature is cached.
+        // host copies are kept alive by the list, and the signatures are
+        // cached; the parameter and word of the parts are the pipeline's.
         unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &bounded,
-                at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
+            if let Some(((param, word), signature)) = &parts {
+                for part in 0..crate::indirect::SPLIT {
+                    list.list.SetComputeRoot32BitConstant(*param, part * crate::indirect::PART, *word);
+                    let at = at + u64::from(part) * crate::indirect::PART_BYTES;
+                    list.list.ExecuteIndirect(signature, 1, &bounded, at, None, 0);
+                }
+                list.list.SetComputeRoot32BitConstant(*param, 0, *word);
+            } else {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &bounded,
+                    at,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                )
+            }
         };
         if kind == MESH {
             self.mesh_scissor(list, false);
@@ -4532,6 +4574,31 @@ fn dispatch_groups(threads: [u32; 3], size: [u32; 3]) -> [u32; 3] {
     std::array::from_fn(|i| threads[i].div_ceil(size[i]))
 }
 
+/// The parts of a dispatch of `x` groups in x, each of at most what the host
+/// runs in one (`crate::indirect::PART`): its first group and its groups.
+fn group_parts(x: u32) -> impl Iterator<Item = (u32, u32)> {
+    let part = crate::indirect::PART;
+    (0..x.div_ceil(part)).map(move |i| (i * part, (x - i * part).min(part)))
+}
+
+/// A dispatch of `groups` in parts ([`group_parts`]), each told its first
+/// group in the program's word `(param, word)`
+/// (`victory_shader::emit::USER_GROUP_BASE`), which is 0 again after.
+///
+/// # Safety
+/// An open list with everything of the dispatch set; `(param, word)` a
+/// word of the bound root signature's compute user data.
+unsafe fn dispatch_in_parts(list: &HostList, (param, word): (u32, u32), [x, y, z]: [u32; 3]) {
+    // SAFETY: the caller's.
+    unsafe {
+        for (first, groups) in group_parts(x) {
+            list.list.SetComputeRoot32BitConstant(param, first, word);
+            list.list.Dispatch(groups, y, z);
+        }
+        list.list.SetComputeRoot32BitConstant(param, 0, word);
+    }
+}
+
 /// Where a compute pipeline's user data has a word the host computes: the
 /// root parameter and the dword in it.
 fn compute_word(p: &HostPipeline, kind: u32) -> Option<(u32, u32)> {
@@ -4544,6 +4611,25 @@ fn compute_word(p: &HostPipeline, kind: u32) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod thread_tests {
     use super::*;
+
+    /// A dispatch of more groups in x than the host runs: the first part
+    /// from group 0, the tail from the group after it; one that fits is one
+    /// part from 0 (the base a bind leaves).
+    #[test]
+    fn large_dispatches_are_made_in_parts() {
+        let parts = |x| group_parts(x).collect::<Vec<_>>();
+        assert_eq!(parts(67_440), [(0, 65_535), (65_535, 1_905)]);
+        assert_eq!(parts(115_200), [(0, 65_535), (65_535, 49_665)]);
+        assert_eq!(parts(65_535), [(0, 65_535)]);
+        assert_eq!(parts(65_536), [(0, 65_535), (65_535, 1)]);
+        assert_eq!(parts(200_000), [(0, 65_535), (65_535, 65_535), (131_070, 65_535), (196_605, 3_395)]);
+        // 2^32 - 1 is 65,537 parts of 65,535.
+        assert_eq!(group_parts(u32::MAX).count(), 65_537);
+        assert_eq!(group_parts(u32::MAX).last(), Some((u32::MAX - 65_535, 65_535)));
+        for x in [67_440, 115_200, 200_000, u32::MAX] {
+            assert_eq!(group_parts(x).map(|(_, n)| u64::from(n)).sum::<u64>(), u64::from(x), "{x}");
+        }
+    }
 
     #[test]
     fn threads_are_counted_in_the_programs_groups() {
