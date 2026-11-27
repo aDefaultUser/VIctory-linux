@@ -175,11 +175,13 @@ fn mouse_pad(mouse: MouseInput, look: (f32, f32)) -> PadState {
 }
 
 /// The mouse in one poll: motion in screen pixels (y down), buttons held
-/// (`MOUSE_*` bits).
+/// (`MOUSE_*` bits), and whether it is captured (mouse look stops at once
+/// when it is not).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct MouseInput {
     motion: (i32, i32),
     buttons: u8,
+    captured: bool,
 }
 
 /// A screen rectangle; right and bottom are outside it.
@@ -249,7 +251,12 @@ impl Capture {
             (None, _) => None,
         };
         if before.is_some() != self.window.is_some() {
-            tracing::info!(captured = self.window.is_some(), "mouse");
+            let why = match self.window {
+                Some(_) => "click",
+                None if escaped => "Esc",
+                None => "the title's window is not the foreground window",
+            };
+            tracing::info!(captured = self.window.is_some(), why, "mouse");
         }
         let Some(window) = self.window else {
             return MouseInput::default();
@@ -266,6 +273,119 @@ impl Capture {
         MouseInput {
             motion,
             buttons: if self.armed { seen.buttons } else { 0 },
+            captured: true,
+        }
+    }
+
+    /// Ends a capture the host could not hold; a click captures again.
+    fn lose(&mut self, why: &str) {
+        if self.window.take().is_some() {
+            tracing::warn!(captured = false, why, "mouse");
+        }
+    }
+}
+
+/// The host's cursor, or a fake in tests.
+trait Pointer {
+    /// The mouse in the title's window, as [`Seen`] describes it.
+    fn see(&mut self) -> Seen;
+    /// Confines the cursor to `clip`, or frees it (`None`); false when the
+    /// system refused.
+    fn set_clip(&mut self, clip: Option<Rect>) -> bool;
+    /// The clip in effect (the whole screen while there is none).
+    fn clip(&mut self) -> Option<Rect>;
+    fn move_to(&mut self, at: (i32, i32));
+}
+
+/// The mouse in the title's window ([`Capture`]): while captured the cursor
+/// is clipped to the window and put back at its centre at every poll.
+///
+/// The clip is held only while it is the one we made. Whatever takes it off
+/// or replaces it (the system when the foreground changes, another program,
+/// Wine) ends the capture instead of being fought: a clip is never set again
+/// over someone else's, and one the system refused is never taken for ours.
+#[derive(Default)]
+#[cfg_attr(not(windows), allow(dead_code))]
+struct Mouse {
+    capture: Capture,
+    /// The clip we asked for, and the one the system made of it (it keeps a
+    /// clip on the screen), taken off again on release.
+    clip: Option<(Rect, Rect)>,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl Mouse {
+    fn poll(&mut self, pointer: &mut impl Pointer) -> MouseInput {
+        let seen = pointer.see();
+        let mut input = self.capture.step(seen);
+        if let Some(window) = self.capture.window {
+            match self.hold(window, pointer) {
+                Ok(()) => {
+                    let center = window.center();
+                    if seen.cursor != center {
+                        pointer.move_to(center);
+                    }
+                }
+                Err(why) => {
+                    self.capture.lose(why);
+                    input = MouseInput::default();
+                }
+            }
+        }
+        if self.capture.window.is_none() {
+            self.release(pointer);
+        }
+        CAPTURED.store(self.capture.window.is_some(), Ordering::Relaxed);
+        input
+    }
+
+    /// Keeps our clip on `window`'s client area.
+    fn hold(&mut self, window: Rect, pointer: &mut impl Pointer) -> Result<(), &'static str> {
+        // A pixel inside on every side: Wine takes a clip as large as the
+        // screen (a borderless window filling it) for no clip, and then does
+        // not grab the pointer.
+        let clip = Rect {
+            left: window.left + 1,
+            top: window.top + 1,
+            right: (window.right - 1).max(window.left + 2),
+            bottom: (window.bottom - 1).max(window.top + 2),
+        };
+        if let Some((asked, made)) = self.clip {
+            if asked == clip && pointer.clip() == Some(made) {
+                return Ok(());
+            }
+            // A window that moved or changed size asks for a new clip (the
+            // system may have taken the old one off for it). For the same
+            // window, ours is gone.
+            if asked == clip {
+                self.clip = None;
+                return Err("the cursor clip was taken off or replaced");
+            }
+        }
+        if !pointer.set_clip(Some(clip)) {
+            // Whatever clip is in effect is not ours to take off later.
+            self.clip = None;
+            return Err("the system refused the cursor clip");
+        }
+        match pointer.clip() {
+            Some(made) => {
+                self.clip = Some((clip, made));
+                Ok(())
+            }
+            None => {
+                // Not known, so it could not be told apart later: off again.
+                pointer.set_clip(None);
+                Err("the cursor clip could not be read back")
+            }
+        }
+    }
+
+    fn release(&mut self, pointer: &mut impl Pointer) {
+        // Another program's clip is left alone.
+        if let Some((_, made)) = self.clip.take()
+            && pointer.clip() == Some(made)
+        {
+            pointer.set_clip(None);
         }
     }
 }
@@ -392,6 +512,12 @@ impl Look {
         let dead_zone = self.settings.dead_zone;
         let tilt = dead_zone + (1.0 - dead_zone) * length.min(1.0);
         (x / length * tilt, y / length * tilt)
+    }
+
+    /// The stick at rest, with no speed left to carry into a later capture.
+    fn stop(&mut self) -> (f32, f32) {
+        *self = Look::new(self.settings);
+        (0.0, 0.0)
     }
 }
 
@@ -756,8 +882,13 @@ impl State {
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
-        // Every poll, so the stick comes to rest after the mouse stops.
-        let look = self.look.step(mouse.motion, now);
+        // Every poll while captured, so the stick comes to rest after the
+        // mouse stops; at once on release.
+        let look = if mouse.captured {
+            self.look.step(mouse.motion, now)
+        } else {
+            self.look.stop()
+        };
         let stand_in = merged(fallback(&keys), mouse_pad(mouse, look));
         if one_pad {
             let pad = pads.into_iter().flatten().fold(stand_in, merged);
@@ -1530,7 +1661,7 @@ mod host {
         fn mouse(&mut self) -> MouseInput {
             self.mouse
                 .as_mut()
-                .map_or_else(MouseInput::default, Mouse::poll)
+                .map_or_else(MouseInput::default, |mouse| mouse.poll(&mut HostPointer))
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1606,81 +1737,40 @@ mod host {
         unsafe { GetAsyncKeyState(i32::from(key)) < 0 }
     }
 
-    /// The mouse in the title's window ([`Capture`]): the cursor is clipped
-    /// to the window and put back at its centre at every poll. Under Wine
-    /// the clip is also what makes the pointer's motion relative: while the
-    /// cursor is clipped, Wine grabs the pointer and moves the cursor by the
-    /// device's own motion, so an X server that cannot warp the host pointer
-    /// (Xwayland) still gives motion, and the desktop pointer stays in the
-    /// window.
-    #[derive(Default)]
-    pub(super) struct Mouse {
-        capture: Capture,
-        /// The clip we asked for, and the one the system made of it (it keeps
-        /// a clip on the screen), taken off again on release.
-        clip: Option<(Rect, Rect)>,
-    }
+    /// The host's cursor. Under Wine the clip ([`Mouse`]) is also what makes
+    /// the pointer's motion relative: while the cursor is clipped, Wine grabs
+    /// the pointer and moves the cursor by the device's own motion, so an X
+    /// server that cannot warp the host pointer (Xwayland) still gives
+    /// motion, and the desktop pointer stays in the window.
+    pub(super) struct HostPointer;
 
-    impl Mouse {
-        fn poll(&mut self) -> MouseInput {
-            let seen = see();
-            let input = self.capture.step(seen);
-            match self.capture.window {
-                Some(window) => self.hold(window, seen.cursor),
-                None => self.release(),
-            }
-            CAPTURED.store(self.capture.window.is_some(), Ordering::Relaxed);
-            input
+    impl Pointer for HostPointer {
+        fn see(&mut self) -> Seen {
+            see()
         }
 
-        fn hold(&mut self, window: Rect, cursor: (i32, i32)) {
-            // A pixel inside on every side: Wine takes a clip as large as
-            // the screen (a borderless window filling it) for no clip, and
-            // then does not grab the pointer.
-            let clip = Rect {
-                left: window.left + 1,
-                top: window.top + 1,
-                right: (window.right - 1).max(window.left + 2),
-                bottom: (window.bottom - 1).max(window.top + 2),
-            };
-            // The system takes a clip off when the foreground changes, so it
-            // is set again whenever it is not ours.
-            let ours = self
-                .clip
-                .filter(|&(asked, made)| asked == clip && current_clip() == Some(made));
-            if ours.is_none() {
-                let host = RECT {
-                    left: clip.left,
-                    top: clip.top,
-                    right: clip.right,
-                    bottom: clip.bottom,
-                };
-                // SAFETY: a valid rectangle.
-                unsafe { ClipCursor(&host) };
-                self.clip = Some((clip, current_clip().unwrap_or(clip)));
-            }
-            let (x, y) = window.center();
-            if cursor != (x, y) {
-                // SAFETY: a plain call; the point is inside the clip.
-                unsafe { SetCursorPos(x, y) };
-            }
+        fn set_clip(&mut self, clip: Option<Rect>) -> bool {
+            let host = clip.map(|c| RECT {
+                left: c.left,
+                top: c.top,
+                right: c.right,
+                bottom: c.bottom,
+            });
+            let to = host.as_ref().map_or(std::ptr::null(), |r| r as *const RECT);
+            // SAFETY: a valid rectangle, or null to free the cursor.
+            unsafe { ClipCursor(to) != 0 }
         }
 
-        fn release(&mut self) {
-            // Another program's clip is left alone.
-            if let Some((_, made)) = self.clip.take()
-                && current_clip() == Some(made)
-            {
-                // SAFETY: a null rectangle frees the cursor.
-                unsafe { ClipCursor(std::ptr::null()) };
-            }
+        fn clip(&mut self) -> Option<Rect> {
+            let mut clip = RECT::default();
+            // SAFETY: room for the rectangle.
+            (unsafe { GetClipCursor(&mut clip) } != 0).then_some(rect(clip))
         }
-    }
 
-    fn current_clip() -> Option<Rect> {
-        let mut clip = RECT::default();
-        // SAFETY: room for the rectangle.
-        (unsafe { GetClipCursor(&mut clip) } != 0).then_some(rect(clip))
+        fn move_to(&mut self, (x, y): (i32, i32)) {
+            // SAFETY: a plain call; the point is inside our clip.
+            unsafe { SetCursorPos(x, y) };
+        }
     }
 
     fn rect(r: RECT) -> Rect {
@@ -1790,7 +1880,7 @@ mod tests {
             let mouse = &mut self.0.lock().unwrap().mouse;
             MouseInput {
                 motion: std::mem::take(&mut mouse.motion),
-                buttons: mouse.buttons,
+                ..*mouse
             }
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -2086,6 +2176,7 @@ mod tests {
         host.lock().unwrap().mouse = MouseInput {
             motion: (40, -10),
             buttons: MOUSE_LEFT | MOUSE_RIGHT | MOUSE_MIDDLE,
+            captured: true,
         };
         hub.poll();
         let p = pad(hub);
@@ -2097,18 +2188,41 @@ mod tests {
         assert!(p.right_x > 0.265 && p.right_y > 0.0 && p.right_x > p.right_y);
         // The mouse stops: the stick comes back to rest, exactly (each
         // poll counts as 1 ms at least, so 400 are enough).
-        host.lock().unwrap().mouse = MouseInput::default();
+        let still = MouseInput {
+            captured: true,
+            ..Default::default()
+        };
+        host.lock().unwrap().mouse = still;
         for _ in 0..400 {
             hub.poll();
         }
         let p = pad(hub);
         assert_eq!((p.right_x, p.right_y, p.right_trigger), (0.0, 0.0, 0.0));
+
+        // Released while turning fast: the stick is at rest in that poll,
+        // and the speed is not carried into the next capture.
+        host.lock().unwrap().mouse = MouseInput {
+            motion: (400, 0),
+            ..still
+        };
+        hub.poll();
+        assert_eq!(pad(hub).right_x, 1.0);
+        host.lock().unwrap().mouse = MouseInput::default();
+        hub.poll();
+        assert_eq!((pad(hub).right_x, pad(hub).right_y), (0.0, 0.0));
+        host.lock().unwrap().mouse = still;
+        hub.poll();
+        assert_eq!(pad(hub).right_x, 0.0);
     }
 
     #[test]
     fn with_a_pad_of_its_own_per_host_pad_the_mouse_goes_with_the_stand_in() {
         let (hub, host) = fake();
-        host.lock().unwrap().mouse.buttons = MOUSE_LEFT;
+        host.lock().unwrap().mouse = MouseInput {
+            buttons: MOUSE_LEFT,
+            captured: true,
+            ..Default::default()
+        };
         hub.poll();
         let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(r).right_trigger, 1.0);
@@ -2163,10 +2277,11 @@ mod tests {
 
         // A left click inside captures; it is no button press, and the
         // first poll has no motion (the cursor goes to the centre).
-        assert_eq!(
-            capture.step(seen((300, 300), MOUSE_LEFT)),
-            MouseInput::default()
-        );
+        let captured = MouseInput {
+            captured: true,
+            ..Default::default()
+        };
+        assert_eq!(capture.step(seen((300, 300), MOUSE_LEFT)), captured);
         assert_eq!(capture.window, Some(WINDOW));
         let at = |dx: i32, dy: i32| (center.0 + dx, center.1 + dy);
         assert_eq!(capture.step(seen(at(5, -3), MOUSE_LEFT)).buttons, 0);
@@ -2175,7 +2290,7 @@ mod tests {
             input,
             MouseInput {
                 motion: (7, 2),
-                buttons: 0
+                ..captured
             }
         );
         // Buttons count from now on.
@@ -2222,6 +2337,175 @@ mod tests {
         });
         assert_eq!(input.motion, (0, 0));
         assert_eq!(capture.window, Some(moved));
+    }
+
+    /// The system's cursor clip as [`Mouse`] sees it.
+    struct FakePointer {
+        seen: Seen,
+        /// The clip in effect; `SCREEN` for none.
+        clip: Rect,
+        /// `set_clip` fails.
+        refuse: bool,
+        moves: Vec<(i32, i32)>,
+    }
+
+    const SCREEN: Rect = Rect {
+        left: 0,
+        top: 0,
+        right: 1920,
+        bottom: 1080,
+    };
+
+    impl FakePointer {
+        fn new() -> FakePointer {
+            FakePointer {
+                seen: Seen::default(),
+                clip: SCREEN,
+                refuse: false,
+                moves: Vec::new(),
+            }
+        }
+    }
+
+    impl Pointer for FakePointer {
+        fn see(&mut self) -> Seen {
+            self.seen
+        }
+        fn set_clip(&mut self, clip: Option<Rect>) -> bool {
+            if self.refuse {
+                return false;
+            }
+            self.clip = clip.unwrap_or(SCREEN);
+            true
+        }
+        fn clip(&mut self) -> Option<Rect> {
+            Some(self.clip)
+        }
+        fn move_to(&mut self, at: (i32, i32)) {
+            self.moves.push(at);
+        }
+    }
+
+    /// `WINDOW`'s client area a pixel inside, as `Mouse` clips it.
+    const CLIPPED: Rect = Rect {
+        left: 101,
+        top: 51,
+        right: 899,
+        bottom: 649,
+    };
+
+    /// A mouse captured by a click in `WINDOW`.
+    fn captured_mouse(pointer: &mut FakePointer) -> Mouse {
+        let mut mouse = Mouse::default();
+        pointer.seen = seen((300, 300), MOUSE_LEFT);
+        assert!(mouse.poll(pointer).captured);
+        pointer.seen.buttons = 0;
+        assert_eq!(pointer.clip, CLIPPED);
+        mouse
+    }
+
+    #[test]
+    fn the_captured_mouse_is_clipped_and_centred_and_esc_takes_off_only_our_clip() {
+        let mut pointer = FakePointer::new();
+        let mut mouse = captured_mouse(&mut pointer);
+        assert_eq!(pointer.moves, [WINDOW.center()]);
+        let (x, y) = WINDOW.center();
+        pointer.seen.cursor = (x + 4, y - 2);
+        let input = mouse.poll(&mut pointer);
+        assert_eq!((input.motion, input.captured), ((4, -2), true));
+        assert_eq!(pointer.clip, CLIPPED);
+        // At the centre already: not moved again.
+        pointer.seen.cursor = (x, y);
+        mouse.poll(&mut pointer);
+        assert_eq!(pointer.moves.len(), 2);
+
+        pointer.seen.escape = true;
+        assert_eq!(mouse.poll(&mut pointer), MouseInput::default());
+        assert_eq!(pointer.clip, SCREEN);
+    }
+
+    #[test]
+    fn a_refused_clip_captures_nothing_and_no_clip_is_taken_for_ours() {
+        let mut pointer = FakePointer::new();
+        let theirs = Rect {
+            left: 10,
+            top: 10,
+            right: 20,
+            bottom: 20,
+        };
+        pointer.clip = theirs;
+        pointer.refuse = true;
+        let mut mouse = Mouse::default();
+        pointer.seen = seen((300, 300), MOUSE_LEFT);
+        assert_eq!(mouse.poll(&mut pointer), MouseInput::default());
+        assert!(mouse.capture.window.is_none() && mouse.clip.is_none());
+        assert!(pointer.moves.is_empty());
+        // Nothing is held and nothing is taken off later, though the clip
+        // could be freed now.
+        pointer.refuse = false;
+        pointer.seen = seen((300, 300), 0);
+        mouse.poll(&mut pointer);
+        assert_eq!(pointer.clip, theirs);
+        // A click after the system allows clipping again captures.
+        pointer.seen.buttons = MOUSE_LEFT;
+        assert!(mouse.poll(&mut pointer).captured);
+        assert_eq!(pointer.clip, CLIPPED);
+    }
+
+    #[test]
+    fn a_clip_taken_off_or_replaced_ends_the_capture_and_is_not_set_again() {
+        let theirs = Rect {
+            left: 0,
+            top: 0,
+            right: 640,
+            bottom: 480,
+        };
+        // Taken off (the system, on a foreground change it reports late), or
+        // replaced by another program's.
+        for after in [SCREEN, theirs] {
+            let mut pointer = FakePointer::new();
+            let mut mouse = captured_mouse(&mut pointer);
+            pointer.clip = after;
+            pointer.seen.cursor = (200, 190);
+            let moves = pointer.moves.len();
+            assert_eq!(mouse.poll(&mut pointer), MouseInput::default());
+            assert_eq!(pointer.clip, after);
+            assert_eq!(pointer.moves.len(), moves);
+            // Still the foreground window, the button up: it stays released.
+            mouse.poll(&mut pointer);
+            assert_eq!(pointer.clip, after);
+            // A new click captures again.
+            pointer.seen.buttons = MOUSE_LEFT;
+            assert!(mouse.poll(&mut pointer).captured);
+            assert_eq!(pointer.clip, CLIPPED);
+        }
+    }
+
+    #[test]
+    fn the_foreground_lost_frees_our_clip_and_a_moved_window_is_clipped_anew() {
+        let mut pointer = FakePointer::new();
+        let mut mouse = captured_mouse(&mut pointer);
+        // The window moves (the system may drop the old clip for it).
+        let moved = Rect {
+            left: WINDOW.left + 50,
+            right: WINDOW.right + 50,
+            ..WINDOW
+        };
+        pointer.seen.window = Some(moved);
+        pointer.clip = SCREEN;
+        assert!(mouse.poll(&mut pointer).captured);
+        assert_eq!(
+            pointer.clip,
+            Rect {
+                left: CLIPPED.left + 50,
+                right: CLIPPED.right + 50,
+                ..CLIPPED
+            }
+        );
+        // The window is no longer the foreground window: our clip is freed.
+        pointer.seen = Seen::default();
+        assert_eq!(mouse.poll(&mut pointer), MouseInput::default());
+        assert_eq!(pointer.clip, SCREEN);
     }
 
     #[test]

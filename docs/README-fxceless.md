@@ -282,9 +282,14 @@ off. The keyboard counts while the title's window has focus:
 | Esc, Tab | Menu, View |
 
 The mouse counts once captured: a left click in the title's window captures
-it (that click presses nothing), Esc releases it (and still presses Menu),
-and so does the window losing focus (Alt+Tab, a dialog, minimizing). While
-captured the cursor is hidden and kept inside the window, and:
+it (that click presses nothing) and Esc releases it (Esc still presses
+Menu). The capture also ends when Windows no longer reports the title's
+window as the foreground window, and when the cursor clip VIctory set is
+taken off or replaced by anything else; VIctory then leaves the cursor free
+and does not set the clip again until the next click. Under Wine a switch to
+a program outside Wine can go unnoticed (see `linux.md`); Esc in the
+title's window still releases it. While captured the cursor is hidden and
+kept inside the window, and:
 
 | Mouse | Pad |
 |-------|-----|
@@ -293,13 +298,20 @@ captured the cursor is hidden and kept inside the window, and:
 | middle button | right stick click |
 | back / forward side button | left / right shoulder |
 
-The wheel does nothing. Click again to look around after a release.
+The wheel does nothing. Click again to look around after a release; the
+stick is at rest as soon as the capture ends.
+
+Look speed and the dead zone are separate settings. The stick tilt is
+`dead zone + (1 - dead zone) * min(1, speed * pixels a second / 2500)`,
+from the mouse's speed averaged over about 50 ms; any motion tilts it by
+at least the dead zone, and 2500 pixels a second at speed 1 tilts it all the
+way. How fast the camera turns at a given tilt is up to the title.
 
 | Variable | Effect |
 |----------|--------|
 | `VICTORY_MOUSE=0` | the mouse is never captured (keyboard and pads unchanged) |
-| `VICTORY_MOUSE_SPEED=1` | look speed; 2 turns twice as fast |
-| `VICTORY_MOUSE_DEAD_ZONE=0.265` | the stick tilt a moving mouse starts at, to step over the title's own dead zone; lower it if slow motion jumps, raise it if slow motion does nothing |
+| `VICTORY_MOUSE_SPEED=1` | look speed: how far a given mouse speed tilts the stick; 2 gives the same tilt at half the mouse speed (full tilt at 1250 pixels a second). It does not change the smallest tilt |
+| `VICTORY_MOUSE_DEAD_ZONE=0.265` | the smallest tilt any motion gives, to step over the title's own dead zone (0.265 is XInput's documented right-stick dead zone); lower it if slow motion jumps, raise it if slow motion does nothing. It does not change the mouse speed that tilts the stick all the way |
 | `VICTORY_ONE_PAD=0` | each XInput pad is a pad of its own; the keyboard and mouse pad is there only while no XInput pad is connected |
 
 ## Commands
