@@ -119,9 +119,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
         uint3 g = src_args.Load3(src_at);
-        // Up to WIDEST groups in x run as asked (`widest`), or in parts
-        // as many as they hold.
-        uint widest = split ? max(WIDEST, SPLIT * 65535u) : WIDEST;
+        // Only one-dimensional records can widen x beyond WIDEST.
+        uint widest = WIDEST;
+        if (split && g.y <= 1u && g.z <= 1u) {
+            widest = max(widest, SPLIT * 65535u);
+        }
         g = min(g, uint3(g.x <= widest ? widest : 65535u, 65535u, 65535u));
         // x * y fits 32 bits where it is looked at; the whole count may not.
         if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
@@ -3134,7 +3136,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
 
     /// The groups a dispatch record asks for, and the [`SPLIT`] records the
     /// clamp makes of it in parts (on a host that holds x to 65,535).
-    const IN_PARTS_CASES: [([u32; 3], [u32; 6]); 11] = [
+    const IN_PARTS_CASES: [([u32; 3], [u32; 6]); 13] = [
         // The title's tile list: 1,905 groups past the first part.
         ([67_440, 1, 1], [65_535, 1, 1, 1_905, 1, 1]),
         ([115_200, 1, 1], [65_535, 1, 1, 49_665, 1, 1]),
@@ -3146,8 +3148,11 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         // Past both parts: as before, what one dispatch runs.
         ([131_071, 1, 1], [65_535, 1, 1, 0, 1, 1]),
         ([200_000, 1, 1], [65_535, 1, 1, 0, 1, 1]),
-        // More than a dispatch runs in all, and a slot of all ones: empty.
-        ([100_000, 11, 1], [0; 6]),
+        // More than one dimension: bound x before charging the groups.
+        ([100_000, 11, 1], [65_535, 11, 1, 0, 11, 1]),
+        ([100_000, 1, 11], [65_535, 1, 11, 0, 1, 11]),
+        // Still too many groups after bounds, or a slot of all ones.
+        ([100_000, 17, 1], [0; 6]),
         ([u32::MAX; 3], [0; 6]),
     ];
 

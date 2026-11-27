@@ -39,10 +39,11 @@ DirectStorage holds known page destinations from the title's submit until
 the request completes. Texture uploads and card fetches use the Linux
 release's queue and fetch paths.
 
-On hosts that cap indirect dispatch width, a single record without a count
-buffer can run in two parts for shaders that read only the X group ID. The
-two parts cover up to 131,070 groups in X. Counted and multi-record
-dispatches on those hosts are limited to 65,535 groups in X per record.
+On hosts that cap indirect dispatch width, a one-dimensional dispatch can
+run in two parts for shaders that read only the X group ID. This requires a
+single record without a count buffer and covers up to 131,070 groups in X.
+Multi-dimensional, counted and multi-record dispatches on those hosts are
+limited to 65,535 groups in X per record.
 
 ## Tested result
 

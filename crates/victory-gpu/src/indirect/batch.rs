@@ -93,7 +93,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             cost = record[0] * record[1];
         } else if (kind == 2 || kind == 3) {
             uint3 g = uint3(record[0], record[1], record[2]);
-            uint widest = kind == 3 ? max(WIDEST, SPLIT * 65535u) : WIDEST;
+            uint widest = WIDEST;
+            if (kind == 3 && g.y <= 1u && g.z <= 1u) {
+                widest = max(widest, SPLIT * 65535u);
+            }
             g = min(g, uint3(g.x <= widest ? widest : 65535u, 65535u, 65535u));
             if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
                 g = uint3(0, 0, 0);
