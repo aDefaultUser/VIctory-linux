@@ -4393,7 +4393,10 @@ impl State {
             .flatten();
         let parts = group_base
             .filter(|_| max == 1 && count.is_none())
-            .zip(host_signature(DISPATCH, crate::indirect::PART_BYTES as u32));
+            .and_then(|base| {
+                host_signature(DISPATCH, crate::indirect::PART_BYTES as u32)
+                    .map(|signature| (base, signature))
+            });
         if group_base.is_some() && parts.is_none() {
             once!(
                 pipeline = p.name,
