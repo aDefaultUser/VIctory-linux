@@ -3235,7 +3235,7 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
             }
         }
     }
-    if late_exact() {
+    if late_exact() && !under_writes_wait() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
         // many changed runs go up to copies in the card's memory, each a
@@ -3249,6 +3249,46 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
     }
     spans.retain(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
     spans
+}
+
+/// Whether [`stale_under_flights`] leaves the title's bytes to a wait for
+/// the flights, as at stage 1 of [`late`], although the stage is 2 or more
+/// (`VICTORY_UNDER_WRITES_WAIT=1`; off by default): for an A/B on the card
+/// of `Shadow::merge_under_writes` alone. The rest of the stage stays (the
+/// relay, the present sent ahead); [`Host::settle_stale`] waits for the
+/// flights that declared the ranges, or settles.
+fn under_writes_wait() -> bool {
+    static ASKED: OnceLock<Result<bool, u32>> = OnceLock::new();
+    opt_in(
+        &ASKED,
+        "VICTORY_UNDER_WRITES_WAIT",
+        "title bytes under flights' shader writes wait for the flights instead of being put in beside them",
+    )
+}
+
+/// A diagnostic switch that is off unless its variable `name` is `1`, or
+/// `VICTORY_AB` names it (diagnostics builds: on and off while the title
+/// runs). Logged once, with `what` it does, if either.
+pub(super) fn opt_in(asked: &OnceLock<Result<bool, u32>>, name: &str, what: &str) -> bool {
+    let asked = asked.get_or_init(|| {
+        #[cfg(feature = "diagnostics")]
+        if let Some(bit) = crate::ab::bit(name) {
+            tracing::warn!("{name} (with VICTORY_AB, switch {bit}): {what}");
+            return Err(bit);
+        }
+        let on = std::env::var_os(name).is_some_and(|v| v == "1");
+        if on {
+            tracing::warn!("{name}=1: {what}");
+        }
+        Ok(on)
+    });
+    match *asked {
+        Ok(on) => on,
+        #[cfg(feature = "diagnostics")]
+        Err(bit) => crate::ab::on(bit),
+        #[cfg(not(feature = "diagnostics"))]
+        Err(_) => false,
+    }
 }
 
 /// How many parts of submissions, and lists, the line's thread gives to the
@@ -5723,7 +5763,7 @@ impl Host {
         stage.next("submit: waiting for flights it reads from");
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
-        } else if own.is_none()
+        } else if (own.is_none() || card_steps::wait_anyway())
             && let Some(why) = late_blocked(runs)
         {
             if relay_exact() && why == WHY_READ {

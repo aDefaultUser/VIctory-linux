@@ -105,6 +105,27 @@ fn guard() -> Guard {
     })
 }
 
+/// Whether a submission whose steps are taken still waits for flights as it
+/// would without them (`VICTORY_CARD_STEPS_WAIT=1`; off by default), for an
+/// A/B on the card: the steps stay on our list, their slots point at its
+/// buffer, and the CPU leaves them out, but the submission is prepared only
+/// once the flights its steps read from have landed ([`late_blocked`]).
+///
+/// Why waiting changes nothing the steps rely on: they read the host copies
+/// on the card behind every flight in the queue's order, wherever the
+/// flights have landed meanwhile; their list holds its host copies and the
+/// title list holds the fill's buffer; a fill's slot is its alone, and no
+/// landing writes it. What differs is only what the CPU reads while
+/// preparing the rest: title memory with the flights landed.
+pub(super) fn wait_anyway() -> bool {
+    static ASKED: OnceLock<Result<bool, u32>> = OnceLock::new();
+    opt_in(
+        &ASKED,
+        "VICTORY_CARD_STEPS_WAIT",
+        "a submission whose steps are taken on the card still waits for the flights it reads from",
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Guard {
     Off,
