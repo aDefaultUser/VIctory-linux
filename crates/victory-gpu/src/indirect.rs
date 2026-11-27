@@ -3158,9 +3158,61 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
     /// groups.
     #[test]
     fn warp_a_large_dispatch_is_clamped_in_parts() {
-        let Some(mut warp) = WarpHarness::new() else {
-            return;
+        if let Some(mut warp) = warp_in_parts("warp_a_large_dispatch_is_clamped_in_parts") {
+            a_large_dispatch_is_clamped_in_parts(&mut warp);
+        }
+    }
+
+    /// The same on the card, where it holds x to 65,535.
+    #[test]
+    fn card_a_large_dispatch_is_clamped_in_parts() {
+        if let Some(mut gpu) = card_in_parts("card_a_large_dispatch_is_clamped_in_parts") {
+            a_large_dispatch_is_clamped_in_parts(&mut gpu);
+        }
+    }
+
+    /// The software adapter for the tests of dispatches in parts, or why
+    /// there is none.
+    fn warp_in_parts(test: &str) -> Option<WarpHarness> {
+        let warp = WarpHarness::new();
+        if warp.is_none() {
+            // DXVK's EnumWarpAdapter gives the card.
+            println!("{test}: skipped, no software adapter");
+        }
+        warp
+    }
+
+    /// The card for the tests of dispatches in parts, when its clamp holds
+    /// x to 65,535 (`VICTORY_INDIRECT_WIDE=0`, which an AMD card needs too),
+    /// or why it is not used; it says which card runs them.
+    fn card_in_parts(test: &str) -> Option<WarpHarness> {
+        if std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0") {
+            println!("{test}: skipped, VICTORY_INDIRECT_WIDE is not 0");
+            return None;
+        }
+        let Some(gpu) = WarpHarness::on(false) else {
+            println!("{test}: skipped, no hardware adapter");
+            return None;
         };
+        assert!(in_parts_on(amd(&gpu.device)), "VICTORY_INDIRECT_WIDE=0: every card runs such dispatches in parts");
+        // SAFETY: plain queries.
+        let desc = unsafe {
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(gpu.device.GetAdapterLuid()))
+                .and_then(|a| a.GetDesc1())
+        };
+        let name = desc.map_or_else(
+            |e| format!("an adapter that does not say its name ({e})"),
+            |d| {
+                let end = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+                format!("{} (vendor {:#06x})", String::from_utf16_lossy(&d.Description[..end]), d.VendorId)
+            },
+        );
+        println!("{test}: running on {name}");
+        Some(gpu)
+    }
+
+    fn a_large_dispatch_is_clamped_in_parts(warp: &mut WarpHarness) {
         let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
         let (src, src_ptr, src_gpu) = warp.shared_buffer(64);
         let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
@@ -3226,9 +3278,25 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
     /// that counts its groups from the base the host sets: run in parts, as
     /// `crate::draw` runs it, every group runs once under its own number,
     /// alone and batched; run whole with the base left at 0, the first
-    /// 65,535 do and the rest do not (what the clamp did before).
+    /// 65,535 do and the rest do not (what the clamp did before); run in
+    /// parts with the base left at 0, the second part runs the first
+    /// 1,905 numbers again and the last 1,905 never run.
     #[test]
     fn warp_a_dispatch_in_parts_runs_every_group_once_under_its_number() {
+        if let Some(mut warp) = warp_in_parts("warp_a_dispatch_in_parts_runs_every_group_once_under_its_number") {
+            a_dispatch_in_parts_runs_every_group_once_under_its_number(&mut warp);
+        }
+    }
+
+    /// The same on the card, where it holds x to 65,535.
+    #[test]
+    fn card_a_dispatch_in_parts_runs_every_group_once_under_its_number() {
+        if let Some(mut gpu) = card_in_parts("card_a_dispatch_in_parts_runs_every_group_once_under_its_number") {
+            a_dispatch_in_parts_runs_every_group_once_under_its_number(&mut gpu);
+        }
+    }
+
+    fn a_dispatch_in_parts_runs_every_group_once_under_its_number(warp: &mut WarpHarness) {
         const CS: &str = r#"
 #define RS "RootConstants(num32BitConstants=1, b0), UAV(u0)"
 cbuffer Base : register(b0) { uint first; };
@@ -3244,14 +3312,12 @@ void main(uint3 group : SV_GroupID) {
 }
 "#;
         const ASKED: u32 = 67_440;
-        let Some(mut warp) = WarpHarness::new() else {
-            return;
-        };
         let worker = compile_cs(&warp.device, CS).expect("the worker must compile");
         let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
         let sig = warp.signature(2, PART_BYTES as u32);
         let size = 16 + 4 * (u64::from(ASKED) + 16);
-        for (batched, parts) in [(false, true), (true, true), (false, false)] {
+        // Batched, in parts, the base set before each part.
+        for (batched, parts, base) in [(false, true, true), (true, true, true), (false, true, false), (false, false, false)] {
             let (src, src_ptr, src_gpu) = warp.shared_buffer(64);
             let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
             let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
@@ -3279,7 +3345,7 @@ void main(uint3 group : SV_GroupID) {
                 warp.list.SetComputeRootUnorderedAccessView(1, seen.GetGPUVirtualAddress());
                 if parts {
                     for part in 0..SPLIT {
-                        warp.list.SetComputeRoot32BitConstant(0, part * PART, 0);
+                        warp.list.SetComputeRoot32BitConstant(0, if base { part * PART } else { 0 }, 0);
                         warp.list.ExecuteIndirect(&sig, 1, &dst, at + u64::from(part) * PART_BYTES, None, 0);
                     }
                     warp.list.SetComputeRoot32BitConstant(0, 0, 0);
@@ -3293,11 +3359,18 @@ void main(uint3 group : SV_GroupID) {
             warp.submit_and_wait();
             // SAFETY: the list has run; mapped words.
             let word = |i: usize| unsafe { back_ptr.cast::<u32>().add(i).read_volatile() };
+            // How often each number runs.
+            let times = |g: u32| match (parts, base) {
+                (true, true) => u32::from(g < ASKED),
+                (true, false) => u32::from(g < PART) + u32::from(g < ASKED - PART),
+                _ => u32::from(g < PART),
+            };
             let runs = if parts { ASKED } else { PART };
-            let what = format!("batched {batched}, in parts {parts}");
-            assert_eq!([word(0), word(1)], [runs, runs - 1], "{what}");
-            let wrong = (0..ASKED as usize + 16).find(|&g| word(4 + g) != u32::from(g < runs as usize));
-            assert_eq!(wrong, None, "every group once and no other, {what}");
+            let top = if parts && base { ASKED - 1 } else { PART - 1 };
+            let what = format!("batched {batched}, in parts {parts}, base {base}");
+            assert_eq!([word(0), word(1)], [runs, top], "{what}");
+            let wrong = (0..ASKED + 16).find(|&g| word(4 + g as usize) != times(g));
+            assert_eq!(wrong, None, "every group as often as expected, {what}");
         }
     }
 
