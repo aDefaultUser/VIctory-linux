@@ -126,6 +126,14 @@ impl Ranges {
         self.by_first.insert(first, (last, self.told));
     }
 
+    /// The first block here at `block` or past it.
+    fn next_from(&self, block: usize) -> Option<usize> {
+        if self.holding(block).is_some() {
+            return Some(block);
+        }
+        self.by_first.range(block..).next().map(|(&first, _)| first)
+    }
+
     /// The run of ranges side by side that holds `block`, as blocks.
     fn run(&self, block: usize) -> Option<(usize, usize)> {
         let (mut first, mut last, _) = self.holding(block)?;
@@ -164,20 +172,72 @@ pub fn title_placeholder_returned(at: usize, len: usize) {
 }
 
 /// The system is about to put something else in `[at, at + len)` (a view, an
-/// allocation) or release it; with no length, the allocation at `at`, whose
-/// end is not known here, so every range side by side with it goes. To be
-/// told before the change: a block that is here after it would be taken for
-/// a placeholder.
+/// allocation) or release it; with no length, the allocation at `at`: every
+/// range side by side with it goes, and all of the allocation Windows says
+/// starts at `at` ([`allocation`]), past any block cut out of it before by a
+/// change that failed and left it whole. To be told before the change: a
+/// block that is here after it would be taken for a placeholder.
 pub fn title_placeholder_leaving(at: usize, len: usize) {
     if !placeholder_ranges() {
         return;
     }
-    let mut r = ranges();
     if len != 0 {
-        r.cut(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    } else if let Some((first, last)) = r.run(at / BLOCK) {
+        ranges().cut(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+        return;
+    }
+    let allocation = allocation(at);
+    let mut r = ranges();
+    if let Some((first, last)) = r.run(at / BLOCK) {
         r.cut(first, last);
     }
+    if let Some((first, last)) = allocation {
+        r.cut(first, last);
+    }
+}
+
+/// The blocks of the allocation that starts at `at` (none if none does: a
+/// release there fails), as far as they may hold ranges here. Windows is
+/// asked only about the next block here past what is known of it, so a
+/// placeholder (one region) takes two questions; past a few, every block
+/// from `at` on is taken for the allocation's. (What the guards held of it
+/// goes by `crate::watch::title_memory_freed`, which finds its end itself.)
+/// This thread's last error is left as it was.
+fn allocation(at: usize) -> Option<(usize, usize)> {
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+    use windows_sys::Win32::System::Memory::MEM_FREE;
+    const QUESTIONS: usize = 16;
+    let region = |address: usize| {
+        query(address)
+            .filter(|info| info.State != MEM_FREE && info.AllocationBase as usize == at)
+            .map(|info| (info.BaseAddress as usize).saturating_add(info.RegionSize))
+    };
+    // SAFETY: this thread's last error.
+    let error = unsafe { GetLastError() };
+    let found = region(at).map(|mut end| {
+        for _ in 0..QUESTIONS {
+            // (The block holding the end known is cut with it; one here past
+            // that is in this allocation only if Windows says so.)
+            let next = ranges().next_from(end.div_ceil(BLOCK));
+            match next.and_then(|next| region(next * BLOCK)) {
+                Some(to) => end = to,
+                None => return (at / BLOCK, end.div_ceil(BLOCK)),
+            }
+        }
+        (at / BLOCK, usize::MAX)
+    });
+    // SAFETY: as above.
+    unsafe { SetLastError(error) };
+    found
+}
+
+/// What `VirtualQuery` says of the region at `address`, if it answers.
+fn query(address: usize) -> Option<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION> {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(address as *const _, &mut info, size_of_val(&info)) };
+    (n != 0).then_some(info)
 }
 
 /// The system changed some range of the title's that was not told (a call
@@ -288,16 +348,10 @@ pub fn title_placeholder_known(at: usize) -> bool {
 /// The blocks of the region at `block` if Windows says it is reserved,
 /// private and no-access (what a placeholder is): first, past the last.
 fn reserved_private(block: usize) -> Option<(usize, usize)> {
-    use windows_sys::Win32::System::Memory::{
-        MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
-    };
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    use windows_sys::Win32::System::Memory::{MEM_PRIVATE, MEM_RESERVE, PAGE_NOACCESS};
+    let info = query(block * BLOCK)?;
     let base = info.BaseAddress as usize;
-    (n != 0
-        && info.State == MEM_RESERVE
+    (info.State == MEM_RESERVE
         && info.Type == MEM_PRIVATE
         && info.AllocationProtect == PAGE_NOACCESS
         && info.RegionSize != 0)
@@ -618,6 +672,74 @@ pub(crate) mod tests {
         assert!(!known(block), "left and came back meanwhile");
         assert!(known(block));
         release(at, 1);
+    }
+
+    /// A release with no length, after a change of part of the placeholder
+    /// that failed (told, so cut here, and the placeholder left whole): all
+    /// of its allocation goes, what lies past it stays. An allocation whose
+    /// end takes too many questions to find: every block from it on goes.
+    /// The last error stays as it was.
+    #[test]
+    fn a_release_with_no_length_takes_all_of_its_allocation() {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        let _alone = alone();
+        placeholder_ranges_for_tests();
+        let here = |at: usize| title_placeholder_tracked(at);
+        let whole = untracked(3, false);
+        title_placeholder_reserved(whole, 3 * BLOCK);
+        // (Between blocks not tracked: never side by side with a range of
+        // the test's, which would go with it.)
+        let apart = untracked(3, true);
+        let beyond = apart + BLOCK;
+        title_placeholder_reserved(beyond, BLOCK);
+        title_placeholder_leaving(whole + BLOCK, BLOCK);
+        assert!(here(whole) && !here(whole + BLOCK) && here(whole + 2 * BLOCK));
+        title_placeholder_leaving(whole, 0);
+        assert!(
+            !(0..3).any(|b| here(whole + b * BLOCK)),
+            "a tail left tracked"
+        );
+        assert!(here(beyond));
+        // SAFETY (all): our own memory.
+        unsafe {
+            assert_ne!(VirtualFree(whole as *mut _, 0, MEM_RELEASE), 0);
+            // A reservation of `blocks` blocks, every other one committed and
+            // the others told (as though placeholders once): a region each.
+            let striped = |blocks: usize| {
+                let at = VirtualAlloc(std::ptr::null(), blocks * BLOCK, MEM_RESERVE, PAGE_NOACCESS)
+                    as usize;
+                assert_ne!(at, 0);
+                for block in 0..blocks {
+                    let at = at + block * BLOCK;
+                    if block % 2 == 0 {
+                        title_placeholder_reserved(at, BLOCK);
+                    } else {
+                        assert!(
+                            !VirtualAlloc(at as *const _, BLOCK, MEM_COMMIT, PAGE_READWRITE)
+                                .is_null()
+                        );
+                    }
+                }
+                at
+            };
+            for (blocks, all_past) in [(8, false), (40, true)] {
+                let at = striped(blocks);
+                title_placeholder_leaving(at, 0);
+                assert!(
+                    !(0..blocks).any(|b| here(at + b * BLOCK)),
+                    "{blocks} blocks"
+                );
+                assert_eq!(here(beyond), !(all_past && beyond > at), "{blocks} blocks");
+                title_placeholder_reserved(beyond, BLOCK);
+                assert_ne!(VirtualFree(at as *mut _, 0, MEM_RELEASE), 0);
+            }
+            // Past what a process has: no allocation, and the error the
+            // question left is not the caller's.
+            SetLastError(7);
+            title_placeholder_leaving(0xffff_8000_0000_0000, 0);
+            assert_eq!(GetLastError(), 7);
+        }
+        release(apart, 3);
     }
 
     /// An address released (told) and reserved again by another as ordinary

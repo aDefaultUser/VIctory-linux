@@ -3551,6 +3551,45 @@ mod tests {
         release_all(elsewhere, 1);
     }
 
+    /// A change of part of a placeholder that fails leaves it whole, cut out
+    /// of the ranges; a release of all of it with no length after (each way
+    /// the title can) leaves none of it tracked, so an ordinary reservation
+    /// where its tail was, which `VirtualQuery` cannot tell from one, is no
+    /// hole.
+    #[test]
+    fn a_release_after_a_failed_partial_change_leaves_nothing_tracked() {
+        let _alone = ranges_alone();
+        victory_gpu::placeholder_ranges_for_tests();
+        let tracked = |at: *mut c_void| victory_gpu::title_placeholder_tracked(at as usize);
+        // SAFETY (all): our own placeholders, and the addresses given up,
+        // ours again if we get them.
+        unsafe {
+            let process = GetCurrentProcess();
+            for way in 0..3 {
+                let base = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+                assert!(!base.is_null());
+                let at = |page: usize| base.wrapping_byte_add(page * PAGE);
+                let kind = MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER;
+                assert!(bypass::virtual_alloc2(process, at(1), PAGE, kind, PAGE_READWRITE, std::ptr::null_mut(), 0).is_null());
+                assert!(tracked(at(0)) && !tracked(at(1)) && tracked(at(2)));
+                assert_eq!(query(at(2)).host.AllocationBase, base, "still whole");
+                match way {
+                    0 => assert_ne!(title_virtual_free(base, 0, MEM_RELEASE), 0),
+                    1 => assert_ne!(bypass::virtual_free_ex(process, base, 0, MEM_RELEASE), 0),
+                    _ => {
+                        let (mut address, mut size) = (base, 0usize);
+                        assert_eq!(bypass::nt_free(process, &mut address, &mut size, MEM_RELEASE), 0);
+                    }
+                }
+                assert!(!(0..3).any(|page| tracked(at(page))), "way {way}");
+                if VirtualAlloc(at(2), PAGE, MEM_RESERVE, PAGE_NOACCESS) == at(2) {
+                    assert!(!victory_gpu::title_placeholder_known(at(2) as usize), "ordinary memory, way {way}");
+                    VirtualFree(at(2), 0, MEM_RELEASE);
+                }
+            }
+        }
+    }
+
     /// Threads that reserve placeholders, release them past `xmem` (and call
     /// with pointers to nothing between), and take the addresses again as
     /// ordinary memory, beside a thread that maps pages: a placeholder
