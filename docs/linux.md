@@ -116,10 +116,11 @@ one machine.
 #### A scoped quality profile
 
 The fog workaround and the three card-steps settings were tested together
-as one opt-in profile. A plain Windows release build ran as a Series S
-with a 1280x720 internal picture at 1920x1080, with the ambient light and
-the scattering at their defaults. The four settings follow the three
-1080p performance settings above.
+as one opt-in profile, in the environment above on the one Radeon PC. A
+plain Windows release build of 6f85e21 ran as a Series S with a 1280x720
+internal picture at 1920x1080, with the ambient light and the scattering at
+their defaults. The four settings follow the three 1080p performance
+settings above.
 
 ```sh
 RUN_LINUX_EXE=target/x86_64-pc-windows-msvc/release/victory.exe \
@@ -130,15 +131,24 @@ RUN_LINUX_CONSOLE=series-s \
   VICTORY_CARD_STEPS_WAIT=1
 ```
 
-- **Day room, fixed camera:** clear, with no large triangles in 1,040
-  captured frames over 52 seconds at 7,392 draws per frame. A median of
-  19.8 FPS across 11 readings about five seconds apart.
-- **First room:** a median of 23.5 FPS across six readings after moving
-  and turning.
-- **Faces were missing** in this replay.
+With a fixed camera, the day room stayed clear of the brown haze and none
+of 1,040 captured frames over 52 seconds showed large triangles, at 7,392
+draws per frame. The median was 19.8 FPS across 11 readings about five
+seconds apart. In the first room the median was 23.5 FPS across six
+readings after moving and turning.
 
-These readings stand apart from the 29.9 and 30.0 FPS first-room medians
-above. Trace revisits are ongoing.
+The 29.9 and 30.0 FPS first-room medians above came from earlier, lighter
+tests at the checkpoint. Holding 30 FPS in the heavier shot is still an
+open goal.
+
+Faces were missing in this replay. With the d16 fix in 1430f61, which reads
+a view's kind from its table, mouths move again when faces render. Jaws can
+still look distorted, and some face meshes still go missing at times. In a
+diagnostics build in the same session, some face meshes were already
+missing with the fog workaround off and stayed missing after it was turned
+on and off again. The workaround removes the whole quarter-resolution
+radiance term, and where each of these symptoms starts is still being
+narrowed down.
 
 ### Earlier result, Series X
 
