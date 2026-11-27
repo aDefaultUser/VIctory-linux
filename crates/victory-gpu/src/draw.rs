@@ -1639,7 +1639,7 @@ impl State {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
-            if stage.shader.ambient.is_some() || stage.shader.probe.is_some() {
+            if stage.shader.ambient.is_some() || stage.shader.probe.is_some() || stage.shader.fog {
                 self.ambient_tables.clear();
                 self.ambient_tables.extend(made.iter().copied());
             }
@@ -2836,6 +2836,10 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        // The fog's composite (`crate::fog`): the tables made afresh in the
+        // list before its bind.
+        let fog = p.stages.first().is_some_and(|s| s.shader.fog);
+        let fresh_before: Vec<_> = if fog { self.fresh_tables.keys().copied().collect() } else { Vec::new() };
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -2869,6 +2873,9 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        if fog {
+            self.fog_input(p, &fresh_before);
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
@@ -2883,6 +2890,70 @@ impl State {
         if p.stages.first().is_some_and(|s| s.shader.probe.is_some()) {
             self.light_probe(list, p, true);
         }
+    }
+
+    /// `VICTORY_FOG_INPUT` (`crate::fog`) after the bind of the fog's
+    /// composite, before its dispatch: if its resources are as recorded, the
+    /// radiance's entry of the table the bind made afresh for it reads zeros.
+    /// Only a table new in the list (not in `before`, its tables made
+    /// afresh before the bind), and no later draw of the list finds it
+    /// again: no other draw reads that entry. The title's slots stay as
+    /// they are.
+    fn fog_input(&mut self, p: &HostPipeline, before: &[(u64, u32, u64)]) {
+        use crate::fog::{DEPTH, MEDIA, OUT, RADIANCE};
+        const { assert!(RADIANCE.1.is_multiple_of(8)) };
+        let Some(t) = p.stages.first().map(|s| s.translated()) else {
+            return;
+        };
+        let refuse = |why| crate::fog::refuse(why, &p.name);
+        if !crate::fog::layout(&t.used) {
+            return refuse("its resources");
+        }
+        let entry = |(slot, offset): (u8, u32)| match self.roots_ref(true).get(usize::from(slot)) {
+            Some(Root::Table(table)) => crate::descriptor::view(table + u64::from(offset) * 4),
+            _ => None,
+        };
+        let Some(radiance) = entry(RADIANCE) else {
+            return refuse("no view of the radiance");
+        };
+        let Some(View::Unordered(picture, 0, picture_view)) = entry(OUT) else {
+            return refuse("the picture's view");
+        };
+        // The picture is not one of the inputs.
+        if [MEDIA, DEPTH].map(entry).iter().any(|v| !matches!(v, Some(View::Shader(r, _)) if *r != picture)) {
+            return refuse("its inputs' views");
+        }
+        let (Some((media, _)), Some((depth, _)), Some((out, _))) = (
+            self.table_view(t, true, ResourceType::Srv, MEDIA),
+            self.table_view(t, true, ResourceType::Srv, DEPTH),
+            self.table_view(t, true, ResourceType::Uav, OUT),
+        ) else {
+            return refuse("its tables");
+        };
+        if let Err(why) = crate::fog::recipe(&radiance, &media, &depth, &out, picture_view.as_ref()) {
+            return refuse(why);
+        }
+        // The table this bind made (`ambient_tables`), by its first slot.
+        let Some(first) = self.ambient_tables.iter().find(|m| m.0 == RADIANCE.0).map(|m| m.1 / 32) else {
+            return refuse("its table is not made afresh");
+        };
+        let Some(key) = self.fresh_tables.iter().find(|(_, f)| f.first == first).map(|(k, _)| *k) else {
+            return refuse("its table is not made afresh");
+        };
+        if before.contains(&key) {
+            return refuse("its table is read by another draw of the list");
+        }
+        let k = RADIANCE.1 / 8;
+        if k >= key.1 {
+            return refuse("its table is short");
+        }
+        let Some(heap) = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()
+        else {
+            return refuse("no view heap");
+        };
+        heap.make_null_like(first + k, &radiance);
+        self.fresh_tables.remove(&key);
+        crate::fog::used(&p.name, first + k);
     }
 
     /// The stand-in for the indirect light after a dispatch of `p`

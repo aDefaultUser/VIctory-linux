@@ -2899,6 +2899,15 @@ impl HostHeap {
         self.keep(index, None);
     }
 
+    /// Makes slot `index` (a dynamic one) a null view of `view`'s kind and
+    /// dimension: it reads zeros where the shader expects `view`.
+    pub(crate) fn make_null_like(&self, index: u32, view: &View) {
+        null_for(view, self.at(index));
+        self.put(index);
+        self.clear_twin(index);
+        self.keep(index, None);
+    }
+
     /// Where the raw twin of slot `index` is made.
     fn twin(&self, index: u32) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
         (index < self.twins.len() as u32).then(|| staged(self.sampler, 1).unwrap_or_else(|| self.cpu(self.raw + index)))

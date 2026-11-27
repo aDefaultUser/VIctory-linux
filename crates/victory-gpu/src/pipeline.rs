@@ -67,6 +67,10 @@ pub(crate) struct Shader {
     /// Its part in the light probe (`crate::lightprobe`).
     #[cfg(windows)]
     pub(crate) probe: Option<crate::lightprobe::Role>,
+    /// Whether it is the fog's composite, one of whose inputs reads zeros
+    /// (`crate::fog`).
+    #[cfg(windows)]
+    pub(crate) fog: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -113,9 +117,12 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            let hash = full.to_hex()[..16].to_owned();
             Arc::new(Shader {
                 stage,
-                hash: full.to_hex()[..16].to_owned(),
+                #[cfg(windows)]
+                fog: stage == "compute" && crate::fog::is_compositor(&hash, bytes.len()),
+                hash,
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),

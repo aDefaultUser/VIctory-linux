@@ -63,6 +63,25 @@ The three settings are optional.
   candidates for GPU memory, within the card's buffer budget. The automatic
   minimum with a 2 GiB budget is 4 MiB.
 
+#### The brown veil in rooms
+
+`VICTORY_FOG_INPUT=radiance` is a targeted workaround for this profile
+(Series S, a 1280x720 picture inside a 1920x1080 window). It is off by
+default and is not part of the script's defaults.
+
+The title's fog composite reads a quarter-resolution radiance texture.
+This setting makes that one input read as zeros, only in the composite's
+own freshly made descriptor table. The title's descriptors, other programs
+and cache keys are not changed. It applies only when the program's
+resources and views match the recorded layout, and otherwise logs why once
+and changes nothing.
+
+With a fixed camera in one room on one machine, the veil cleared with this
+setting alone, with the scattered light left on, and it stayed when only
+the scattered light was zeroed. The fog's density and the normal scattering
+are kept, but everything the radiance input adds is removed, not just the
+excess. Why that input is too bright is still under investigation.
+
 ### Earlier result, Series X
 
 The script's defaults, as a Series X: medians of 23.1 frames per second over
