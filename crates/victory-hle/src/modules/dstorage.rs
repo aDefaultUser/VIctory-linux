@@ -33,6 +33,7 @@ use victory_formats::bcpack::{self, Tables};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
+use super::xmem::PageRuns;
 use crate::{HleModule, hle_export};
 
 /// The factory interface the title asks for.
@@ -593,6 +594,9 @@ struct Job {
     seq: u64,
     request: Request,
     note: Note,
+    /// A page destination's pages as taken at the title's submit; `None`
+    /// for other destinations, or one whose list is read when it runs.
+    pages: Option<PageRuns>,
     staging: u64,
 }
 
@@ -783,7 +787,7 @@ fn work(scheduler: &'static Scheduler) {
         let started = std::time::Instant::now();
         let traced = Traced::start(&job);
         let reading = victory_gpu::timeline::span("streaming: a request");
-        let result = execute(&job.request);
+        let result = execute(&job.request, job.pages.as_ref());
         reading.end();
         walls_request(&job.request, &result, started);
         stream_log::request(&job, started, &result);
@@ -845,14 +849,20 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, Read { request, note }) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let staging = staging_bytes(&lane.reads.front()?.1.request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (
+            seq,
+            Read {
+                request,
+                note,
+                pages,
+            },
+        ) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -865,6 +875,7 @@ impl Lanes {
             seq,
             request,
             note,
+            pages,
             staging,
         })
     }
@@ -881,7 +892,11 @@ impl Lanes {
     }
 
     /// Moves a queue's enqueued commands to the workers; `early` when the
-    /// title has not asked for it ([`queue`]).
+    /// title has not asked for it ([`queue`]). The title's submit takes each
+    /// page destination's pages as its list says them now
+    /// ([`taken_at_submit`]); one of our own leaves lists to be read when
+    /// the requests run, and moves page destinations only with
+    /// `VICTORY_PAGE_LIST=late` ([`Lane::holds_page_lists`]).
     fn submit(&mut self, id: u64, early: bool) {
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
             return;
@@ -908,6 +923,9 @@ impl Lanes {
             match command {
                 Command::Read(mut read) => {
                     read.note.submitted(&read.request, early);
+                    if !early {
+                        read.pages = taken_at_submit(&read.request);
+                    }
                     lane.reads.push_back((seq, read));
                 }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
@@ -932,9 +950,18 @@ impl Lane {
         }
     }
 
-    /// Requests and status entries held, submitted or not.
+    /// Requests and status entries held, submitted or not; more than the
+    /// capacity only once it held page destinations past it ([`queue`]),
+    /// until enough of them finish after the title's submit.
     fn entries(&self) -> usize {
         self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
+    }
+
+    /// Page destinations wait among the enqueued commands for their lists
+    /// to be taken at the title's submit ([`at_submit`]): nothing but that
+    /// submit moves them to the workers.
+    fn holds_page_lists(&self) -> bool {
+        at_submit() && self.unsubmitted.iter().any(Command::to_pages)
     }
 
     /// Writes the status entries whose earlier reads have all finished.
@@ -1039,11 +1066,76 @@ enum Command {
     Status(Status),
 }
 
-/// An enqueued request, and what the trace knows of it.
-#[derive(Clone, Copy)]
+impl Command {
+    fn to_pages(&self) -> bool {
+        matches!(self, Command::Read(read) if read.request.options & PAGE_DESTINATION != 0)
+    }
+}
+
+/// An enqueued request, what the trace knows of it, and a page
+/// destination's pages once taken at the title's submit.
 struct Read {
     request: Request,
     note: Note,
+    pages: Option<PageRuns>,
+}
+
+/// A page destination's request carries a pointer into the title's live
+/// table of physical pages: the title enqueues, maps the pages (which fills
+/// the table in), submits, and may change the table again, or free the
+/// pages, before the request runs. So the list is taken at the title's
+/// submit, its pages held until the request is done, and nothing of the
+/// list is read after; a queue holding such requests never submits on its
+/// own (`queue`). `VICTORY_PAGE_LIST=late`: the list is read when the
+/// request runs, and a queue full of page destinations submits itself, as
+/// before, to compare. Analysis by JappertjeV (PastiiJay/klbf-lab-beta#3).
+fn at_submit() -> bool {
+    static AT_SUBMIT: OnceLock<bool> = OnceLock::new();
+    *AT_SUBMIT.get_or_init(|| {
+        let late = std::env::var("VICTORY_PAGE_LIST").is_ok_and(|v| v.trim() == "late");
+        tracing::info!(
+            at = if late { "late" } else { "submit" },
+            "dstorage: page lists taken"
+        );
+        !late
+    })
+}
+
+/// A page destination's pages as its list says them now, at the title's
+/// submit; `None` for other requests, with `VICTORY_PAGE_LIST=late`, or
+/// when a page is not known yet (zero, or not made yet): then the list is
+/// read when the request runs.
+fn taken_at_submit(request: &Request) -> Option<PageRuns> {
+    if request.options & PAGE_DESTINATION == 0 || request.destination.is_null() || !at_submit() {
+        return None;
+    }
+    let (offset, len) = page_span(request);
+    let pages = read_list(request.destination.cast(), offset, len);
+    let runs = super::xmem::resolve_pages(&pages, offset, len);
+    if runs.is_none() {
+        static UNKNOWN: AtomicU64 = AtomicU64::new(0);
+        let unknown = UNKNOWN.fetch_add(1, Ordering::Relaxed) + 1;
+        if unknown <= 8 || unknown.is_power_of_two() {
+            tracing::info!(
+                requests = unknown,
+                pages = pages.len(),
+                first = format_args!("{:#x}", pages.first().copied().unwrap_or(0)),
+                "dstorage: a page list not known at the submit; read when the request runs"
+            );
+        }
+    }
+    runs
+}
+
+/// Where in the first page a page destination starts, and how many bytes
+/// `execute` writes there (a raw read larger than its destination fails).
+fn page_span(request: &Request) -> (usize, usize) {
+    let len = if request.options & (ZLIB | BCPACK) == 0 {
+        request.source_size.min(request.destination_size)
+    } else {
+        request.destination_size
+    };
+    ((request.page_offset & 0xffff) as usize, len as usize)
 }
 
 /// The streaming trace (`VICTORY_DSTORAGE_TRACE`): 0 or unset: off; 1: a
@@ -1158,8 +1250,16 @@ impl Traced {
         if trace() == 0 {
             return None;
         }
-        let at_start = list_hash(&job.request);
-        let pages = list_of(&job.request).unwrap_or_default();
+        // A request with pages taken at the submit reads nothing of its list
+        // again: those pages are its own, and the title may have reused or
+        // freed the list.
+        let (at_start, pages) = match &job.pages {
+            Some(taken) => (job.note.at_submit, taken.pages().to_vec()),
+            None => (
+                list_hash(&job.request),
+                list_of(&job.request).unwrap_or_default(),
+            ),
+        };
         let (offset, len) = Traced::bytes(&job.request);
         {
             let mut writers = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1194,7 +1294,11 @@ impl Traced {
 
     fn end(self, job: &Job, result: &Result<(), HRESULT>) {
         let (offset, len) = Traced::bytes(&job.request);
-        let at_end = list_hash(&job.request);
+        let at_end = if job.pages.is_some() {
+            self.at_start
+        } else {
+            list_hash(&job.request)
+        };
         let moved = super::xmem::pages_shown(&self.pages, offset, len) != self.shown;
         {
             let mut writers = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1230,6 +1334,7 @@ impl Traced {
             at_start = format_args!("{:016x}", self.at_start),
             at_end = format_args!("{at_end:016x}"),
             list_changed_late = late,
+            taken_at_submit = job.pages.is_some(),
             mapping_changed = moved,
             first_page = self.pages.first().copied().unwrap_or(0),
             ok = result.is_ok(),
@@ -1270,7 +1375,14 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
         return;
     };
     let note = Note::enqueued(&request);
-    queue(this, Command::Read(Read { request, note }));
+    queue(
+        this,
+        Command::Read(Read {
+            request,
+            note,
+            pages: None,
+        }),
+    );
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -1306,7 +1418,13 @@ fn half_submits() -> bool {
 
 /// Adds a command to the queue; blocks while the queue is full. A queue
 /// that is full of commands nobody submitted submits itself, since nothing
-/// else could make room.
+/// else could make room, unless page destinations wait in it for their
+/// lists to be taken at the title's submit ([`Lane::holds_page_lists`]):
+/// the title fills those lists only after this enqueue returns, and they
+/// may still name the pages of their last use (pages that exist, but not
+/// the destination). Such a queue takes the command past its capacity
+/// instead, until the title's submit; what it holds past it is only ever
+/// enqueued commands, which hold no worker, staging or status of their own.
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
     let id = unsafe { &*this }.state.id;
@@ -1323,11 +1441,26 @@ fn queue(this: QueueRef, command: Command) {
             break;
         }
         if !lane.unsubmitted.is_empty() && lane.reads.is_empty() && lane.running.is_empty() {
-            tracing::warn!(
-                queue = id,
-                commands = lane.unsubmitted.len(),
-                "dstorage: a queue full of commands that are not submitted submits itself"
-            );
+            let held = lane.holds_page_lists();
+            static FULL: AtomicU64 = AtomicU64::new(0);
+            let times = FULL.fetch_add(1, Ordering::Relaxed) + 1;
+            if times <= 8 || times.is_power_of_two() {
+                tracing::warn!(
+                    queue = id,
+                    commands = lane.unsubmitted.len(),
+                    capacity = lane.capacity,
+                    times,
+                    "dstorage: a queue full of commands that are not submitted {}",
+                    if held {
+                        "holds them past its capacity (page lists are taken at the title's submit)"
+                    } else {
+                        "submits itself"
+                    }
+                );
+            }
+            if held {
+                break;
+            }
             lanes.submit(id, true);
             scheduler.work.notify_all();
             continue;
@@ -1341,7 +1474,10 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    if half_submits() && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+    if half_submits()
+        && !lane.holds_page_lists()
+        && lane.unsubmitted.len() >= (lane.capacity / 2).max(1)
+    {
         lanes.submit(id, true);
         scheduler.work.notify_all();
     }
@@ -1372,8 +1508,9 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
-/// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+/// Reads, inflates and/or unpacks, and writes one request; `pages` is a
+/// page destination's as taken at the title's submit.
+fn execute(request: &Request, pages: Option<&PageRuns>) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -1402,8 +1539,10 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
-            .map_err(|hr| fail(hr, "copying"));
+        return into_destination(request, pages, size, |out| {
+            read_into(request, out).map(|()| size)
+        })
+        .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
@@ -1416,7 +1555,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
+    into_destination(request, pages, size, |out| match tables {
         Some(tables) => bcpack::decode(bc, &source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
@@ -1590,9 +1729,14 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
 /// many it produced. GPU-visible destinations are host memory like the
 /// rest (GPU address = CPU address), so an address is written in place;
 /// physical pages are too when they are consecutive pages of one
-/// allocation, and otherwise go through a buffer.
+/// allocation, and otherwise go through a buffer. `taken` is a page
+/// destination's pages as taken at the title's submit: then the title's
+/// list is not read again (it may have reused or freed it since); without
+/// them (`VICTORY_PAGE_LIST=late`, or a page not known then) the list is
+/// read now.
 fn into_destination(
     request: &Request,
+    taken: Option<&PageRuns>,
     len: usize,
     mut fill: impl FnMut(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
@@ -1607,7 +1751,7 @@ fn into_destination(
         let filled = fill(out).map(drop);
         drop(writing);
         // Again now that the bytes are there: a texture looked at in between
-        // was uploaded without them (`xmem::pages_written`).
+        // was uploaded without them (`xmem::PageRuns::written`).
         if super::xmem::stream_notice() {
             victory_gpu::kernel_will_write(request.destination as usize, len);
         } else {
@@ -1616,6 +1760,9 @@ fn into_destination(
         return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
+    if let Some(taken) = taken {
+        return into_pages(Some(taken), taken.pages(), offset, len, &mut fill);
+    }
     let list = request.destination.cast();
     let mut pages = page_list(list, offset, len);
     // The title sees its destination through the pages its list names: if
@@ -1623,7 +1770,7 @@ fn into_destination(
     // (Said aloud: by the title's protocol a submitted request's list stays
     // as it is.)
     for _ in 0..3 {
-        into_pages(&pages, offset, len, &mut fill)?;
+        into_pages(None, &pages, offset, len, &mut fill)?;
         let now = read_list(list, offset, len);
         if now == pages || !super::xmem::pages_known(&now, offset, len) {
             break;
@@ -1641,18 +1788,28 @@ fn into_destination(
     Ok(())
 }
 
-/// Runs `fill` on `len` bytes of `pages`, from `offset` into the first.
+/// Runs `fill` on `len` bytes of `pages`, from `offset` into the first:
+/// through `taken`, the sections held since the title's submit, or else
+/// those the pages are now.
 fn into_pages(
+    taken: Option<&PageRuns>,
     pages: &[usize],
     offset: usize,
     len: usize,
     mut fill: impl FnMut(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
+    let mut late = match taken {
+        Some(_) => None,
+        None => super::xmem::resolve_pages(pages, offset, len),
+    };
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+    if let Some(runs) = taken.or(late.as_ref())
+        && let Some(mut window) = runs.window()
+    {
         let filled = fill(window.bytes()).map(drop);
-        super::xmem::pages_written(pages, offset, len);
+        drop(window);
+        runs.written(len);
         return filled;
     }
     let mut data = vec![0; len];
@@ -1660,27 +1817,40 @@ fn into_pages(
     // A page the title has just made, or a view the host refuses for a moment (commit
     // or address space short while a load maps many at once), can come right a little
     // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
-    // about 1.5 s in all).
+    // about 1.5 s in all). Pages taken at the submit are known; only the host can fail.
     static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let retries = *RETRIES.get_or_init(|| {
         std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(12)
     });
-    let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
+    let write = |late: &mut Option<PageRuns>| {
+        if taken.is_none() && late.is_none() {
+            *late = super::xmem::resolve_pages(pages, offset, n);
+        }
+        taken
+            .or(late.as_ref())
+            .is_some_and(|runs| runs.write(&data[..n]))
+    };
+    let mut written = write(&mut late);
     let mut tries = 0;
     while !written && tries < retries {
         std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
         tries += 1;
-        written = super::xmem::write_physical(pages, offset, &data[..n]);
+        written = write(&mut late);
     }
-    if written {
-        super::xmem::pages_written(pages, offset, n);
+    let runs = taken.or(late.as_ref());
+    if let (true, Some(runs)) = (written, runs) {
+        runs.written(n);
         if tries > 0 {
             tracing::info!(offset, len, tries, "dstorage: a destination's physical pages written after a retry");
         }
         Ok(())
     } else {
-        let known = super::xmem::pages_known(pages, offset, len);
-        tracing::warn!(known, last_error = std::io::Error::last_os_error().raw_os_error(), "dstorage: retries used up");
+        tracing::warn!(
+            known = runs.is_some(),
+            taken_at_submit = taken.is_some(),
+            last_error = std::io::Error::last_os_error().raw_os_error(),
+            "dstorage: retries used up"
+        );
         // Said aloud: the title never reads a request's result
         // (it only polls for completion), so a destination left unwritten
         // is a model or texture that silently holds whatever its pages
@@ -1868,13 +2038,19 @@ mod tests {
 
     /// Polls as the title does, then returns the entry's result.
     fn wait(array: *mut c_void, index: u32) -> HRESULT {
+        wait_for_completion(array, index).expect("never completed")
+    }
+
+    fn wait_for_completion(array: *mut c_void, index: u32) -> Option<HRESULT> {
         let done: extern "system" fn(*mut c_void, u32) -> bool = call(array, 0x18);
         let start = Instant::now();
         while !done(array, index) {
-            assert!(start.elapsed() < Duration::from_secs(10), "never completed");
+            if start.elapsed() >= Duration::from_secs(10) {
+                return None;
+            }
             std::thread::sleep(Duration::from_millis(1));
         }
-        result(array, index)
+        Some(result(array, index))
     }
 
     fn file_with(bytes: &[u8]) -> (tempfile::TempDir, *mut c_void) {
@@ -2076,7 +2252,7 @@ mod tests {
             let len = PAGE + 100;
             let r = request(PAGE_DESTINATION, at.cast(), len, std::ptr::null(), 0, len);
             let mut runs = 0;
-            let written = into_destination(&r, len, |out| {
+            let written = into_destination(&r, None, len, |out| {
                 runs += 1;
                 out.fill(0xa5);
                 // SAFETY: our own list.
@@ -2116,7 +2292,7 @@ mod tests {
             protect(PAGE_READWRITE)
         });
         let r = request(0, at as *mut c_void, plain.len(), file, 0, plain.len());
-        assert_eq!(execute(&r), Ok(()));
+        assert_eq!(execute(&r, None), Ok(()));
         assert_ne!(opener.join().unwrap(), 0);
         // SAFETY: as above, all of it readable.
         assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, plain.len()) }, plain);
@@ -2226,7 +2402,11 @@ mod tests {
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
         let note = Note::default();
-        lane.unsubmitted.push(Command::Read(Read { request: r, note }));
+        lane.unsubmitted.push(Command::Read(Read {
+            request: r,
+            note,
+            pages: None,
+        }));
     }
 
     #[test]
@@ -2550,5 +2730,323 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    // Page lists taken at the title's submit (PastiiJay/klbf-lab-beta#3).
+
+    use std::sync::atomic::AtomicUsize;
+
+    fn allocate(n: usize) -> Vec<usize> {
+        use crate::modules::xmem;
+        let (mut pages, mut given) = (vec![0usize; n], n);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut given, pages.as_mut_ptr()),
+            1
+        );
+        pages
+    }
+
+    /// Maps `pages` where the test can read them, as the title would.
+    fn show(pages: &[usize]) -> *mut u8 {
+        use crate::modules::xmem;
+        let n = pages.len();
+        let at = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            n * PAGE,
+            0x2000 | 0x2040_0000,
+            0,
+            0x04,
+        );
+        assert!(!at.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(at, n, pages.as_ptr()), at);
+        at.cast()
+    }
+
+    fn unshow(at: *mut u8, n: usize) {
+        let at = at.cast();
+        assert_eq!(
+            crate::modules::xmem::XMemMapPhysicalPages(at, n, std::ptr::null()),
+            at
+        );
+    }
+
+    /// A title's page list, which it writes while we hold a pointer to it.
+    fn page_list_of(pages: &[usize]) -> Vec<AtomicUsize> {
+        pages.iter().map(|&p| AtomicUsize::new(p)).collect()
+    }
+
+    fn set(list: &[AtomicUsize], pages: &[usize]) {
+        list.iter()
+            .zip(pages)
+            .for_each(|(entry, &p)| entry.store(p, Ordering::Release));
+    }
+
+    fn page_request(list: *const AtomicUsize, source: &[u8], page_offset: usize) -> Request {
+        let mut r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            list.cast_mut().cast(),
+            source.len(),
+            source.as_ptr().cast(),
+            0,
+            source.len(),
+        );
+        r.page_offset = page_offset as u64;
+        r
+    }
+
+    fn push_read(lanes: &mut Lanes, id: u64, request: Request) {
+        let read = Read {
+            request,
+            note: Note::default(),
+            pages: None,
+        };
+        lanes
+            .lanes
+            .get_mut(&id)
+            .unwrap()
+            .unsubmitted
+            .push(Command::Read(read));
+    }
+
+    fn unsubmitted(queue: *mut c_void) -> usize {
+        // SAFETY: a queue we created.
+        let id = unsafe { &*queue.cast_const().cast::<Instance<Queue>>() }
+            .state
+            .id;
+        scheduler()
+            .unwrap()
+            .lock()
+            .lanes
+            .get(&id)
+            .map_or(0, |l| l.unsubmitted.len())
+    }
+
+    fn small_queue(capacity: u16) -> *mut c_void {
+        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        let desc = QueueDesc {
+            source_type: 1,
+            capacity,
+            priority: 0,
+            name: c"small".as_ptr(),
+            unknown: 1,
+        };
+        let mut queue = std::ptr::null_mut();
+        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
+        queue
+    }
+
+    /// Pages taken at the title's submit are the ones written, though the
+    /// title changes its list and frees those pages before the request runs;
+    /// the GPU side is told at the addresses that show them. Without pages
+    /// taken (`VICTORY_PAGE_LIST=late`, or a list not known at the submit)
+    /// the list is read when the request runs.
+    #[test]
+    fn pages_taken_at_submit_survive_a_changed_list_and_a_free() {
+        use crate::modules::xmem;
+        let (a, b) = (allocate(2), allocate(2));
+        let (at_a, at_b) = (show(&a), show(&b));
+        let list = page_list_of(&a);
+        let plain = pattern(100);
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64));
+        push_read(&mut l, 0, page_request(list.as_ptr(), &plain, PAGE - 40));
+        l.submit(0, false);
+        // After the submit: the list names other pages, and `a` is freed
+        // (still shown at `at_a`, as freed pages stay mapped).
+        set(&list, &b);
+        assert_eq!(xmem::XMemFreePhysicalPages(2, a.as_ptr()), 1);
+        let job = l.start().unwrap();
+        let taken = job.pages.as_ref().expect("taken at the submit");
+        assert_eq!(taken.pages(), a);
+        assert_eq!(
+            taken.shown_at(plain.len()),
+            vec![(at_a as usize + PAGE - 40, plain.len())]
+        );
+        assert_eq!(execute(&job.request, job.pages.as_ref()), Ok(()));
+        // SAFETY: all four pages are mapped read-write.
+        let (seen_a, seen_b) = unsafe {
+            (
+                std::slice::from_raw_parts(at_a, 2 * PAGE),
+                std::slice::from_raw_parts(at_b, 2 * PAGE),
+            )
+        };
+        assert_eq!(seen_a[PAGE - 40..PAGE + 60], plain);
+        assert!(
+            seen_b.iter().all(|&byte| byte == 0),
+            "the list's new pages are not written"
+        );
+        // The list as it is when the request runs: `b`.
+        assert_eq!(execute(&job.request, None), Ok(()));
+        assert_eq!(seen_b[PAGE - 40..PAGE + 60], plain);
+        l.finish(&job, Ok(()));
+        drop(job);
+        unshow(at_a, 2);
+        unshow(at_b, 2);
+        assert_eq!(xmem::XMemFreePhysicalPages(2, b.as_ptr()), 1);
+    }
+
+    /// A request whose pages were taken at the title's submit does not read
+    /// the title's list again: the list's memory released after the submit,
+    /// the pages taken then are still written.
+    #[test]
+    fn pages_taken_at_submit_need_no_list_when_the_request_runs() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let pages = allocate(1);
+        let at = show(&pages);
+        let plain = pattern(64);
+        // SAFETY: a fresh read-write page holding the list, released below.
+        let list = unsafe {
+            let list = VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+            .cast::<AtomicUsize>();
+            assert!(!list.is_null());
+            list.write(AtomicUsize::new(pages[0]));
+            list
+        };
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64));
+        push_read(&mut l, 0, page_request(list, &plain, 8));
+        l.submit(0, false);
+        // SAFETY: the list's own allocation; a read of it from now on faults.
+        assert_ne!(unsafe { VirtualFree(list.cast(), 0, MEM_RELEASE) }, 0);
+        let job = l.start().unwrap();
+        assert_eq!(
+            job.pages.as_ref().expect("taken at the submit").pages(),
+            pages
+        );
+        assert_eq!(execute(&job.request, job.pages.as_ref()), Ok(()));
+        // SAFETY: the page is mapped read-write.
+        assert_eq!(unsafe { std::slice::from_raw_parts(at.add(8), 64) }, plain);
+        l.finish(&job, Ok(()));
+        drop(job);
+        unshow(at, 1);
+        assert_eq!(
+            crate::modules::xmem::XMemFreePhysicalPages(1, pages.as_ptr()),
+            1
+        );
+    }
+
+    /// A list still empty at the title's submit is not taken: the request
+    /// reads it when it runs. Requests that are not page destinations, and
+    /// a submit of our own, take nothing.
+    #[test]
+    fn a_list_unknown_at_the_submit_is_read_when_the_request_runs() {
+        let pages = allocate(1);
+        let list = page_list_of(&[0]);
+        let known = page_list_of(&pages);
+        let plain = pattern(64);
+        let mut out = [0u8; 16];
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64));
+        let address = request(
+            MEMORY_SOURCE,
+            out.as_mut_ptr().cast(),
+            16,
+            plain.as_ptr().cast(),
+            0,
+            16,
+        );
+        push_read(&mut l, 0, page_request(list.as_ptr(), &plain, 8));
+        push_read(&mut l, 0, address);
+        l.submit(0, false);
+        push_read(&mut l, 0, page_request(known.as_ptr(), &plain, 8));
+        l.submit(0, true);
+        let jobs = [l.start().unwrap(), l.start().unwrap(), l.start().unwrap()];
+        assert!(jobs.iter().all(|job| job.pages.is_none()));
+        set(&list, &pages);
+        assert_eq!(execute(&jobs[0].request, None), Ok(()));
+        assert_eq!(execute(&jobs[1].request, None), Ok(()));
+        let at = show(&pages);
+        // SAFETY: the page is mapped read-write.
+        let seen = unsafe { std::slice::from_raw_parts(at, PAGE) };
+        assert_eq!(seen[8..72], plain);
+        assert_eq!(out, plain[..16]);
+        unshow(at, 1);
+        assert_eq!(
+            crate::modules::xmem::XMemFreePhysicalPages(1, pages.as_ptr()),
+            1
+        );
+    }
+
+    /// The title enqueues more page destinations than its queue holds, all
+    /// with lists still naming the pages of their last use (pages that
+    /// exist), and only after its enqueues return fills the lists and
+    /// submits, on the same thread. The queue takes them past its capacity
+    /// rather than submit or wait: the old pages stay untouched, the new
+    /// ones are written, and the status completes after them.
+    #[test]
+    fn a_full_queue_takes_page_destinations_until_the_titles_submit() {
+        const N: usize = 5;
+        let (stale, fresh) = (allocate(N), allocate(N));
+        let plain = pattern(32);
+        let queue = small_queue(4);
+        let array = status_array(1);
+        let lists = page_list_of(&stale);
+        let (held, status) = std::thread::scope(|scope| {
+            let (done, enqueued) = std::sync::mpsc::channel();
+            let (allow_submit, wait_for_submit) = std::sync::mpsc::channel();
+            let (queue_at, array_at) = (queue as usize, array as usize);
+            let (plain, lists, fresh) = (&plain, &lists, &fresh);
+            let title = scope.spawn(move || {
+                let queue = queue_at as *mut c_void;
+                // From the fourth command on, the queue is full of these.
+                for list in lists {
+                    enqueue(queue, &page_request(list, plain, 0));
+                }
+                enqueue_status(queue, array_at as *mut c_void, 0);
+                if done.send(unsubmitted(queue)).is_ok() && wait_for_submit.recv().is_ok() {
+                    set(lists, fresh);
+                    void(queue, 0x30);
+                }
+            });
+            let held = enqueued.recv_timeout(Duration::from_secs(10));
+            let status = if held.as_ref().is_ok_and(|&count| count == N + 1)
+                && allow_submit.send(()).is_ok()
+            {
+                wait_for_completion(array, 0)
+            } else {
+                None
+            };
+            drop(allow_submit);
+            // Close wakes a blocked Enqueue and waits for reads using the
+            // fixture. Join the title before asserting either result.
+            void(queue, 0x40);
+            title.join().unwrap();
+            (held, status)
+        });
+        let held = held.expect("the enqueues return before the title's submit");
+        assert_eq!(held, N + 1, "all held for the title's submit");
+        assert_eq!(status.expect("never completed"), S_OK);
+        for (old, new) in stale.iter().zip(&fresh) {
+            let (at_old, at_new) = (show(&[*old]), show(&[*new]));
+            // SAFETY: both pages are mapped read-write.
+            let (seen_old, seen_new) = unsafe {
+                (
+                    std::slice::from_raw_parts(at_old, PAGE),
+                    std::slice::from_raw_parts(at_new, PAGE),
+                )
+            };
+            assert!(
+                seen_old.iter().all(|&b| b == 0),
+                "the old page is untouched"
+            );
+            assert_eq!(seen_new[..32], plain);
+            assert!(seen_new[32..].iter().all(|&b| b == 0));
+            unshow(at_old, 1);
+            unshow(at_new, 1);
+        }
+        for pages in [&stale, &fresh] {
+            assert_eq!(
+                crate::modules::xmem::XMemFreePhysicalPages(N, pages.as_ptr()),
+                1
+            );
+        }
     }
 }
