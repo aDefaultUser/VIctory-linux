@@ -1,7 +1,9 @@
-# VIctory on an RX 7900 XTX
+# VIctory for Linux
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
+On Linux, the Windows build runs under Wine or Proton. See the
+[Linux guide](docs/linux.md) for setup, tested configurations and known gaps.
 
 ## The goal
 
@@ -20,7 +22,7 @@ lighting that is too bright or too dark when walking indoors are next in line.
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
-## Where it stands (2026-11-26)
+## Windows reference runs (2026-11-26)
 
 Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
 RX 7900 XTX, ray tracing off.
@@ -76,8 +78,8 @@ model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
 tools, and your own dump of the title.
 
 ```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
+git clone https://github.com/aDefaultUser/VIctory-linux
+cd VIctory-linux
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
 scripts\play.ps1 -Exe <path of your copy's executable>
@@ -113,12 +115,19 @@ target\diag\victory.exe shaders <the shader archives>   # every shader translate
 target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
 ```
 
-On Linux, `scripts/run-linux.sh` runs the Windows build under Wine or Proton
-with the same commands: [docs/linux.md](docs/linux.md).
+## Keyboard and mouse
 
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
+WASD moves and IJKL looks while the window has focus. Left-click in the
+title window to capture the mouse for look, and press Esc to release it.
+Once captured, the left and right mouse buttons act as the right and left
+triggers. The keyboard and mouse work alongside connected XInput controllers
+by default. See [all controls and sensitivity settings](docs/README-fxceless.md#input).
+
+## Command reference
+
+The [command reference](docs/README-fxceless.md) covers runtime switches and
+diagnostics. Each `VICTORY_...` switch is described where it is read in the
+source.
 
 ## What is different here
 

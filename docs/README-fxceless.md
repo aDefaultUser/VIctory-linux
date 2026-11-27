@@ -183,8 +183,8 @@ is read.
 - A few style lints are switched off for this fork in the workspace `Cargo.toml` until the newer code is tidied.
 - Many changes here are specific to this title and this GPU, and some are marked `shortcut:` in the code where they approximate what the console does.
 
-Everything below this line is upstream VIctory's own README, unchanged; its
-status section describes upstream, not this fork.
+The section below is adapted from upstream VIctory's README. Its dated
+status describes the upstream build. The input section covers this fork.
 
 ---
 
@@ -278,7 +278,9 @@ limits them. This scales the displayed image; it does not change the
 console render resolution or the swap-chain buffers. With the variable
 unset, window sizing is unchanged.
 
-Input: the title sees one pad. Every XInput pad, the keyboard and the mouse
+## Input
+
+The title sees one pad. Every XInput pad, the keyboard and the mouse
 press it together, so a connected pad never turns the keyboard or the mouse
 off. The keyboard counts while the title's window has focus:
 

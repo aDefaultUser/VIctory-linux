@@ -15,6 +15,26 @@ scripts/run-linux.sh run <title folder> <title exe>
 README's "How to run it"), run ahead of time in the same sandbox. Both can be
 stopped and pick up where they left off later.
 
+## Updating from the previous launcher
+
+Put the path to the Windows executable in `RUN_LINUX_EXE`, then use
+`scripts/run-linux.sh run <title folder> <title exe>`. Point
+`RUN_LINUX_STATE` at your existing state directory to reuse its prefix
+and data folders, or set each path under
+[Where things are kept](#where-things-are-kept). The cache has its own
+`RUN_LINUX_CACHE` path. The launcher now defaults to Proton's Wine.
+Use `RUN_LINUX_WINE=wine` to keep running with system Wine.
+
+Run `shaders` and `warm --used` as separate commands for the old
+launch-time warm-up. Put settings such as `VICTORY_BAKE_TEXTURES_MS=1500`
+after the title executable name. After updating, the renderer translates
+shaders under a new cache key.
+
+With `VICTORY_STREAM_NOTICE=0`, the default `VICTORY_PAGE_WRITES` setting
+also queues early-uploaded textures again when a plain storage read
+finishes. `VICTORY_HEAP_RECHECK_EVERY` enables further checks for late
+texture changes and is off by default.
+
 ## Tested result
 
 One machine, November 2026: CachyOS, Radeon RX 9070 XT, Ryzen 9 9950X3D,
@@ -163,6 +183,20 @@ The script's defaults, as a Series X: medians of 23.1 frames per second over
 room, starting from a private checkpoint in a save the tester made. The
 camera responded to input, and **face textures were missing**.
 
+### Validation of the main update
+
+Proton Experimental replays on Xwayland exercised keyboard movement, mouse
+look and buttons, click-to-capture and Esc release. A menu replay of
+`2892a9e` also exercised activation-loss release with a test window manager.
+On the same Radeon RX 9070 XT, `e145f70` passed seven synthetic device
+checks for heap descriptors and root constant buffers, plus a CPU check for
+the d16 kind decision.
+
+The scene and frame-rate results above belong to their stated builds. A
+full gameplay replay of the combined update is pending. Jaw alignment,
+intermittent missing face meshes, asset level of detail and shimmer remain
+open.
+
 ## What it needs
 
 None of these ship with the repository. Point the script at your own copies.
@@ -293,13 +327,10 @@ its own binary before it looks at `WINESERVER`, so the script mounts the file
 over `files/bin/wineserver` inside the sandbox only. The Proton install is
 not changed. This works only with Proton's Wine.
 
-The mouse (see "Input" in `README-fxceless.md`) needs nothing of its own:
-while it is captured VIctory clips the cursor to the title's window, and
-Wine then grabs the pointer and moves the cursor by the device's relative
-motion, which also works on Xwayland, where a program cannot move the
-host pointer. This was seen working on Xwayland: mouse look both ways, the
-buttons, the capturing click and the release by Esc. Esc takes the clip off
-again.
+The [mouse controls](README-fxceless.md#input) work through Wine. While
+captured, VIctory clips the cursor to the title's window. Wine grabs the
+pointer and moves the cursor by the device's relative motion. This also
+works on Xwayland, where a program cannot move the host pointer directly.
 
 When an X11 window outside Wine takes the keyboard focus while the mouse is
 captured, Wine (Proton Experimental, Wine 11) may still report the title's
